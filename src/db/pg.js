@@ -1,11 +1,14 @@
 // src/db/pg.js
+// Versão robusta para Supabase (pooler/direct), SNI e SSL "no-verify" quando necessário.
+// Mantém retry, IPv4 candidates e reconexão em background.
+
 import pg from 'pg';
 import dns from 'dns';
 import { URL as NodeURL } from 'url';
 
 const env = process.env;
 
-// ===== 1) Coleta URLs
+// 1) coleta URLs (pooler primeiro)
 const poolerURL = [
   env.DATABASE_URL_POOLING,
   env.POSTGRES_PRISMA_URL,
@@ -20,7 +23,7 @@ const directURL = [
 
 const HAS_POOLER = Boolean(poolerURL || altPooler);
 
-// ===== 2) Normaliza (portas + sslmode=require)
+// 2) normaliza porta (6543 para pooler, 5432 para supabase direct) e adiciona sslmode=require se não tiver
 function normalize(url) {
   if (!url) return null;
   try {
@@ -38,6 +41,7 @@ const urlsRaw = (HAS_POOLER ? [poolerURL, altPooler] : [directURL])
   .map(normalize)
   .filter(Boolean);
 
+// remove duplicados mantendo ordem
 const seen = new Set();
 const urls = urlsRaw.filter(u => (seen.has(u) ? false : (seen.add(u), true)));
 
@@ -45,15 +49,12 @@ if (urls.length === 0) {
   console.error('[pg] nenhuma DATABASE_URL definida nas ENVs');
 }
 
-// ===== 3) SSL fix (Supabase = no verify + SNI)
+// 3) SSL policy: para supabase usamos rejectUnauthorized:false e passamos servername (SNI)
 function sslFor(url, sniHost) {
   try {
     const u = new NodeURL(url);
     if (/\.(supabase\.co|supabase\.com)$/i.test(u.hostname)) {
-      return {
-        rejectUnauthorized: false, // evita SELF_SIGNED_CERT_IN_CHAIN
-        servername: sniHost || u.hostname, // SNI correto
-      };
+      return { rejectUnauthorized: false, servername: sniHost || u.hostname };
     }
   } catch {}
   const mode = String(env.PGSSLMODE || 'require').trim().toLowerCase();
@@ -61,7 +62,7 @@ function sslFor(url, sniHost) {
   return { rejectUnauthorized: mode !== 'no-verify', servername: sniHost };
 }
 
-// ===== 4) DNS helpers
+// 4) DNS helpers
 const dnp = dns.promises;
 async function resolveAllIPv4(host) {
   try {
@@ -77,6 +78,7 @@ async function resolveAllIPv4(host) {
   }
 }
 
+// Gera candidatos trocando hostname por cada IP e preservando sni=hostname original
 async function toIPv4Candidates(url) {
   try {
     const u = new NodeURL(url);
@@ -86,7 +88,6 @@ async function toIPv4Candidates(url) {
     }
     const ips = await resolveAllIPv4(host);
     if (!ips.length) return [{ url, sni: host }];
-
     return ips.map(ip => {
       const clone = new NodeURL(url);
       clone.hostname = ip;
@@ -97,13 +98,12 @@ async function toIPv4Candidates(url) {
   }
 }
 
-// ===== 5) Pool config
+// 5) pool config
 function cfg(url, sni) {
   return {
     connectionString: url,
     ssl: sslFor(url, sni),
-    lookup: (hostname, _opts, cb) =>
-      dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
+    lookup: (hostname, _opts, cb) => dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
@@ -111,7 +111,7 @@ function cfg(url, sni) {
   };
 }
 
-let pool;
+let pool = null;
 let reconnectTimer = null;
 
 function safe(url) {
@@ -129,11 +129,10 @@ function isTransient(err) {
   return TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg);
 }
 
-// ===== 6) Conexão
+// tenta conectar uma vez numa URL, experimentando todos os IPs
 async function connectOnce(url) {
   const candidates = await toIPv4Candidates(url);
   let lastErr = null;
-
   for (const c of candidates) {
     const p = new pg.Pool(cfg(c.url, c.sni));
     try {
@@ -147,7 +146,7 @@ async function connectOnce(url) {
       return p;
     } catch (e) {
       lastErr = e;
-      console.log('[pg] failed on', safe(c.url), '->', e.code || e.message);
+      console.log('[pg] failed on', safe(c.url), '->', e.code || e.errno || e.message || e);
       await p.end().catch(() => {});
       continue;
     }
@@ -155,11 +154,11 @@ async function connectOnce(url) {
   throw lastErr || new Error('All IPv4 candidates failed');
 }
 
+// connect with retry/backoff across URLs
 async function connectWithRetry(urlList) {
   const PER_URL_TRIES = 5;
   const BASE_DELAY = 500;
   let lastErr = null;
-
   for (const url of urlList) {
     for (let i = 0; i < PER_URL_TRIES; i++) {
       try {
@@ -168,7 +167,7 @@ async function connectWithRetry(urlList) {
         lastErr = e;
         if (i < PER_URL_TRIES - 1 && isTransient(e)) {
           const delay = BASE_DELAY * Math.pow(2, i);
-          console.warn('[pg] transient connect error, retrying in', delay, 'ms');
+          console.warn('[pg] transient connect error, retrying', i + 1, 'of', PER_URL_TRIES, 'in', delay, 'ms');
           await new Promise(r => setTimeout(r, delay));
           continue;
         }
