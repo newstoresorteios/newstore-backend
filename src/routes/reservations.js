@@ -7,24 +7,25 @@ import { requireAuth } from '../middleware/auth.js';
 const router = Router();
 
 async function cleanupExpired() {
-  // Marca reservas expiradas e libera números
+  // Expira reservas 'active' que passaram do prazo e libera números amarrados a elas
   const expired = await query(
     `update reservations
-        set status = 'expired'
-      where status = 'active'
-        and expires_at < now()
-      returning id, draw_id, numbers`
+       set status = 'expired'
+     where status = 'active'
+       and expires_at < now()
+     returning id, draw_id, numbers`
   );
 
   if (expired.rows.length) {
     for (const r of expired.rows) {
       await query(
         `update numbers
-            set status = 'available', reservation_id = null
-          where draw_id = $1
-            and n = any($2)
-            and status = 'reserved'
-            and reservation_id = $3`,
+           set status = 'available',
+               reservation_id = null
+         where draw_id = $1
+           and n = any($2)
+           and status = 'reserved'
+           and reservation_id = $3`,
         [r.draw_id, r.numbers, r.id]
       );
     }
@@ -32,80 +33,101 @@ async function cleanupExpired() {
 }
 
 router.post('/', requireAuth, async (req, res) => {
+  const DBG = process.env.DEBUG_RESERVATIONS === 'true';
   try {
-    const DBG = process.env.DEBUG_RESERVATIONS === 'true';
-
     if (DBG) {
       console.log('[reservations] origin =', req.headers.origin || '(none)');
-      console.log('[reservations] authorization present =', Boolean(req.headers.authorization));
-      console.log(
-        '[reservations] cookie token/jwt present =',
-        Boolean(req.cookies && (req.cookies.token || req.cookies.jwt))
-      );
-      console.log(
-        '[reservations] user (JWT) =',
-        req.user ? { id: req.user.id, email: req.user.email } : '(none)'
-      );
+      console.log('[reservations] auth present =', Boolean(req.headers.authorization));
+      console.log('[reservations] user =', req.user ? { id: req.user.id, email: req.user.email } : '(none)');
     }
 
     await cleanupExpired();
 
     const { numbers } = req.body || {};
-    if (DBG) console.log('[reservations] body.numbers =', numbers);
-
     if (!Array.isArray(numbers) || numbers.length === 0) {
       return res.status(400).json({ error: 'no_numbers' });
     }
 
-    // Normaliza para inteiros
-    const nums = numbers
-      .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n));
-
-    const ttl = Number(process.env.RESERVATION_TTL_MIN || 15);
-
-    // Sorteio aberto mais recente
-    const dr = await query(
-      `select id from draws where status = 'open' order by id desc limit 1`
+    // normaliza para inteiros únicos 0..99
+    const nums = Array.from(
+      new Set(
+        numbers
+          .map((n) => Number(n))
+          .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99)
+      )
     );
-    if (!dr.rows.length) return res.status(400).json({ error: 'no_open_draw' });
-    const drawId = dr.rows[0].id;
-
-    // Checa disponibilidade dos números
-    const checks = await query(
-      `select n, status from numbers where draw_id = $1 and n = any($2)`,
-      [drawId, nums]
-    );
-    for (const row of checks.rows) {
-      if (row.status !== 'available') {
-        if (DBG) {
-          console.log('[reservations] número indisponível:', row.n, 'status =', row.status);
-        }
-        return res.status(409).json({ error: 'unavailable', n: row.n });
-      }
+    if (!nums.length) {
+      return res.status(400).json({ error: 'numbers_invalid' });
     }
 
-    // Cria reserva
-    const id = uuid();
-    const expiresAt = new Date(Date.now() + ttl * 60 * 1000);
+    const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 15);
 
-    await query(
-      `insert into reservations(id, user_id, draw_id, numbers, expires_at)
-       values ($1, $2, $3, $4, $5)`,
-      [id, req.user.id, drawId, nums, expiresAt]
+    // sorteio aberto mais recente
+    const dr = await query(
+      `select id
+         from draws
+        where status = 'open'
+     order by id desc
+        limit 1`
+    );
+    if (!dr.rows.length) {
+      return res.status(400).json({ error: 'no_open_draw' });
+    }
+    const drawId = dr.rows[0].id;
+
+    // ===== Transação atômica
+    await query('BEGIN');
+
+    // trava as linhas dos números para evitar corrida
+    const check = await query(
+      `select n, status
+         from numbers
+        where draw_id = $1
+          and n = any($2)
+        for update`,
+      [drawId, nums]
     );
 
-    // Marca números como reservados
+    // algum número não existe?
+    const foundSet = new Set(check.rows.map((r) => r.n));
+    const notFound = nums.filter((n) => !foundSet.has(n));
+    if (notFound.length) {
+      await query('ROLLBACK');
+      return res.status(400).json({ error: 'numbers_not_found', numbers: notFound });
+    }
+
+    // conflitos (já não disponíveis)
+    const conflicts = check.rows.filter((r) => r.status !== 'available').map((r) => r.n);
+    if (conflicts.length) {
+      await query('ROLLBACK');
+      return res.status(409).json({ error: 'unavailable', conflicts });
+    }
+
+    // cria reserva com status 'active'
+    const reservationId = uuid();
+    const expiresAt = new Date(Date.now() + ttlMin * 60 * 1000);
+
+    await query(
+      `insert into reservations (id, user_id, draw_id, numbers, status, expires_at)
+       values ($1, $2, $3, $4::int[], 'active', $5)`,
+      [reservationId, req.user.id, drawId, nums, expiresAt]
+    );
+
+    // marca números como reservados e amarra a reserva
     await query(
       `update numbers
-          set status = 'reserved', reservation_id = $3
-        where draw_id = $1 and n = any($2)`,
-      [drawId, nums, id]
+          set status = 'reserved',
+              reservation_id = $3
+        where draw_id = $1
+          and n = any($2)`,
+      [drawId, nums, reservationId]
     );
+
+    await query('COMMIT');
 
     if (DBG) {
       console.log('[reservations] created', {
-        reservationId: id,
+        reservationId,
         userId: req.user.id,
         drawId,
         numbers: nums,
@@ -113,11 +135,15 @@ router.post('/', requireAuth, async (req, res) => {
       });
     }
 
-    return res.json({ reservationId: id, drawId, expiresAt });
+    return res.status(201).json({ reservationId, drawId, expiresAt, numbers: nums });
   } catch (e) {
-    console.error('[reservations] error:', e);
+    // garante rollback se algo falhar no meio
+    try { await query('ROLLBACK'); } catch {}
+    console.error('[reservations] error:', e.code || e.message, e);
     return res.status(500).json({ error: 'reserve_failed' });
   }
 });
 
 export default router;
+// --- IGNORE ---
+import { Pool } from 'pg';    
