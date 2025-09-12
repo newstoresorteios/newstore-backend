@@ -17,7 +17,6 @@ import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
 import { query, getPool } from './db/pg.js';
 
-import { ensureDatabase } from './db/init.js';
 import { ensureSchema } from './seed.js';
 
 const app = express();
@@ -25,19 +24,14 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const ORIGIN = process.env.CORS_ORIGIN || '*';
 
-// health check para manter conexão ativa
 setInterval(() => {
-  query('SELECT 1').catch(e =>
-    console.warn('[health] db ping failed', e.code || e.message)
-  );
+  query('SELECT 1').catch(e => console.warn('[health] db ping failed', e.code || e.message));
 }, 60_000);
 
-app.use(
-  cors({
-    origin: ORIGIN === '*' ? true : ORIGIN.split(',').map(s => s.trim()),
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: ORIGIN === '*' ? true : ORIGIN.split(',').map(s => s.trim()),
+  credentials: true,
+}));
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
@@ -61,13 +55,10 @@ app.use((req, res) => {
   res.status(404).json({ error: 'not_found', path: req.originalUrl });
 });
 
-// Bootstrap do servidor
+// Bootstrap: garante tables (seed) antes de subir servidor
 async function bootstrap() {
   try {
-    // garante banco (se tiver permissão)
-    await ensureDatabase();
-
-    // garante tabelas + dados iniciais
+    // garante tabelas e dados iniciais (seed.js)
     await ensureSchema();
 
     // testa pool

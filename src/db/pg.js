@@ -1,59 +1,64 @@
 // src/db/pg.js
-// Versão robusta para Supabase (pooler/direct), SNI e SSL "no-verify" quando necessário.
-// Mantém retry, IPv4 candidates e reconexão em background.
-
+// Robust pg pool for Supabase (direct/pooler), with SSL no-verify for Supabase,
+// SNI preserved when connecting to IP addresses, IPv4 candidate rotation, and retries.
 import pg from 'pg';
 import dns from 'dns';
 import { URL as NodeURL } from 'url';
 
 const env = process.env;
 
-// 1) coleta URLs (pooler primeiro)
-const poolerURL = [
-  env.DATABASE_URL_POOLING,
-  env.POSTGRES_PRISMA_URL,
-  env.POSTGRES_URL,
-].find(v => v && v.trim()) || '';
+// Helper to safely trim / remove surrounding quotes from env values
+function stripQuotes(s) {
+  if (!s) return s;
+  return String(s).trim().replace(/^['"]+|['"]+$/g, '');
+}
 
-const altPooler = (env.DATABASE_URL_POOLING_ALT || '').trim();
-const directURL = [
-  env.DATABASE_URL,
-  env.POSTGRES_URL_NON_POOLING,
-].find(v => v && v.trim()) || '';
+// ===== 1) Coleta URLs (prefer direct non-pooling if present)
+const poolerURL = stripQuotes(env.DATABASE_URL_POOLING || env.POSTGRES_PRISMA_URL || env.POSTGRES_URL) || '';
+const altPooler = stripQuotes(env.DATABASE_URL_POOLING_ALT || '');
+const directURL = stripQuotes(env.DATABASE_URL || env.POSTGRES_URL_NON_POOLING || env.POSTGRES_URL) || '';
 
-const HAS_POOLER = Boolean(poolerURL || altPooler);
+// Prefer direct URL first (avoids pooler-related SSL issues when possible)
+const ordered = [];
+if (directURL) ordered.push(directURL);
+if (poolerURL) ordered.push(poolerURL);
+if (altPooler) ordered.push(altPooler);
 
-// 2) normaliza porta (6543 para pooler, 5432 para supabase direct) e adiciona sslmode=require se não tiver
-function normalize(url) {
+const urlsRaw = ordered
+  .map(normalizeSafe)
+  .filter(Boolean);
+
+// remove duplicadas preservando ordem
+const seen = new Set();
+const urls = urlsRaw.filter(u => (seen.has(u) ? false : (seen.add(u), true)));
+
+if (urls.length === 0) {
+  console.error('[pg] nenhuma DATABASE_URL definida nas ENVs (after normalization)');
+}
+
+// ===== normalization helper (ports + sslmode) with safe input handling
+function normalizeSafe(url) {
   if (!url) return null;
   try {
+    // ensure no surrounding quotes
+    url = stripQuotes(url);
     const u = new NodeURL(url);
     if (/pooler\.supabase\.com$/i.test(u.hostname)) u.port = '6543';
     if (/\.supabase\.co$/i.test(u.hostname) && !u.port) u.port = '5432';
     if (!/[?&]sslmode=/.test(u.search)) u.search += (u.search ? '&' : '?') + 'sslmode=require';
     return u.toString();
-  } catch {
+  } catch (err) {
+    console.warn('[pg] normalizeSafe failed for url:', url, err && err.message);
     return url;
   }
 }
 
-const urlsRaw = (HAS_POOLER ? [poolerURL, altPooler] : [directURL])
-  .map(normalize)
-  .filter(Boolean);
-
-// remove duplicados mantendo ordem
-const seen = new Set();
-const urls = urlsRaw.filter(u => (seen.has(u) ? false : (seen.add(u), true)));
-
-if (urls.length === 0) {
-  console.error('[pg] nenhuma DATABASE_URL definida nas ENVs');
-}
-
-// 3) SSL policy: para supabase usamos rejectUnauthorized:false e passamos servername (SNI)
+// ===== 3) SSL policy: for supabase hosts we disable verification but preserve SNI
 function sslFor(url, sniHost) {
   try {
     const u = new NodeURL(url);
     if (/\.(supabase\.co|supabase\.com)$/i.test(u.hostname)) {
+      // IMPORTANT: rejectUnauthorized:false prevents SELF_SIGNED_CERT_IN_CHAIN errors
       return { rejectUnauthorized: false, servername: sniHost || u.hostname };
     }
   } catch {}
@@ -62,7 +67,7 @@ function sslFor(url, sniHost) {
   return { rejectUnauthorized: mode !== 'no-verify', servername: sniHost };
 }
 
-// 4) DNS helpers
+// ===== 4) DNS helpers: attempt all IPv4 for a host (helps avoid a "bad" rotated IP)
 const dnp = dns.promises;
 async function resolveAllIPv4(host) {
   try {
@@ -78,11 +83,11 @@ async function resolveAllIPv4(host) {
   }
 }
 
-// Gera candidatos trocando hostname por cada IP e preservando sni=hostname original
 async function toIPv4Candidates(url) {
   try {
     const u = new NodeURL(url);
     const host = u.hostname;
+    // Only rewrite hosts that belong to supabase to IPs (others keep hostname)
     if (!/\.(supabase\.co|supabase\.com)$/i.test(host)) {
       return [{ url, sni: undefined }];
     }
@@ -98,11 +103,12 @@ async function toIPv4Candidates(url) {
   }
 }
 
-// 5) pool config
+// ===== 5) Pool config builder
 function cfg(url, sni) {
   return {
     connectionString: url,
     ssl: sslFor(url, sni),
+    // force IPv4 for any internal hostname resolution
     lookup: (hostname, _opts, cb) => dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
@@ -111,6 +117,7 @@ function cfg(url, sni) {
   };
 }
 
+// ===== state & helpers
 let pool = null;
 let reconnectTimer = null;
 
@@ -129,10 +136,11 @@ function isTransient(err) {
   return TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg);
 }
 
-// tenta conectar uma vez numa URL, experimentando todos os IPs
+// Connect once to a URL attempting every IPv4 candidate
 async function connectOnce(url) {
   const candidates = await toIPv4Candidates(url);
   let lastErr = null;
+
   for (const c of candidates) {
     const p = new pg.Pool(cfg(c.url, c.sni));
     try {
@@ -154,11 +162,12 @@ async function connectOnce(url) {
   throw lastErr || new Error('All IPv4 candidates failed');
 }
 
-// connect with retry/backoff across URLs
+// connect with retry/backoff across provided URLs
 async function connectWithRetry(urlList) {
   const PER_URL_TRIES = 5;
   const BASE_DELAY = 500;
   let lastErr = null;
+
   for (const url of urlList) {
     for (let i = 0; i < PER_URL_TRIES; i++) {
       try {
@@ -171,7 +180,7 @@ async function connectWithRetry(urlList) {
           await new Promise(r => setTimeout(r, delay));
           continue;
         }
-        break;
+        break; // try next URL
       }
     }
   }
