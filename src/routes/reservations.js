@@ -1,7 +1,7 @@
 // src/routes/reservations.js
 import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
-import { query } from '../db.js';
+import { query } from './db/pg.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();

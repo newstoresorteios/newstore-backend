@@ -1,7 +1,7 @@
 // src/routes/payments.js
 import { Router } from 'express';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
-import { query } from '../db.js';
+import { query } from './db/pg.js';
 import { requireAuth } from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 
