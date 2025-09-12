@@ -7,7 +7,7 @@ import { requireAuth } from '../middleware/auth.js';
 const router = Router();
 
 async function cleanupExpired() {
-  // Expira reservas 'active' que passaram do prazo e libera números amarrados a elas
+  // Expira reservas 'active' vencidas e libera números
   const expired = await query(
     `update reservations
        set status = 'expired'
@@ -16,29 +16,31 @@ async function cleanupExpired() {
      returning id, draw_id, numbers`
   );
 
-  if (expired.rows.length) {
-    for (const r of expired.rows) {
-      await query(
-        `update numbers
-           set status = 'available',
-               reservation_id = null
-         where draw_id = $1
-           and n = any($2)
-           and status = 'reserved'
-           and reservation_id = $3`,
-        [r.draw_id, r.numbers, r.id]
-      );
-    }
+  for (const r of expired.rows) {
+    await query(
+      `update numbers
+          set status = 'available',
+              reservation_id = null
+        where draw_id = $1
+          and n = any($2)
+          and status = 'reserved'
+          and reservation_id = $3`,
+      [r.draw_id, r.numbers, r.id]
+    );
   }
 }
 
 router.post('/', requireAuth, async (req, res) => {
   const DBG = process.env.DEBUG_RESERVATIONS === 'true';
   try {
+    if (!req.user?.id) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
     if (DBG) {
       console.log('[reservations] origin =', req.headers.origin || '(none)');
       console.log('[reservations] auth present =', Boolean(req.headers.authorization));
-      console.log('[reservations] user =', req.user ? { id: req.user.id, email: req.user.email } : '(none)');
+      console.log('[reservations] user =', { id: req.user.id, email: req.user.email });
     }
 
     await cleanupExpired();
@@ -50,15 +52,9 @@ router.post('/', requireAuth, async (req, res) => {
 
     // normaliza para inteiros únicos 0..99
     const nums = Array.from(
-      new Set(
-        numbers
-          .map((n) => Number(n))
-          .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99)
-      )
+      new Set(numbers.map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n <= 99))
     );
-    if (!nums.length) {
-      return res.status(400).json({ error: 'numbers_invalid' });
-    }
+    if (!nums.length) return res.status(400).json({ error: 'numbers_invalid' });
 
     const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 15);
 
@@ -70,9 +66,7 @@ router.post('/', requireAuth, async (req, res) => {
      order by id desc
         limit 1`
     );
-    if (!dr.rows.length) {
-      return res.status(400).json({ error: 'no_open_draw' });
-    }
+    if (!dr.rows.length) return res.status(400).json({ error: 'no_open_draw' });
     const drawId = dr.rows[0].id;
 
     // ===== Transação atômica
@@ -103,7 +97,7 @@ router.post('/', requireAuth, async (req, res) => {
       return res.status(409).json({ error: 'unavailable', conflicts });
     }
 
-    // cria reserva com status 'active'
+    // cria reserva com status 'active' e AMARRA ao usuário autenticado
     const reservationId = uuid();
     const expiresAt = new Date(Date.now() + ttlMin * 60 * 1000);
 
@@ -135,7 +129,14 @@ router.post('/', requireAuth, async (req, res) => {
       });
     }
 
-    return res.status(201).json({ reservationId, drawId, expiresAt, numbers: nums });
+    // retorna com o alias "id" também, para tolerar clientes diferentes
+    return res.status(201).json({
+      reservationId,
+      id: reservationId,
+      drawId,
+      expiresAt,
+      numbers: nums,
+    });
   } catch (e) {
     try { await query('ROLLBACK'); } catch {}
     console.error('[reservations] error:', e.code || e.message, e);

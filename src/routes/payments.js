@@ -7,8 +7,9 @@ import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
 
+// Aceita variável do backend (MP_ACCESS_TOKEN) ou a que você informou no Render (REACT_APP_MP_ACCESS_TOKEN)
 const mpClient = new MercadoPagoConfig({
-  accessToken: process.env.MP_ACCESS_TOKEN
+  accessToken: process.env.MP_ACCESS_TOKEN || process.env.REACT_APP_MP_ACCESS_TOKEN
 });
 const mpPayment = new Payment(mpClient);
 
@@ -19,16 +20,26 @@ const mpPayment = new Payment(mpClient);
  */
 router.post('/pix', requireAuth, async (req, res) => {
   try {
+    if (!req.user?.id) return res.status(401).json({ error: 'unauthorized' });
+
     const { reservationId } = req.body || {};
     if (!reservationId) {
       return res.status(400).json({ error: 'missing_reservation' });
     }
 
-    // Carrega a reserva + usuário
+    // Corrige reservas antigas sem user_id (anexa ao usuário atual)
+    await query(
+      `update reservations set user_id = $2
+        where id = $1 and user_id is null`,
+      [reservationId, req.user.id]
+    );
+
+    // Carrega a reserva + (opcional) usuário
     const r = await query(
-      `select r.id, r.user_id, r.draw_id, r.numbers, r.status, r.expires_at, u.email, u.name
+      `select r.id, r.user_id, r.draw_id, r.numbers, r.status, r.expires_at,
+              u.email as user_email, u.name as user_name
          from reservations r
-         join users u on u.id = r.user_id
+         left join users u on u.id = r.user_id
         where r.id = $1`,
       [reservationId]
     );
@@ -43,8 +54,12 @@ router.post('/pix', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'reservation_expired' });
     }
 
-    // Valor
-    const priceCents = Number(process.env.PRICE_CENTS || 5500);
+    // Valor (preço * quantidade)
+    const priceCents = Number(
+      process.env.PRICE_CENTS ||
+      process.env.REACT_APP_PIX_PRICE * 100 ||
+      5500
+    );
     const amount = Number(((rs.numbers.length * priceCents) / 100).toFixed(2));
 
     // Descrição e webhook
@@ -53,18 +68,19 @@ router.post('/pix', requireAuth, async (req, res) => {
       .join(', ')}`;
 
     // URL pública do backend para o webhook
-    const baseUrl =
-      process.env.PUBLIC_URL ||
-      `${req.protocol}://${req.get('host')}`;
-    const notification_url = `${baseUrl.replace(/\/$/, '')}/api/payments/webhook`;
+    const baseUrl = (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+    const notification_url = `${baseUrl}/api/payments/webhook`;
 
-    // Cria pagamento PIX no MP (idempotente)
+    // E-mail do pagador (do banco ou do token atual)
+    const payerEmail = rs.user_email || req.user?.email || 'comprador@example.com';
+
+    // Cria pagamento PIX no Mercado Pago (idempotente)
     const mpResp = await mpPayment.create({
       body: {
         transaction_amount: amount,
         description,
         payment_method_id: 'pix',
-        payer: { email: rs.email },
+        payer: { email: payerEmail },
         external_reference: String(reservationId),
         notification_url,
         date_of_expiration: new Date(Date.now() + 30 * 60 * 1000).toISOString()
@@ -91,7 +107,7 @@ router.post('/pix', requireAuth, async (req, res) => {
              qr_code_base64 = coalesce(excluded.qr_code_base64, payments.qr_code_base64)`,
       [
         String(id),
-        rs.user_id,
+        rs.user_id || req.user.id,
         rs.draw_id,
         rs.numbers,
         rs.numbers.length * priceCents,
@@ -101,7 +117,7 @@ router.post('/pix', requireAuth, async (req, res) => {
       ]
     );
 
-    // Amarra a reserva ao pagamento
+    // Amarra a reserva ao pagamento (status segue 'active' até aprovar)
     await query(
       `update reservations set payment_id = $2 where id = $1`,
       [reservationId, String(id)]
@@ -129,16 +145,10 @@ router.get('/:id/status', requireAuth, async (req, res) => {
     const resp = await mpPayment.get({ id: String(id) });
     const body = resp?.body || resp;
 
-    await query(
-      `update payments set status = $2 where id = $1`,
-      [id, body.status]
-    );
+    await query(`update payments set status = $2 where id = $1`, [id, body.status]);
 
     if (body.status === 'approved') {
-      const pr = await query(
-        `select draw_id, numbers from payments where id = $1`,
-        [id]
-      );
+      const pr = await query(`select draw_id, numbers from payments where id = $1`, [id]);
       if (pr.rows.length) {
         const { draw_id, numbers } = pr.rows[0];
 
@@ -153,7 +163,7 @@ router.get('/:id/status', requireAuth, async (req, res) => {
         // marca reserva como paga
         await query(`update reservations set status = 'paid' where payment_id = $1`, [id]);
 
-        // se vendeu 100, fecha o sorteio e abre um novo
+        // fecha sorteio se vendeu 100 e abre novo
         const cnt = await query(
           `select count(*)::int as sold
              from numbers
@@ -190,13 +200,8 @@ router.post('/webhook', async (req, res) => {
     const paymentId = req.body?.data?.id || req.query?.id || req.body?.id;
     const type = req.body?.type || req.query?.type;
 
-    // Ignora eventos não relacionados a pagamento
-    if (type && type !== 'payment') {
-      return res.sendStatus(200);
-    }
-    if (!paymentId) {
-      return res.sendStatus(200);
-    }
+    if (type && type !== 'payment') return res.sendStatus(200);
+    if (!paymentId) return res.sendStatus(200);
 
     const resp = await mpPayment.get({ id: String(paymentId) });
     const body = resp?.body || resp;
@@ -204,7 +209,6 @@ router.post('/webhook', async (req, res) => {
     const id = String(body.id);
     const status = body.status;
 
-    // Atualiza status + paid_at
     await query(
       `update payments
           set status = $2,
@@ -225,7 +229,7 @@ router.post('/webhook', async (req, res) => {
           [draw_id, numbers]
         );
 
-        // fecha sorteio se vendeu 100
+        // fecha sorteio se vendeu 100 e abre novo
         const cnt = await query(
           `select count(*)::int as sold
              from numbers
@@ -246,10 +250,10 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
+    // Sempre 200 para o MP não reenfileirar indefinidamente
     return res.sendStatus(200);
   } catch (e) {
     console.error('[webhook] error:', e);
-    // sempre 200 para o MP não reenfileirar indefinidamente
     return res.sendStatus(200);
   }
 });
