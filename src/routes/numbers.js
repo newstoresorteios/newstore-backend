@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query } from './db/pg.js';
+import { query } from '../db.js';
 
 const router = Router();
 
