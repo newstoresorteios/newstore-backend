@@ -12,15 +12,15 @@ const env = process.env;
 const stripQuotes = (s) => (s ? String(s).trim().replace(/^['"]+|['"]+$/g, "") : s);
 
 // ===== 1) Coleta URLs (DATABASE_URL primeiro)
-const dbUrlPrimary = stripQuotes(env.DATABASE_URL || "");
-const directURL = stripQuotes(env.POSTGRES_URL || "");
-const prismaURL = stripQuotes(env.POSTGRES_PRISMA_URL || "");
-const nonPoolingURL = stripQuotes(env.POSTGRES_URL_NON_POOLING || "");
+const dbUrlPrimary   = stripQuotes(env.DATABASE_URL || "");
+const directURL      = stripQuotes(env.POSTGRES_URL || "");
+const prismaURL      = stripQuotes(env.POSTGRES_PRISMA_URL || "");
+const nonPoolingURL  = stripQuotes(env.POSTGRES_URL_NON_POOLING || "");
 
 const ordered = [];
-if (dbUrlPrimary) ordered.push(dbUrlPrimary);     // << prioridade
-if (directURL) ordered.push(directURL);
-if (prismaURL) ordered.push(prismaURL);
+if (dbUrlPrimary)  ordered.push(dbUrlPrimary);   // << prioridade
+if (directURL)     ordered.push(directURL);
+if (prismaURL)     ordered.push(prismaURL);
 if (nonPoolingURL) ordered.push(nonPoolingURL);
 
 const urlsRaw = ordered.map(normalizeSafe).filter(Boolean);
@@ -44,10 +44,14 @@ function normalizeSafe(url) {
     if (/pooler\.supabase\.com$/i.test(u.hostname)) u.port = "6543";
     if (/\.supabase\.co$/i.test(u.hostname) && !u.port) u.port = "5432";
 
-    // Garante SSL obrigatório
-    if (!/[?&]sslmode=/.test(u.search)) {
-      u.search += (u.search ? "&" : "?") + "sslmode=require";
+    // >>> Importante: REMOVER sslmode da URL (vamos configurar SSL no objeto)
+    if (/[?&]sslmode=/i.test(u.search)) {
+      const params = new URLSearchParams(u.search.replace(/^\?/, ""));
+      params.delete("sslmode");
+      const rest = params.toString();
+      u.search = rest ? `?${rest}` : "";
     }
+
     return u.toString();
   } catch (err) {
     console.warn("[pg] normalizeSafe falhou:", url, err?.message);
@@ -111,7 +115,8 @@ async function toIPv4Candidates(url) {
 function cfg(url, sni) {
   return {
     connectionString: url,
-    ssl: sslFor(url, sni), // <<<<< força SSL no-verify
+    // >>> SSL configurado no objeto (ignora verificação do cert)
+    ssl: sslFor(url, sni),
     lookup: (hostname, _opts, cb) =>
       dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
@@ -240,6 +245,7 @@ export async function query(text, params) {
     throw e;
   }
 }
+
 export async function endPool() {
   if (reconnectTimer) {
     clearInterval(reconnectTimer);
@@ -262,4 +268,7 @@ process.on("exit", () => {
     pool.end().catch(() => {});
     pool = null;
   }
+});
+process.on("SIGINT", () => {
+  endPool().finally(() => process.exit(0));
 }); 
