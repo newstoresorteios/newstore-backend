@@ -15,7 +15,9 @@ import meRoutes from './routes/me.js';
 import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
-import { query, getPool } from './db/pg.js';
+
+// 👉 use sempre o hub
+import { query, getPool } from './db.js';
 
 import { ensureSchema } from './seed.js';
 
@@ -55,18 +57,14 @@ app.use((req, res) => {
   res.status(404).json({ error: 'not_found', path: req.originalUrl });
 });
 
-// Bootstrap: garante tables (seed) antes de subir servidor
+// Bootstrap
 async function bootstrap() {
   try {
-    // garante tabelas e dados iniciais (seed.js)
-    await ensureSchema();
-
-    // testa pool
-    const pool = await getPool();
+    await ensureSchema();                    // garante schema
+    const pool = await getPool();            // aquece pool
     await pool.query('SELECT 1');
     console.log('[db] warmup ok');
 
-    // inicia servidor
     app.listen(PORT, () => {
       console.log(`API listening on :${PORT}`);
     });

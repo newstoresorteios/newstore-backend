@@ -137,7 +137,6 @@ router.post('/', requireAuth, async (req, res) => {
 
     return res.status(201).json({ reservationId, drawId, expiresAt, numbers: nums });
   } catch (e) {
-    // garante rollback se algo falhar no meio
     try { await query('ROLLBACK'); } catch {}
     console.error('[reservations] error:', e.code || e.message, e);
     return res.status(500).json({ error: 'reserve_failed' });
@@ -145,5 +144,3 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 export default router;
-// --- IGNORE ---
-import { Pool } from 'pg';    
