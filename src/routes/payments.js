@@ -19,6 +19,7 @@ const mpPayment = new Payment(mpClient);
  * Auth: Bearer
  */
 router.post('/pix', requireAuth, async (req, res) => {
+  console.log('[payments/pix] user=', req.user?.id, 'body=', req.body);
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'unauthorized' });
 

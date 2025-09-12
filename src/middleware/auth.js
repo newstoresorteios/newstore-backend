@@ -3,25 +3,66 @@ import jwt from 'jsonwebtoken';
 
 const JWT_SECRET =
   process.env.JWT_SECRET ||
+  process.env.JWT_SECRET_KEY ||
   process.env.SUPABASE_JWT_SECRET ||
-  'change-me-in-env';
+  'dev-secret';
 
-const COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'ns_auth';
+// você pode manter AUTH_COOKIE_NAME, mas também aceitaremos nomes comuns
+const COOKIE_NAMES = [
+  process.env.AUTH_COOKIE_NAME || 'ns_auth',
+  'ns_auth_token',
+  'token',
+  'jwt',
+];
 
-function tokenFromReq(req) {
-  const b = req.headers.authorization;
-  if (b && b.startsWith('Bearer ')) return b.slice(7);
-  if (req.cookies && req.cookies[COOKIE_NAME]) return req.cookies[COOKIE_NAME];
+function sanitizeToken(t) {
+  if (!t) return '';
+  let s = String(t).trim();
+  // remove "Bearer " se vier no header
+  if (/^Bearer\s+/i.test(s)) s = s.replace(/^Bearer\s+/i, '').trim();
+  // remove aspas acidentais
+  s = s.replace(/^['"]|['"]$/g, '');
+  return s;
+}
+
+function extractToken(req) {
+  // 1) Authorization
+  const auth = req.headers?.authorization;
+  if (auth) {
+    const tok = sanitizeToken(auth);
+    if (tok) return tok;
+  }
+
+  // 2) Cookies
+  const cookies = req.cookies || {};
+  for (const name of COOKIE_NAMES) {
+    if (cookies[name]) {
+      const tok = sanitizeToken(cookies[name]);
+      if (tok) return tok;
+    }
+  }
+
   return null;
 }
 
 export function requireAuth(req, res, next) {
   try {
-    const token = tokenFromReq(req);
+    const token = extractToken(req);
     if (!token) return res.status(401).json({ error: 'unauthorized' });
-    req.user = jwt.verify(token, JWT_SECRET);
+
+    const payload = jwt.verify(token, JWT_SECRET);
+
+    // anexa um usuário mínimo no req
+    req.user = {
+      id: payload.id || payload.sub,
+      email: payload.email || payload.user?.email,
+      role: payload.role || payload.user?.role,
+      ...payload,
+    };
+
     return next();
-  } catch {
+  } catch (e) {
+    console.warn('[auth] invalid token:', e?.message || e);
     return res.status(401).json({ error: 'unauthorized' });
   }
 }
