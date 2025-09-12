@@ -1,4 +1,4 @@
-import { query } from './db.js';
+import { query } from './db/pg.js';
 import { hashPassword } from './utils.js';
 
 export async function ensureSchema() {
