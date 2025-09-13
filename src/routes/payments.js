@@ -7,9 +7,9 @@ import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
 
-// Aceita variável do backend (MP_ACCESS_TOKEN) ou a que você informou no Render (REACT_APP_MP_ACCESS_TOKEN)
+// Aceita MP_ACCESS_TOKEN (backend) ou REACT_APP_MP_ACCESS_TOKEN (Render)
 const mpClient = new MercadoPagoConfig({
-  accessToken: process.env.MP_ACCESS_TOKEN || process.env.REACT_APP_MP_ACCESS_TOKEN
+  accessToken: process.env.MP_ACCESS_TOKEN || process.env.REACT_APP_MP_ACCESS_TOKEN,
 });
 const mpPayment = new Payment(mpClient);
 
@@ -31,7 +31,7 @@ router.post('/pix', requireAuth, async (req, res) => {
     // Corrige reservas antigas sem user_id (anexa ao usuário atual)
     await query(
       `update reservations set user_id = $2
-        where id = $1 and user_id is null`,
+         where id = $1 and user_id is null`,
       [reservationId, req.user.id]
     );
 
@@ -40,7 +40,7 @@ router.post('/pix', requireAuth, async (req, res) => {
       `select r.id, r.user_id, r.draw_id, r.numbers, r.status, r.expires_at,
               u.email as user_email, u.name as user_name
          from reservations r
-         left join users u on u.id = r.user_id
+    left join users u on u.id = r.user_id
         where r.id = $1`,
       [reservationId]
     );
@@ -48,9 +48,7 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     const rs = r.rows[0];
 
-    if (rs.status !== 'active') {
-      return res.status(400).json({ error: 'reservation_not_active' });
-    }
+    if (rs.status !== 'active') return res.status(400).json({ error: 'reservation_not_active' });
     if (new Date(rs.expires_at).getTime() < Date.now()) {
       return res.status(400).json({ error: 'reservation_expired' });
     }
@@ -58,8 +56,8 @@ router.post('/pix', requireAuth, async (req, res) => {
     // Valor (preço * quantidade)
     const priceCents = Number(
       process.env.PRICE_CENTS ||
-      process.env.REACT_APP_PIX_PRICE * 100 ||
-      5500
+        (Number(process.env.REACT_APP_PIX_PRICE) * 100) ||
+        5500
     );
     const amount = Number(((rs.numbers.length * priceCents) / 100).toFixed(2));
 
@@ -68,11 +66,10 @@ router.post('/pix', requireAuth, async (req, res) => {
       .map((n) => n.toString().padStart(2, '0'))
       .join(', ')}`;
 
-    // URL pública do backend para o webhook
     const baseUrl = (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
     const notification_url = `${baseUrl}/api/payments/webhook`;
 
-    // E-mail do pagador (do banco ou do token atual)
+    // E-mail do pagador
     const payerEmail = rs.user_email || req.user?.email || 'comprador@example.com';
 
     // Cria pagamento PIX no Mercado Pago (idempotente)
@@ -84,9 +81,9 @@ router.post('/pix', requireAuth, async (req, res) => {
         payer: { email: payerEmail },
         external_reference: String(reservationId),
         notification_url,
-        date_of_expiration: new Date(Date.now() + 30 * 60 * 1000).toISOString()
+        date_of_expiration: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
       },
-      requestOptions: { idempotencyKey: uuidv4() }
+      requestOptions: { idempotencyKey: uuidv4() },
     });
 
     const body = mpResp?.body || mpResp;
@@ -114,22 +111,14 @@ router.post('/pix', requireAuth, async (req, res) => {
         rs.numbers.length * priceCents,
         status,
         qr_code || null,
-        qr_code_base64 || null
+        qr_code_base64 || null,
       ]
     );
 
     // Amarra a reserva ao pagamento (status segue 'active' até aprovar)
-    await query(
-      `update reservations set payment_id = $2 where id = $1`,
-      [reservationId, String(id)]
-    );
+    await query(`update reservations set payment_id = $2 where id = $1`, [reservationId, String(id)]);
 
-    return res.json({
-      paymentId: String(id),
-      status,
-      qr_code,
-      qr_code_base64
-    });
+    return res.json({ paymentId: String(id), status, qr_code, qr_code_base64 });
   } catch (e) {
     console.error('[pix] error:', e);
     return res.status(500).json({ error: 'pix_failed' });
@@ -259,12 +248,8 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
-export default router;
-
 // === LISTA MEUS PAGAMENTOS (para a conta) ===
 // GET /api/payments/me  -> { payments: [...] }
-import { requireAuth } from '../middleware/auth.js';
-
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const r = await query(
@@ -287,3 +272,5 @@ router.get('/me', requireAuth, async (req, res) => {
     return res.status(500).json({ error: 'list_failed' });
   }
 });
+
+export default router;
