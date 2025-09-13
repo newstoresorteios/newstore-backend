@@ -53,7 +53,7 @@ router.post('/', requireAuth, async (req, res) => {
     );
     if (!nums.length) return res.status(400).json({ error: 'numbers_invalid' });
 
-    const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 15);
+    const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 5);
 
     const dr = await query(
       `select id

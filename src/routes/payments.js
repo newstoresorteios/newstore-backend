@@ -81,7 +81,7 @@ router.post('/pix', requireAuth, async (req, res) => {
         payer: { email: payerEmail },
         external_reference: String(reservationId),
         notification_url,
-        date_of_expiration: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        date_of_expiration: new Date(Date.now() + PIX_EXP_MIN * 60 * 1000).toISOString()
       },
       requestOptions: { idempotencyKey: uuidv4() },
     });
