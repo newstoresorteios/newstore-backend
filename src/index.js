@@ -15,6 +15,7 @@ import meRoutes from './routes/me.js';
 import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
+import adminDrawsRouter from "./routes/admin_draws.js";
 
 import { query, getPool } from './db.js';
 import { ensureSchema } from './seed.js';
@@ -61,6 +62,8 @@ app.use('/api/me', meRoutes);
 app.use('/api/draws', drawsRoutes);
 app.use('/api/draws-ext', drawsExtRoutes);
 app.use('/api/admin', adminRoutes);
+
+app.use("/api/admin/draws", adminDrawsRouter);
 
 // 404
 app.use((req, res) => {
