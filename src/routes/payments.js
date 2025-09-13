@@ -13,6 +13,11 @@ const mpClient = new MercadoPagoConfig({
 });
 const mpPayment = new Payment(mpClient);
 
+const PIX_EXP_MIN = Math.max(
+  30,
+  Number(process.env.PIX_EXP_MIN || process.env.PIX_EXP_MINUTES || 30)
+);
+
 /**
  * POST /api/payments/pix
  * Body: { reservationId }
