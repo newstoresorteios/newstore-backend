@@ -16,10 +16,7 @@ import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
 
-
-// 👉 use sempre o hub
 import { query, getPool } from './db.js';
-
 import { ensureSchema } from './seed.js';
 
 const app = express();
@@ -27,14 +24,14 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const ORIGIN = process.env.CORS_ORIGIN || '*';
 
+// ping de saúde no DB
 setInterval(() => {
-  query('SELECT 1').catch(e => console.warn('[health] db ping failed', e.code || e.message));
+  query('SELECT 1').catch(e =>
+    console.warn('[health] db ping failed', e.code || e.message)
+  );
 }, 60_000);
 
-app.use('/api/payments', paymentsRouter);
-
-
-
+// ── middlewares ─────────────────────────────────────────────
 app.use(cors({
   origin: ORIGIN === '*' ? true : ORIGIN.split(',').map(s => s.trim()),
   credentials: true,
@@ -47,28 +44,34 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// Rotas
+// ── rotas ───────────────────────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/numbers', numbersRoutes);
 app.use('/api/reservations', reservationsRoutes);
+
+// monta uma única vez o payments **correto**
 app.use('/api/payments', paymentsRoutes);
+
+// aliases para compatibilidade com o front:
+// /api/orders/me e /api/participations/me
+app.use('/api/orders', paymentsRoutes);
+app.use('/api/participations', paymentsRoutes);
+
 app.use('/api/me', meRoutes);
 app.use('/api/draws', drawsRoutes);
 app.use('/api/draws-ext', drawsExtRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api/orders', paymentsRouter);
-app.use('/api/participations', paymentsRouter);
 
 // 404
 app.use((req, res) => {
   res.status(404).json({ error: 'not_found', path: req.originalUrl });
 });
 
-// Bootstrap
+// ── bootstrap ───────────────────────────────────────────────
 async function bootstrap() {
   try {
-    await ensureSchema();                    // garante schema
-    const pool = await getPool();            // aquece pool
+    await ensureSchema();
+    const pool = await getPool();
     await pool.query('SELECT 1');
     console.log('[db] warmup ok');
 
