@@ -260,3 +260,30 @@ router.post('/webhook', async (req, res) => {
 });
 
 export default router;
+
+// === LISTA MEUS PAGAMENTOS (para a conta) ===
+// GET /api/payments/me  -> { payments: [...] }
+import { requireAuth } from '../middleware/auth.js';
+
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const r = await query(
+      `select id,
+              user_id,
+              draw_id,
+              numbers,
+              amount_cents,
+              status,
+              created_at,
+              paid_at
+         from payments
+        where user_id = $1
+        order by coalesce(paid_at, created_at) asc`,
+      [req.user.id]
+    );
+    return res.json({ payments: r.rows || [] });
+  } catch (e) {
+    console.error('[payments/me] error:', e);
+    return res.status(500).json({ error: 'list_failed' });
+  }
+});

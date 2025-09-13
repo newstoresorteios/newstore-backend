@@ -16,6 +16,7 @@ import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
 
+
 // 👉 use sempre o hub
 import { query, getPool } from './db.js';
 
@@ -29,6 +30,10 @@ const ORIGIN = process.env.CORS_ORIGIN || '*';
 setInterval(() => {
   query('SELECT 1').catch(e => console.warn('[health] db ping failed', e.code || e.message));
 }, 60_000);
+
+app.use('/api/payments', paymentsRouter);
+
+
 
 app.use(cors({
   origin: ORIGIN === '*' ? true : ORIGIN.split(',').map(s => s.trim()),
@@ -51,6 +56,8 @@ app.use('/api/me', meRoutes);
 app.use('/api/draws', drawsRoutes);
 app.use('/api/draws-ext', drawsExtRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/orders', paymentsRouter);
+app.use('/api/participations', paymentsRouter);
 
 // 404
 app.use((req, res) => {
