@@ -6,34 +6,46 @@ const router = Router();
 
 /**
  * GET /api/draws
- * Lista sorteios. Aceita ?status=open|closed (opcional)
+ * Lista sorteios. Aceita ?status=open|closed (opcional).
+ * Retorna campos padronizados que o front entende.
  */
 router.get('/draws', async (req, res) => {
   try {
     const status = String(req.query.status || '').toLowerCase();
-    const args = [];
-    let where = '';
-    if (status === 'open' || status === 'closed') {
-      args.push(status);
-      where = 'WHERE d.status = $1';
-    }
 
-    const sql = `
-      SELECT
+    let sql = `
+      select
         d.id,
         d.status,
-        COALESCE(d.opened_at, d.created_at) AS opened_at,
+        coalesce(d.opened_at, d.created_at) as opened_at,
         d.closed_at,
         d.realized_at,
-        COALESCE(d.winner_name, u.name, u.email, '-') AS winner_name
-      FROM draws d
-      LEFT JOIN users u ON u.id = d.winner_user_id
-      ${where}
-      ORDER BY d.id DESC
+        -- usa winner_name que existe na tabela
+        d.winner_name
+      from draws d
     `;
+    const args = [];
+
+    if (status === 'open' || status === 'closed') {
+      sql += ` where d.status = $1`;
+      args.push(status);
+    }
+
+    sql += ` order by d.id desc`;
 
     const { rows } = await query(sql, args);
-    return res.json({ draws: rows || [] });
+
+    // Normaliza payload
+    const draws = (rows || []).map(r => ({
+      id: r.id,
+      status: r.status,
+      opened_at: r.opened_at,
+      closed_at: r.closed_at,
+      realized_at: r.realized_at,
+      winner_name: r.winner_name || null,
+    }));
+
+    return res.json({ draws });
   } catch (e) {
     console.error('[draws] list error', e);
     return res.status(500).json({ error: 'list_failed' });
@@ -42,53 +54,38 @@ router.get('/draws', async (req, res) => {
 
 /**
  * GET /api/draws/history
- * Lista sorteios fechados (status = closed OU closed_at não-nulo)
- * Não exige auth (somente leitura)
+ * Versão pública: só sorteios fechados.
  */
 router.get('/draws/history', async (_req, res) => {
   try {
-    const sql = `
-      SELECT
+    const { rows } = await query(
+      `
+      select
         d.id,
         d.status,
-        COALESCE(d.opened_at, d.created_at) AS opened_at,
+        coalesce(d.opened_at, d.created_at) as opened_at,
         d.closed_at,
         d.realized_at,
-        ROUND(
-          EXTRACT(EPOCH FROM (COALESCE(d.closed_at, NOW()) - COALESCE(d.opened_at, d.created_at)))
-          / 86400.0
-        )::int AS days_open,
-        COALESCE(d.winner_name, u.name, u.email, '-') AS winner_name
-      FROM draws d
-      LEFT JOIN users u ON u.id = d.winner_user_id
-      WHERE d.status = 'closed' OR d.closed_at IS NOT NULL
-      ORDER BY d.id DESC
-    `;
-    const { rows } = await query(sql, []);
-    return res.json({ history: rows || [] });
-  } catch (e) {
-    console.error('[draws/history] error:', e);
-    return res.status(500).json({ error: 'list_failed' });
-  }
-});
-
-/**
- * (Opcional) GET /api/draws/:id/numbers
- * Lista números do sorteio.
- */
-router.get('/draws/:id/numbers', async (req, res) => {
-  try {
-    const drawId = Number(req.params.id);
-    if (!drawId) return res.json({ numbers: [] });
-    const r = await query(
-      'SELECT n, status FROM numbers WHERE draw_id = $1 ORDER BY n ASC',
-      [drawId]
+        d.winner_name
+      from draws d
+      where d.status = 'closed' or d.closed_at is not null
+      order by d.id desc
+      `
     );
-    const numbers = (r.rows || []).map(x => ({ n: x.n, status: x.status }));
-    return res.json({ numbers });
+
+    const history = (rows || []).map(r => ({
+      id: r.id,
+      status: r.status,
+      opened_at: r.opened_at,
+      closed_at: r.closed_at,
+      realized_at: r.realized_at,
+      winner_name: r.winner_name || null,
+    }));
+
+    return res.json({ history });
   } catch (e) {
-    console.error('[draws/:id/numbers] error:', e);
-    return res.status(500).json({ error: 'numbers_failed' });
+    console.error('[draws/history] error', e);
+    return res.status(500).json({ error: 'history_failed' });
   }
 });
 
