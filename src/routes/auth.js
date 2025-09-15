@@ -18,6 +18,9 @@ const TOKEN_TTL   = process.env.JWT_TTL || '7d';
 const COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'ns_auth';
 const IS_PROD     = (process.env.NODE_ENV || 'production') === 'production';
 
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_TTL });
 }
@@ -27,12 +30,10 @@ async function verifyPassword(plain, hashed) {
   try {
     const h = String(hashed);
     if (h.startsWith('$2')) {
-      // bcrypt hash
-      return await bcrypt.compare(String(plain), h);
+      return await bcrypt.compare(String(plain), h); // bcrypt
     }
     if (!h.startsWith('$')) {
-      // fallback: texto-plain legado (não recomendado)
-      return String(plain) === h;
+      return String(plain) === h; // legado texto puro
     }
     return false;
   } catch {
@@ -40,9 +41,8 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
+// Cupom determinístico, único por usuário
 function makeUserCouponCode(userId) {
-  // Cupom determinístico, único por usuário (não muda a cada request)
-  // Ex.: NSU-0003-8K (baseado no id)
   const id = Number(userId || 0);
   const base = `NSU-${String(id).padStart(4, '0')}`;
   const salt = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -50,8 +50,8 @@ function makeUserCouponCode(userId) {
   return `${base}-${tail}`;
 }
 
+// Lê usuário completo + gera cupom se precisar
 async function hydrateUserFromDB(id, email) {
-  // Busca o usuário completo no banco (inclui coupon_code)
   let r = null;
   if (id) {
     r = await query(
@@ -71,7 +71,6 @@ async function hydrateUserFromDB(id, email) {
   if (!r || !r.rows.length) return null;
   let u = r.rows[0];
 
-  // Se ainda não tem cupom, gera e grava UMA vez
   if (!u.coupon_code) {
     const code = makeUserCouponCode(u.id);
     const upd = await query(
@@ -94,66 +93,53 @@ async function hydrateUserFromDB(id, email) {
   };
 }
 
-
-// Busca usuário por e-mail tentando colunas/tabelas conhecidas, SEM quebrar se não existirem
+// Busca por e-mail em esquemas/colunas legadas (best-effort)
 async function findUserByEmail(emailRaw) {
   const email = String(emailRaw).trim();
-
-  // ping leve para manter pool ativo
   try { await query('SELECT 1', []); } catch {}
 
   const variants = [
-    // users.pass_hash (bcrypt) — PRIORIDADE
     {
       sql: `
         SELECT id, email, pass_hash AS hash,
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
           FROM users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1
-      `,
+         LIMIT 1`,
       args: [email],
     },
-    // users.password_hash (bcrypt)
     {
       sql: `
         SELECT id, email, password_hash AS hash,
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
           FROM users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1
-      `,
+         LIMIT 1`,
       args: [email],
     },
-    // users.password (texto-plain legado)
     {
       sql: `
         SELECT id, email, password AS hash,
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
           FROM users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1
-      `,
+         LIMIT 1`,
       args: [email],
     },
-    // admin_users.password_hash (bcrypt)
     {
       sql: `
         SELECT id, email, password_hash AS hash, role
           FROM admin_users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1
-      `,
+         LIMIT 1`,
       args: [email],
     },
-    // admins.password (texto-plain legado)
     {
       sql: `
         SELECT id, email, password AS hash, 'admin' AS role
           FROM admins
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1
-      `,
+         LIMIT 1`,
       args: [email],
     },
   ];
@@ -163,12 +149,15 @@ async function findUserByEmail(emailRaw) {
       const { rows } = await query(v.sql, v.args);
       if (rows && rows.length) return rows[0];
     } catch {
-      // ignora 42P01/42703 etc. e tenta a próxima variante
+      // ignora 42P01/42703 etc. e tenta a próxima
     }
   }
   return null;
 }
 
+// ----------------------------------------------------------------------------
+// Rotas
+// ----------------------------------------------------------------------------
 router.post('/register', async (req, res) => {
   try {
     const { name, email, password } = req.body || {};
@@ -224,9 +213,16 @@ router.post('/login', async (req, res) => {
     }
 
     const ok = await verifyPassword(password, user.hash);
-    if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+    if (!ok) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
 
     const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
+
+    // inclui coupon_code
+    const full =
+      (await hydrateUserFromDB(user.id, user.email)) ||
+      { id: user.id, email: user.email, role: user.role || 'user' };
 
     res.cookie(COOKIE_NAME, token, {
       httpOnly: true,
@@ -236,43 +232,12 @@ router.post('/login', async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    return res.json({
-      ok: true,
-      token,
-      user: { id: user.id, email: user.email, role: user.role || 'user' },
-    });
+    return res.json({ ok: true, token, user: full });
   } catch (e) {
     console.error('[auth] login error', e.code || e.message || e);
     return res.status(503).json({ error: 'db_unavailable' });
   }
 });
-
-const user = await findUserByEmail(email);
-if (!user || !user.hash) return res.status(401).json({ error: 'invalid_credentials' });
-
-const ok = await verifyPassword(password, user.hash);
-if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
-
-const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
-
-// <<< NOVO: compõe o usuário com coupon_code do banco
-const full = await hydrateUserFromDB(user.id, user.email) || {
-  id: user.id,
-  email: user.email,
-  role: user.role || 'user',
-};
-
-res.cookie(COOKIE_NAME, token, {
-  httpOnly: true,
-  secure: IS_PROD,
-  sameSite: IS_PROD ? 'none' : 'lax',
-  path: '/',
-  maxAge: 7 * 24 * 60 * 60 * 1000,
-});
-
-// mantém a mesma estrutura que o front já usa
-return res.json({ ok: true, token, user: full });
-
 
 router.post('/logout', (_req, res) => {
   res.clearCookie(COOKIE_NAME, {
@@ -287,7 +252,6 @@ router.post('/logout', (_req, res) => {
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const u = await hydrateUserFromDB(req.user?.id, req.user?.email);
-    // O AuthContext atual espera o objeto do usuário diretamente (sem { ok, user })
     return res.json(u || req.user);
   } catch (e) {
     console.error('[auth] /me error', e?.message || e);
@@ -295,11 +259,13 @@ router.get('/me', requireAuth, async (req, res) => {
   }
 });
 
-
+// ----------------------------------------------------------------------------
+// Reset de senha
+// ----------------------------------------------------------------------------
 /**
  * POST /api/auth/reset-password
  * Body: { email: string, newPassword?: string }
- * - Gera (ou usa) uma senha nova
+ * - Gera (ou usa) nova senha
  * - Atualiza pass_hash/password_hash/password nas tabelas legadas (best-effort)
  * - Envia e-mail (ou só loga em dev, se SMTP não estiver configurado)
  */
@@ -309,7 +275,7 @@ router.post('/reset-password', async (req, res) => {
     email = String(email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ error: 'invalid_email' });
 
-    // Gera senha aleatória de 6 chars se não vier pronta
+    // Senha aleatória de 6 chars
     if (!newPassword) {
       const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
       newPassword = Array.from({ length: 6 }, () =>
@@ -317,60 +283,50 @@ router.post('/reset-password', async (req, res) => {
       ).join('');
     }
 
-    // 1) Atualiza a senha em todos os lugares plausíveis (best-effort)
+    // Atualiza em colunas/tabelas plausíveis (best-effort)
     let updated = false;
     try {
       const hash = await bcrypt.hash(String(newPassword), 10);
 
-      // users.pass_hash (bcrypt)
       try {
         const r = await query(
           `UPDATE users SET pass_hash = $2 WHERE lower(email) = lower($1)`,
           [email, hash]
-        );
-        if (r.rowCount) updated = true;
+        ); if (r.rowCount) updated = true;
       } catch {}
 
-      // users.password_hash (bcrypt)
       try {
         const r = await query(
           `UPDATE users SET password_hash = $2 WHERE lower(email) = lower($1)`,
           [email, hash]
-        );
-        if (r.rowCount) updated = true;
+        ); if (r.rowCount) updated = true;
       } catch {}
 
-      // users.password (texto-plain legado)
       try {
         const r = await query(
           `UPDATE users SET password = $2 WHERE lower(email) = lower($1)`,
           [email, String(newPassword)]
-        );
-        if (r.rowCount) updated = true;
+        ); if (r.rowCount) updated = true;
       } catch {}
 
-      // admin_users.password_hash (bcrypt)
       try {
         const r = await query(
           `UPDATE admin_users SET password_hash = $2 WHERE lower(email) = lower($1)`,
           [email, hash]
-        );
-        if (r.rowCount) updated = true;
+        ); if (r.rowCount) updated = true;
       } catch {}
 
-      // admins.password (texto-plain legado)
       try {
         const r = await query(
           `UPDATE admins SET password = $2 WHERE lower(email) = lower($1)`,
           [email, String(newPassword)]
-        );
-        if (r.rowCount) updated = true;
+        ); if (r.rowCount) updated = true;
       } catch {}
     } catch (e) {
       console.warn('[reset-password] hashing/update skipped:', e.message);
     }
 
-    // 2) Envia o e-mail (ou apenas loga em dev)
+    // Envia e-mail
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT || 587),
@@ -381,7 +337,7 @@ router.post('/reset-password', async (req, res) => {
     });
 
     const mail = {
-      from: 'tironinho@hotmail.com',
+      from: 'administracao@newstoresorteios.com.br',
       to: email,
       subject: 'Reset de senha - New Store Sorteios',
       text:
@@ -401,7 +357,6 @@ router.post('/reset-password', async (req, res) => {
     return res.json({ ok: true, delivered, updated });
   } catch (err) {
     console.error('[reset-password] error:', err);
-    // Mesmo se o e-mail falhar, não travamos o fluxo do front
     return res.json({ ok: true, delivered: false, updated: false });
   }
 });
