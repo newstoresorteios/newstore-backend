@@ -8,9 +8,9 @@ const router = Router();
  * GET /api/numbers
  * - Pega o draw aberto
  * - Lê todos os números do draw (0..99) a partir da tabela numbers
- * - Marca como "taken" os números que têm pagamento aprovado
+ * - Marca como "sold" (indisponível) os números que têm pagamento aprovado
  * - Marca como "reserved" os números com reserva ativa (não expirada)
- * - Faz lazy-expire das reservas vencidas
+ * - Faz lazy-expire das reservas vencidas (best-effort)
  * - Retorna o status final para cada número
  */
 router.get('/', async (_req, res) => {
@@ -22,13 +22,13 @@ router.get('/', async (_req, res) => {
     if (!dr.rows.length) return res.json({ drawId: null, numbers: [] });
     const drawId = dr.rows[0].id;
 
-    // 2) lista base de números (autoridade para o range 0..99)
+    // 2) lista base de números 0..99
     const base = await query(
       `SELECT n FROM numbers WHERE draw_id = $1 ORDER BY n ASC`,
       [drawId]
     );
 
-    // 3) números TOMADOS por pagamento aprovado
+    // 3) pagos => SOLD (UI espera "sold")
     const pays = await query(
       `SELECT numbers
          FROM payments
@@ -36,12 +36,12 @@ router.get('/', async (_req, res) => {
           AND lower(status) IN ('approved','paid','pago')`,
       [drawId]
     );
-    const taken = new Set();
+    const sold = new Set();
     for (const p of pays.rows || []) {
-      for (const n of (p.numbers || [])) taken.add(Number(n));
+      for (const n of (p.numbers || [])) sold.add(Number(n));
     }
 
-    // 4) RESERVAS ativas; expira as vencidas (lazy)
+    // 4) reservas ativas; ignora expiradas (e tenta expirar em background)
     const resvs = await query(
       `SELECT id, numbers, status, expires_at
          FROM reservations
@@ -58,23 +58,23 @@ router.get('/', async (_req, res) => {
       const isExpired = exp && !Number.isNaN(exp) && exp < now;
 
       if (isExpired) {
-        // marca como expirado (best-effort; não bloqueia a resposta)
+        // best-effort: não bloqueia a resposta
         query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [r.id])
           .catch(() => {});
         continue;
       }
 
-      // reserva só se ainda não foi tomada por pagamento aprovado
+      // reserva só se ainda não foi vendida
       for (const n of (r.numbers || [])) {
         const num = Number(n);
-        if (!taken.has(num)) reserved.add(num);
+        if (!sold.has(num)) reserved.add(num);
       }
     }
 
     // 5) status final por número
     const numbers = base.rows.map(({ n }) => {
-      if (taken.has(n))     return { n, status: 'taken' };
-      if (reserved.has(n))  return { n, status: 'reserved' };
+      if (sold.has(n))     return { n, status: 'sold' };      // <<< ajuste aqui
+      if (reserved.has(n)) return { n, status: 'reserved' };
       return { n, status: 'available' };
     });
 

@@ -1,4 +1,4 @@
-// src/routes/reservations.js
+// backend/src/routes/reservations.js
 import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../db.js';
@@ -8,30 +8,32 @@ const router = Router();
 
 /**
  * Expira reservas vencidas (best-effort, fora da transação principal).
- * Mantido para “limpeza geral”, mas a expiração crítica também é feita
- * novamente dentro da transação ao reservar (garante consistência).
+ * Mantido para “limpeza geral”; a expiração crítica também acontece
+ * dentro da transação ao reservar (garante consistência).
  */
 async function cleanupExpiredGlobal() {
-  const expired = await query(
+  // expira qualquer reserva “bloqueadora” vencida
+  await query(
     `UPDATE reservations
         SET status = 'expired'
-      WHERE status = 'active'
-        AND expires_at IS NOT NULL
+      WHERE expires_at IS NOT NULL
         AND expires_at < NOW()
-      RETURNING id, draw_id, numbers`
+        AND lower(coalesce(status,'')) IN ('active','pending','reserved','')`
   );
 
-  for (const r of expired.rows) {
-    await query(
-      `UPDATE numbers
-          SET status = 'available',
-              reservation_id = NULL
-        WHERE draw_id = $1
-          AND n = ANY($2)
-          AND reservation_id = $3`,
-      [r.draw_id, r.numbers, r.id]
-    );
-  }
+  // libera números que ficaram presos com reservation_id sem reserva ativa
+  await query(
+    `UPDATE numbers n
+        SET status = 'available',
+            reservation_id = NULL
+      WHERE n.status = 'reserved'
+        AND NOT EXISTS (
+              SELECT 1
+                FROM reservations r
+               WHERE r.id = n.reservation_id
+                 AND lower(coalesce(r.status,'')) IN ('active','pending','reserved','')
+            )`
+  );
 }
 
 router.post('/', requireAuth, async (req, res) => {
@@ -102,6 +104,7 @@ router.post('/', requireAuth, async (req, res) => {
     for (const row of check.rows) {
       if (row.status === 'reserved' && row.reservation_id) {
         const rid = row.reservation_id;
+
         // lock na reserva para leitura consistente
         const rsv = await query(
           `SELECT id, status, expires_at
@@ -113,14 +116,13 @@ router.post('/', requireAuth, async (req, res) => {
 
         const r = rsv.rows[0];
         if (r) {
-          const isActive = String(r.status).toLowerCase() === 'active';
-          const isExpired =
-            r.expires_at && new Date(r.expires_at).getTime() <= Date.now();
+          const statusLower = String(r.status || '').toLowerCase();
+          const isBlocking = ['active','pending','reserved',''].includes(statusLower);
+          const isExpired = r.expires_at && new Date(r.expires_at).getTime() <= Date.now();
 
-          if (isActive && isExpired) {
-            // expira a reserva e libera os números que ela segurava
+          if (isBlocking && isExpired) {
+            // expira a reserva e marca para liberar seus números
             await query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [rid]);
-
             if (!byResId.has(rid)) byResId.set(rid, []);
             byResId.get(rid).push(row.n);
           }
@@ -166,10 +168,8 @@ router.post('/', requireAuth, async (req, res) => {
 
     const conflicts = [];
     for (const row of after.rows) {
-      // conflito se já “sold/taken/reserved” OU pago aprovado
       const st = String(row.status).toLowerCase();
-      const isBusy =
-        st !== 'available' || paidTaken.has(Number(row.n));
+      const isBusy = st !== 'available' || paidTaken.has(Number(row.n));
       if (isBusy) conflicts.push(row.n);
     }
 
