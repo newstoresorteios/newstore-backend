@@ -3,6 +3,7 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
+
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 
@@ -25,39 +26,87 @@ async function verifyPassword(plain, hashed) {
   if (!hashed) return false;
   try {
     const h = String(hashed);
-    if (h.startsWith('$2')) {
-      return await bcrypt.compare(String(plain), h);
-    }
-    if (!h.startsWith('$')) {
-      return String(plain) === h; // legado em texto
-    }
+    if (h.startsWith('$2')) return await bcrypt.compare(String(plain), h); // bcrypt
+    if (!h.startsWith('$')) return String(plain) === h; // legado texto-plain
     return false;
   } catch {
     return false;
   }
 }
 
-// Busca usuário **sem** referenciar colunas inexistentes (evita 42703)
-async function findUserByEmail(emailRaw) {
-  const email = String(emailRaw || '').trim();
-  if (!email) return null;
-  try { await query('SELECT 1'); } catch {}
+// Gera um cupom determinístico por usuário (só se ainda não existir)
+function makeUserCouponCode(userId) {
+  const id = Number(userId || 0);
+  const base = `NSU-${String(id).padStart(4, '0')}`;
+  const salt = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const tail = salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
+  return `${base}-${tail}`;
+}
 
-  try {
-    const { rows } = await query(
-      `SELECT * FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [email]
+async function hydrateUserFromDB(id, email) {
+  let r = null;
+  if (id) {
+    r = await query(
+      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+         FROM users WHERE id=$1 LIMIT 1`, [id]
     );
-    if (!rows?.length) return null;
-
-    const u = rows[0];
-    const hash = u.pass_hash || u.password_hash || u.password || null;
-    const role = u.is_admin === true ? 'admin' : (u.role ? String(u.role) : 'user');
-
-    return { id: u.id, email: u.email, hash, role };
-  } catch {
-    return null;
   }
+  if ((!r || !r.rows.length) && email) {
+    r = await query(
+      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+         FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]
+    );
+  }
+  if (!r || !r.rows.length) return null;
+  let u = r.rows[0];
+
+  // cria o coupon_code se ainda não existir (não mexe em tray aqui)
+  if (!u.coupon_code) {
+    const code = makeUserCouponCode(u.id);
+    const upd = await query(
+      `UPDATE users SET coupon_code=$2, coupon_updated_at=NOW()
+        WHERE id=$1
+        RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at`,
+      [u.id, code]
+    );
+    u = upd.rows[0];
+  }
+
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    role: u.is_admin ? 'admin' : 'user',
+    coupon_code: u.coupon_code || null,
+    coupon_updated_at: u.coupon_updated_at || null,
+  };
+}
+
+// Busca usuário por e-mail cobrindo colunas/tabelas legadas
+async function findUserByEmail(emailRaw) {
+  const email = String(emailRaw).trim();
+  try { await query('SELECT 1', []); } catch {}
+
+  const variants = [
+    { sql: `SELECT id, email, pass_hash AS hash, CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
+            FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, args: [email] },
+    { sql: `SELECT id, email, password_hash AS hash, CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
+            FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, args: [email] },
+    { sql: `SELECT id, email, password AS hash, CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
+            FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, args: [email] },
+    { sql: `SELECT id, email, password_hash AS hash, role FROM admin_users
+            WHERE LOWER(email)=LOWER($1) LIMIT 1`, args: [email] },
+    { sql: `SELECT id, email, password AS hash, 'admin' AS role FROM admins
+            WHERE LOWER(email)=LOWER($1) LIMIT 1`, args: [email] },
+  ];
+
+  for (const v of variants) {
+    try {
+      const { rows } = await query(v.sql, v.args);
+      if (rows && rows.length) return rows[0];
+    } catch {/* ignora 42P01/42703 etc. */}
+  }
+  return null;
 }
 
 router.post('/register', async (req, res) => {
@@ -68,19 +117,14 @@ router.post('/register', async (req, res) => {
     }
 
     const emailNorm = String(email).trim().toLowerCase();
-
-    const dupe = await query(
-      'SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)',
-      [emailNorm]
-    );
+    const dupe = await query('SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)', [emailNorm]);
     if (dupe.rows.length) return res.status(409).json({ error: 'email_in_use' });
 
     const hash = await bcrypt.hash(String(password), 10);
     const ins = await query(
       `INSERT INTO users (name, email, pass_hash)
        VALUES ($1,$2,$3)
-       RETURNING id, name, email,
-                 CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role`,
+       RETURNING id, name, email, CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role`,
       [name, emailNorm, hash]
     );
 
@@ -119,6 +163,11 @@ router.post('/login', async (req, res) => {
 
     const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
 
+    // usuário “hidratado” (traz coupon_code caso exista/precise criar)
+    const full = await hydrateUserFromDB(user.id, user.email) || {
+      id: user.id, email: user.email, role: user.role || 'user',
+    };
+
     res.cookie(COOKIE_NAME, token, {
       httpOnly: true,
       secure: IS_PROD,
@@ -127,12 +176,7 @@ router.post('/login', async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    // devolve no formato que o front já usa
-    return res.json({
-      ok: true,
-      token,
-      user: { id: user.id, email: user.email, role: user.role || 'user' },
-    });
+    return res.json({ ok: true, token, user: full });
   } catch (e) {
     console.error('[auth] login error', e.code || e.message || e);
     return res.status(503).json({ error: 'db_unavailable' });
@@ -151,27 +195,9 @@ router.post('/logout', (_req, res) => {
 
 router.get('/me', requireAuth, async (req, res) => {
   try {
-    // tenta enriquecer com coupon_code; se falhar, devolve req.user mesmo
-    let out = req.user;
-    try {
-      const { rows } = await query(
-        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
-           FROM users WHERE id=$1 LIMIT 1`,
-        [req.user.id]
-      );
-      if (rows?.length) {
-        const r = rows[0];
-        out = {
-          id: r.id,
-          name: r.name,
-          email: r.email,
-          role: r.is_admin ? 'admin' : 'user',
-          coupon_code: r.coupon_code || null,
-          coupon_updated_at: r.coupon_updated_at || null,
-        };
-      }
-    } catch {}
-    return res.json(out);
+    const u = await hydrateUserFromDB(req.user?.id, req.user?.email);
+    // O front já espera o objeto diretamente
+    return res.json(u || req.user);
   } catch (e) {
     console.error('[auth] /me error', e?.message || e);
     return res.status(503).json({ error: 'db_unavailable' });
@@ -197,31 +223,14 @@ router.post('/reset-password', async (req, res) => {
     let updated = false;
     try {
       const hash = await bcrypt.hash(String(newPassword), 10);
-
-      try {
-        const r = await query(`UPDATE users SET pass_hash=$2 WHERE lower(email)=lower($1)`, [email, hash]);
-        if (r.rowCount) updated = true;
-      } catch {}
-
-      try {
-        const r = await query(`UPDATE users SET password_hash=$2 WHERE lower(email)=lower($1)`, [email, hash]);
-        if (r.rowCount) updated = true;
-      } catch {}
-
-      try {
-        const r = await query(`UPDATE users SET password=$2 WHERE lower(email)=lower($1)`, [email, String(newPassword)]);
-        if (r.rowCount) updated = true;
-      } catch {}
-
-      try {
-        const r = await query(`UPDATE admin_users SET password_hash=$2 WHERE lower(email)=lower($1)`, [email, hash]);
-        if (r.rowCount) updated = true;
-      } catch {}
-
-      try {
-        const r = await query(`UPDATE admins SET password=$2 WHERE lower(email)=lower($1)`, [email, String(newPassword)]);
-        if (r.rowCount) updated = true;
-      } catch {}
+      const upd = async (sql, vals) => {
+        try { const r = await query(sql, vals); if (r.rowCount) updated = true; } catch {}
+      };
+      await upd(`UPDATE users SET pass_hash=$2        WHERE lower(email)=lower($1)`, [email, hash]);
+      await upd(`UPDATE users SET password_hash=$2    WHERE lower(email)=lower($1)`, [email, hash]);
+      await upd(`UPDATE users SET password=$2         WHERE lower(email)=lower($1)`, [email, String(newPassword)]);
+      await upd(`UPDATE admin_users SET password_hash=$2 WHERE lower(email)=lower($1)`, [email, hash]);
+      await upd(`UPDATE admins SET password=$2        WHERE lower(email)=lower($1)`, [email, String(newPassword)]);
     } catch (e) {
       console.warn('[reset-password] hashing/update skipped:', e.message);
     }
@@ -230,19 +239,14 @@ router.post('/reset-password', async (req, res) => {
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT || 587),
       secure: String(process.env.SMTP_SECURE || 'false') === 'true',
-      auth: process.env.SMTP_USER
-        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-        : undefined,
+      auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
     });
 
     const mail = {
       from: 'tironinho@hotmail.com',
       to: email,
       subject: 'Reset de senha - New Store Sorteios',
-      text:
-        `Sua senha foi resetada.\n\n` +
-        `Nova Senha: ${newPassword}\n\n` +
-        `Se você não solicitou, ignore este e-mail.`,
+      text: `Sua senha foi resetada.\n\nNova Senha: ${newPassword}\n\nSe você não solicitou, ignore este e-mail.`,
     };
 
     let delivered = false;
