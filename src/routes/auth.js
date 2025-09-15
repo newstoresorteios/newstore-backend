@@ -27,10 +27,12 @@ async function verifyPassword(plain, hashed) {
   try {
     const h = String(hashed);
     if (h.startsWith('$2')) {
-      return await bcrypt.compare(String(plain), h); // bcrypt
+      // bcrypt hash
+      return await bcrypt.compare(String(plain), h);
     }
     if (!h.startsWith('$')) {
-      return String(plain) === h; // legado texto-plain
+      // fallback: texto-plain legado (não recomendado)
+      return String(plain) === h;
     }
     return false;
   } catch {
@@ -38,7 +40,7 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
-// Cupom determinístico por usuário (único e estável)
+/** Gera um cupom determinístico e único por usuário */
 function makeUserCouponCode(userId) {
   const id = Number(userId || 0);
   const base = `NSU-${String(id).padStart(4, '0')}`;
@@ -47,52 +49,95 @@ function makeUserCouponCode(userId) {
   return `${base}-${tail}`;
 }
 
-// Carrega usuário completo e garante coupon_code
-async function hydrateUserFromDB(id, email) {
-  let r = null;
-  if (id) {
-    r = await query(
-      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
-         FROM users WHERE id=$1 LIMIT 1`,
-      [id]
-    );
+/** Garante (best-effort) que as colunas de cupom existam */
+let ensuredCouponCols = false;
+async function ensureCouponColumns() {
+  if (ensuredCouponCols) return;
+  try {
+    await query(`
+      ALTER TABLE IF EXISTS users
+        ADD COLUMN IF NOT EXISTS coupon_code text,
+        ADD COLUMN IF NOT EXISTS coupon_updated_at timestamptz
+    `);
+  } catch (e) {
+    // se não puder alterar, apenas seguimos; os SELECTs têm fallback
+    console.warn('[auth] ensureCouponColumns:', e.code || e.message);
+  } finally {
+    ensuredCouponCols = true;
   }
-  if ((!r || !r.rows.length) && email) {
-    r = await query(
-      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
-         FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [email]
-    );
-  }
-  if (!r || !r.rows.length) return null;
-
-  let u = r.rows[0];
-
-  if (!u.coupon_code) {
-    const code = makeUserCouponCode(u.id);
-    const upd = await query(
-      `UPDATE users
-          SET coupon_code=$2, coupon_updated_at=NOW()
-        WHERE id=$1
-      RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at`,
-      [u.id, code]
-    );
-    u = upd.rows[0];
-  }
-
-  return {
-    id: u.id,
-    name: u.name,
-    email: u.email,
-    role: u.is_admin ? 'admin' : 'user',
-    coupon_code: u.coupon_code || null,
-    coupon_updated_at: u.coupon_updated_at || null,
-  };
 }
 
-// Busca usuário por e-mail em variações de schema/colunas (tolerante a erros)
+/** Busca o usuário completo do DB (com coupon_code quando disponível) */
+async function hydrateUserFromDB(id, email) {
+  await ensureCouponColumns();
+
+  // tenta com as colunas novas
+  try {
+    let r = null;
+    if (id) {
+      r = await query(
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+           FROM users WHERE id=$1 LIMIT 1`,
+        [id]
+      );
+    }
+    if ((!r || !r.rows.length) && email) {
+      r = await query(
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+           FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+        [email]
+      );
+    }
+    if (!r || !r.rows.length) return null;
+
+    let u = r.rows[0];
+
+    // Se ainda não tem cupom, gera e grava UMA vez
+    if (!u.coupon_code) {
+      const code = makeUserCouponCode(u.id);
+      const upd = await query(
+        `UPDATE users
+            SET coupon_code=$2, coupon_updated_at=NOW()
+          WHERE id=$1
+        RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at`,
+        [u.id, code]
+      );
+      u = upd.rows[0];
+    }
+
+    return {
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      role: u.is_admin ? 'admin' : 'user',
+      coupon_code: u.coupon_code || null,
+      coupon_updated_at: u.coupon_updated_at || null,
+    };
+  } catch (e) {
+    // fallback para bases que ainda não têm as colunas
+    console.warn('[auth] hydrate fallback:', e.code || e.message);
+    const r = await query(
+      `SELECT id, name, email, is_admin FROM users
+        WHERE ${id ? 'id = $1' : 'LOWER(email)=LOWER($1)'} LIMIT 1`,
+      [id || email]
+    );
+    if (!r.rows.length) return null;
+    const u = r.rows[0];
+    return {
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      role: u.is_admin ? 'admin' : 'user',
+      coupon_code: null,
+      coupon_updated_at: null,
+    };
+  }
+}
+
+/** Busca usuário por e-mail, cobrindo colunas/tabelas legadas */
 async function findUserByEmail(emailRaw) {
   const email = String(emailRaw).trim();
+
   try { await query('SELECT 1', []); } catch {}
 
   const variants = [
@@ -102,7 +147,8 @@ async function findUserByEmail(emailRaw) {
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
           FROM users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1`,
+         LIMIT 1
+      `,
       args: [email],
     },
     {
@@ -111,7 +157,8 @@ async function findUserByEmail(emailRaw) {
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
           FROM users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1`,
+         LIMIT 1
+      `,
       args: [email],
     },
     {
@@ -120,7 +167,8 @@ async function findUserByEmail(emailRaw) {
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
           FROM users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1`,
+         LIMIT 1
+      `,
       args: [email],
     },
     {
@@ -128,7 +176,8 @@ async function findUserByEmail(emailRaw) {
         SELECT id, email, password_hash AS hash, role
           FROM admin_users
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1`,
+         LIMIT 1
+      `,
       args: [email],
     },
     {
@@ -136,7 +185,8 @@ async function findUserByEmail(emailRaw) {
         SELECT id, email, password AS hash, 'admin' AS role
           FROM admins
          WHERE LOWER(email) = LOWER($1)
-         LIMIT 1`,
+         LIMIT 1
+      `,
       args: [email],
     },
   ];
@@ -151,6 +201,8 @@ async function findUserByEmail(emailRaw) {
   }
   return null;
 }
+
+/* ===================== ROTAS ===================== */
 
 router.post('/register', async (req, res) => {
   try {
@@ -211,10 +263,12 @@ router.post('/login', async (req, res) => {
 
     const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
 
-    // Monta usuário completo (com coupon_code)
-    const full =
-      (await hydrateUserFromDB(user.id, user.email)) ||
-      { id: user.id, email: user.email, role: user.role || 'user' };
+    // compõe usuário completo (com coupon_code se houver)
+    const full = (await hydrateUserFromDB(user.id, user.email)) || {
+      id: user.id,
+      email: user.email,
+      role: user.role || 'user',
+    };
 
     res.cookie(COOKIE_NAME, token, {
       httpOnly: true,
@@ -264,6 +318,7 @@ router.post('/reset-password', async (req, res) => {
     email = String(email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ error: 'invalid_email' });
 
+    // Gera senha aleatória de 6 chars se não vier pronta
     if (!newPassword) {
       const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
       newPassword = Array.from({ length: 6 }, () =>
@@ -271,11 +326,12 @@ router.post('/reset-password', async (req, res) => {
       ).join('');
     }
 
-    // Atualiza nas possíveis colunas/tabelas (best-effort)
+    // 1) Atualiza a senha em todos os lugares plausíveis (best-effort)
     let updated = false;
     try {
       const hash = await bcrypt.hash(String(newPassword), 10);
 
+      // users.pass_hash (bcrypt)
       try {
         const r = await query(
           `UPDATE users SET pass_hash = $2 WHERE lower(email) = lower($1)`,
@@ -284,6 +340,7 @@ router.post('/reset-password', async (req, res) => {
         if (r.rowCount) updated = true;
       } catch {}
 
+      // users.password_hash (bcrypt)
       try {
         const r = await query(
           `UPDATE users SET password_hash = $2 WHERE lower(email) = lower($1)`,
@@ -292,6 +349,7 @@ router.post('/reset-password', async (req, res) => {
         if (r.rowCount) updated = true;
       } catch {}
 
+      // users.password (texto-plain legado)
       try {
         const r = await query(
           `UPDATE users SET password = $2 WHERE lower(email) = lower($1)`,
@@ -300,6 +358,7 @@ router.post('/reset-password', async (req, res) => {
         if (r.rowCount) updated = true;
       } catch {}
 
+      // admin_users.password_hash (bcrypt)
       try {
         const r = await query(
           `UPDATE admin_users SET password_hash = $2 WHERE lower(email) = lower($1)`,
@@ -308,6 +367,7 @@ router.post('/reset-password', async (req, res) => {
         if (r.rowCount) updated = true;
       } catch {}
 
+      // admins.password (texto-plain legado)
       try {
         const r = await query(
           `UPDATE admins SET password = $2 WHERE lower(email) = lower($1)`,
@@ -319,7 +379,7 @@ router.post('/reset-password', async (req, res) => {
       console.warn('[reset-password] hashing/update skipped:', e.message);
     }
 
-    // Envio de e-mail
+    // 2) Envia o e-mail (ou apenas loga em dev)
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT || 587),
