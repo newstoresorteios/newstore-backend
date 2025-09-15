@@ -14,9 +14,9 @@ const JWT_SECRET =
   process.env.SUPABASE_JWT_SECRET ||
   'change-me-in-env';
 
-const TOKEN_TTL  = process.env.JWT_TTL || '7d';
+const TOKEN_TTL   = process.env.JWT_TTL || '7d';
 const COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'ns_auth';
-const IS_PROD = (process.env.NODE_ENV || 'production') === 'production';
+const IS_PROD     = (process.env.NODE_ENV || 'production') === 'production';
 
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_TTL });
@@ -25,11 +25,14 @@ function signToken(payload) {
 async function verifyPassword(plain, hashed) {
   if (!hashed) return false;
   try {
-    if (String(hashed).startsWith('$2')) {
-      return await bcrypt.compare(String(plain), String(hashed)); // bcrypt
+    const h = String(hashed);
+    if (h.startsWith('$2')) {
+      // bcrypt hash
+      return await bcrypt.compare(String(plain), h);
     }
-    if (!String(hashed).startsWith('$')) {
-      return String(plain) === String(hashed); // fallback (não recomendado)
+    if (!h.startsWith('$')) {
+      // fallback: texto-plain legado (não recomendado)
+      return String(plain) === h;
     }
     return false;
   } catch {
@@ -37,38 +40,43 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
+// Busca usuário por e-mail em esquemas legados/combinados
 async function findUserByEmail(emailRaw) {
   const email = String(emailRaw).trim();
 
-  // ping leve (força reconexão se o pool estiver quebrado)
+  // ping leve para manter pool ativo
   await query('SELECT 1', []);
 
   const tries = [
+    // users: aceita pass_hash, password_hash OU password (texto)
     {
       q: `
-        SELECT id, email, pass_hash AS hash,
+        SELECT id, email,
+               COALESCE(pass_hash, password_hash, password) AS hash,
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
-        FROM users
-        WHERE LOWER(email) = LOWER($1)
-        LIMIT 1
+          FROM users
+         WHERE LOWER(email) = LOWER($1)
+         LIMIT 1
       `,
       args: [email],
     },
+    // admin_users: normalmente password_hash
     {
       q: `
         SELECT id, email, password_hash AS hash, role
-        FROM admin_users
-        WHERE LOWER(email) = LOWER($1)
-        LIMIT 1
+          FROM admin_users
+         WHERE LOWER(email) = LOWER($1)
+         LIMIT 1
       `,
       args: [email],
     },
+    // admins: legado com password em texto
     {
       q: `
         SELECT id, email, password AS hash, 'admin' AS role
-        FROM admins
-        WHERE LOWER(email) = LOWER($1)
-        LIMIT 1
+          FROM admins
+         WHERE LOWER(email) = LOWER($1)
+         LIMIT 1
       `,
       args: [email],
     },
@@ -90,7 +98,10 @@ router.post('/register', async (req, res) => {
 
     const emailNorm = String(email).trim().toLowerCase();
 
-    const dupe = await query('SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)', [emailNorm]);
+    const dupe = await query(
+      'SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)',
+      [emailNorm]
+    );
     if (dupe.rows.length) return res.status(409).json({ error: 'email_in_use' });
 
     const hash = await bcrypt.hash(String(password), 10);
@@ -123,10 +134,14 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'invalid_payload' });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'invalid_payload' });
+    }
 
     const user = await findUserByEmail(email);
-    if (!user || !user.hash) return res.status(401).json({ error: 'invalid_credentials' });
+    if (!user || !user.hash) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
 
     const ok = await verifyPassword(password, user.hash);
     if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
@@ -141,7 +156,11 @@ router.post('/login', async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    return res.json({ ok: true, token, user: { id: user.id, email: user.email, role: user.role || 'user' } });
+    return res.json({
+      ok: true,
+      token,
+      user: { id: user.id, email: user.email, role: user.role || 'user' },
+    });
   } catch (e) {
     console.error('[auth] login error', e.code || e.message || e);
     return res.status(503).json({ error: 'db_unavailable' });
@@ -162,19 +181,20 @@ router.get('/me', requireAuth, (req, res) => {
   return res.json({ ok: true, user: req.user });
 });
 
-
-// POST /api/auth/reset-password
-// body: { email: string, newPassword?: string }
-// - Gera (ou usa) uma senha nova
-// - Tenta gravar hash em users.password_hash (best-effort; ignora se não existir)
-// - Envia e-mail; se não houver SMTP configurado, apenas loga e retorna ok
+/**
+ * POST /api/auth/reset-password
+ * Body: { email: string, newPassword?: string }
+ * - Gera (ou usa) uma senha nova
+ * - Atualiza pass_hash/password_hash/password nas tabelas legadas (best-effort)
+ * - Envia e-mail (ou só loga em dev, se SMTP não estiver configurado)
+ */
 router.post('/reset-password', async (req, res) => {
   try {
     let { email, newPassword } = req.body || {};
     email = String(email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ error: 'invalid_email' });
 
-    // gera senha aleatória de 6 caracteres se não vier pronta
+    // Gera senha aleatória de 6 chars se não vier pronta
     if (!newPassword) {
       const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
       newPassword = Array.from({ length: 6 }, () =>
@@ -182,18 +202,57 @@ router.post('/reset-password', async (req, res) => {
       ).join('');
     }
 
-    // 1) Tenta atualizar a senha no banco (best-effort)
+    // 1) Atualiza a senha em todos os lugares plausíveis (best-effort)
+    let updated = false;
     try {
       const hash = await bcrypt.hash(String(newPassword), 10);
-      await query(
-        `UPDATE users
-           SET password_hash = $2
-         WHERE lower(email) = lower($1)`,
-        [email, hash]
-      );
+
+      // users.pass_hash (bcrypt)
+      try {
+        const r = await query(
+          `UPDATE users SET pass_hash = $2 WHERE lower(email) = lower($1)`,
+          [email, hash]
+        );
+        if (r.rowCount) updated = true;
+      } catch {}
+
+      // users.password_hash (bcrypt)
+      try {
+        const r = await query(
+          `UPDATE users SET password_hash = $2 WHERE lower(email) = lower($1)`,
+          [email, hash]
+        );
+        if (r.rowCount) updated = true;
+      } catch {}
+
+      // users.password (texto-plain legado)
+      try {
+        const r = await query(
+          `UPDATE users SET password = $2 WHERE lower(email) = lower($1)`,
+          [email, String(newPassword)]
+        );
+        if (r.rowCount) updated = true;
+      } catch {}
+
+      // admin_users.password_hash (bcrypt)
+      try {
+        const r = await query(
+          `UPDATE admin_users SET password_hash = $2 WHERE lower(email) = lower($1)`,
+          [email, hash]
+        );
+        if (r.rowCount) updated = true;
+      } catch {}
+
+      // admins.password (texto-plain legado)
+      try {
+        const r = await query(
+          `UPDATE admins SET password = $2 WHERE lower(email) = lower($1)`,
+          [email, String(newPassword)]
+        );
+        if (r.rowCount) updated = true;
+      } catch {}
     } catch (e) {
-      // se a tabela/coluna não existir, seguimos — o e-mail ainda será enviado
-      console.warn('[reset-password] DB update skipped:', e.message);
+      console.warn('[reset-password] hashing/update skipped:', e.message);
     }
 
     // 2) Envia o e-mail (ou apenas loga em dev)
@@ -216,18 +275,19 @@ router.post('/reset-password', async (req, res) => {
         `Se você não solicitou, ignore este e-mail.`,
     };
 
-    // Sem SMTP configurado? Não falha; apenas loga e retorna ok.
+    let delivered = false;
     if (!process.env.SMTP_HOST && !process.env.SMTP_USER) {
       console.log('[reset-password] DEV EMAIL ->', mail);
-      return res.json({ ok: true, delivered: false, dev: true });
+    } else {
+      await transporter.sendMail(mail);
+      delivered = true;
     }
 
-    await transporter.sendMail(mail);
-    return res.json({ ok: true, delivered: true });
+    return res.json({ ok: true, delivered, updated });
   } catch (err) {
     console.error('[reset-password] error:', err);
-    // Mesmo se o e-mail falhar, não travamos o fluxo do front.
-    return res.json({ ok: true, delivered: false });
+    // Mesmo se o e-mail falhar, não travamos o fluxo do front
+    return res.json({ ok: true, delivered: false, updated: false });
   }
 });
 
