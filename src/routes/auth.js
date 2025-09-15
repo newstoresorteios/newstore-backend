@@ -40,6 +40,61 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
+function makeUserCouponCode(userId) {
+  // Cupom determinístico, único por usuário (não muda a cada request)
+  // Ex.: NSU-0003-8K (baseado no id)
+  const id = Number(userId || 0);
+  const base = `NSU-${String(id).padStart(4, '0')}`;
+  const salt = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const tail = salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
+  return `${base}-${tail}`;
+}
+
+async function hydrateUserFromDB(id, email) {
+  // Busca o usuário completo no banco (inclui coupon_code)
+  let r = null;
+  if (id) {
+    r = await query(
+      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+         FROM users WHERE id=$1 LIMIT 1`,
+      [id]
+    );
+  }
+  if ((!r || !r.rows.length) && email) {
+    r = await query(
+      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+         FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+      [email]
+    );
+  }
+
+  if (!r || !r.rows.length) return null;
+  let u = r.rows[0];
+
+  // Se ainda não tem cupom, gera e grava UMA vez
+  if (!u.coupon_code) {
+    const code = makeUserCouponCode(u.id);
+    const upd = await query(
+      `UPDATE users 
+          SET coupon_code=$2, coupon_updated_at=NOW()
+        WHERE id=$1 
+      RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at`,
+      [u.id, code]
+    );
+    u = upd.rows[0];
+  }
+
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    role: u.is_admin ? 'admin' : 'user',
+    coupon_code: u.coupon_code || null,
+    coupon_updated_at: u.coupon_updated_at || null,
+  };
+}
+
+
 // Busca usuário por e-mail tentando colunas/tabelas conhecidas, SEM quebrar se não existirem
 async function findUserByEmail(emailRaw) {
   const email = String(emailRaw).trim();
@@ -192,6 +247,33 @@ router.post('/login', async (req, res) => {
   }
 });
 
+const user = await findUserByEmail(email);
+if (!user || !user.hash) return res.status(401).json({ error: 'invalid_credentials' });
+
+const ok = await verifyPassword(password, user.hash);
+if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+
+const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
+
+// <<< NOVO: compõe o usuário com coupon_code do banco
+const full = await hydrateUserFromDB(user.id, user.email) || {
+  id: user.id,
+  email: user.email,
+  role: user.role || 'user',
+};
+
+res.cookie(COOKIE_NAME, token, {
+  httpOnly: true,
+  secure: IS_PROD,
+  sameSite: IS_PROD ? 'none' : 'lax',
+  path: '/',
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+});
+
+// mantém a mesma estrutura que o front já usa
+return res.json({ ok: true, token, user: full });
+
+
 router.post('/logout', (_req, res) => {
   res.clearCookie(COOKIE_NAME, {
     httpOnly: true,
@@ -202,9 +284,17 @@ router.post('/logout', (_req, res) => {
   return res.json({ ok: true });
 });
 
-router.get('/me', requireAuth, (req, res) => {
-  return res.json({ ok: true, user: req.user });
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const u = await hydrateUserFromDB(req.user?.id, req.user?.email);
+    // O AuthContext atual espera o objeto do usuário diretamente (sem { ok, user })
+    return res.json(u || req.user);
+  } catch (e) {
+    console.error('[auth] /me error', e?.message || e);
+    return res.status(503).json({ error: 'db_unavailable' });
+  }
 });
+
 
 /**
  * POST /api/auth/reset-password
