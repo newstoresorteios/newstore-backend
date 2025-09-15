@@ -18,9 +18,6 @@ const TOKEN_TTL   = process.env.JWT_TTL || '7d';
 const COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'ns_auth';
 const IS_PROD     = (process.env.NODE_ENV || 'production') === 'production';
 
-// ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_TTL });
 }
@@ -33,7 +30,7 @@ async function verifyPassword(plain, hashed) {
       return await bcrypt.compare(String(plain), h); // bcrypt
     }
     if (!h.startsWith('$')) {
-      return String(plain) === h; // legado texto puro
+      return String(plain) === h; // legado texto-plain
     }
     return false;
   } catch {
@@ -41,7 +38,7 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
-// Cupom determinístico, único por usuário
+// Cupom determinístico por usuário (único e estável)
 function makeUserCouponCode(userId) {
   const id = Number(userId || 0);
   const base = `NSU-${String(id).padStart(4, '0')}`;
@@ -50,7 +47,7 @@ function makeUserCouponCode(userId) {
   return `${base}-${tail}`;
 }
 
-// Lê usuário completo + gera cupom se precisar
+// Carrega usuário completo e garante coupon_code
 async function hydrateUserFromDB(id, email) {
   let r = null;
   if (id) {
@@ -67,16 +64,16 @@ async function hydrateUserFromDB(id, email) {
       [email]
     );
   }
-
   if (!r || !r.rows.length) return null;
+
   let u = r.rows[0];
 
   if (!u.coupon_code) {
     const code = makeUserCouponCode(u.id);
     const upd = await query(
-      `UPDATE users 
+      `UPDATE users
           SET coupon_code=$2, coupon_updated_at=NOW()
-        WHERE id=$1 
+        WHERE id=$1
       RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at`,
       [u.id, code]
     );
@@ -93,7 +90,7 @@ async function hydrateUserFromDB(id, email) {
   };
 }
 
-// Busca por e-mail em esquemas/colunas legadas (best-effort)
+// Busca usuário por e-mail em variações de schema/colunas (tolerante a erros)
 async function findUserByEmail(emailRaw) {
   const email = String(emailRaw).trim();
   try { await query('SELECT 1', []); } catch {}
@@ -155,9 +152,6 @@ async function findUserByEmail(emailRaw) {
   return null;
 }
 
-// ----------------------------------------------------------------------------
-// Rotas
-// ----------------------------------------------------------------------------
 router.post('/register', async (req, res) => {
   try {
     const { name, email, password } = req.body || {};
@@ -213,13 +207,11 @@ router.post('/login', async (req, res) => {
     }
 
     const ok = await verifyPassword(password, user.hash);
-    if (!ok) {
-      return res.status(401).json({ error: 'invalid_credentials' });
-    }
+    if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
 
     const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
 
-    // inclui coupon_code
+    // Monta usuário completo (com coupon_code)
     const full =
       (await hydrateUserFromDB(user.id, user.email)) ||
       { id: user.id, email: user.email, role: user.role || 'user' };
@@ -259,13 +251,10 @@ router.get('/me', requireAuth, async (req, res) => {
   }
 });
 
-// ----------------------------------------------------------------------------
-// Reset de senha
-// ----------------------------------------------------------------------------
 /**
  * POST /api/auth/reset-password
  * Body: { email: string, newPassword?: string }
- * - Gera (ou usa) nova senha
+ * - Gera (ou usa) uma senha nova
  * - Atualiza pass_hash/password_hash/password nas tabelas legadas (best-effort)
  * - Envia e-mail (ou só loga em dev, se SMTP não estiver configurado)
  */
@@ -275,7 +264,6 @@ router.post('/reset-password', async (req, res) => {
     email = String(email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ error: 'invalid_email' });
 
-    // Senha aleatória de 6 chars
     if (!newPassword) {
       const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
       newPassword = Array.from({ length: 6 }, () =>
@@ -283,7 +271,7 @@ router.post('/reset-password', async (req, res) => {
       ).join('');
     }
 
-    // Atualiza em colunas/tabelas plausíveis (best-effort)
+    // Atualiza nas possíveis colunas/tabelas (best-effort)
     let updated = false;
     try {
       const hash = await bcrypt.hash(String(newPassword), 10);
@@ -292,41 +280,46 @@ router.post('/reset-password', async (req, res) => {
         const r = await query(
           `UPDATE users SET pass_hash = $2 WHERE lower(email) = lower($1)`,
           [email, hash]
-        ); if (r.rowCount) updated = true;
+        );
+        if (r.rowCount) updated = true;
       } catch {}
 
       try {
         const r = await query(
           `UPDATE users SET password_hash = $2 WHERE lower(email) = lower($1)`,
           [email, hash]
-        ); if (r.rowCount) updated = true;
+        );
+        if (r.rowCount) updated = true;
       } catch {}
 
       try {
         const r = await query(
           `UPDATE users SET password = $2 WHERE lower(email) = lower($1)`,
           [email, String(newPassword)]
-        ); if (r.rowCount) updated = true;
+        );
+        if (r.rowCount) updated = true;
       } catch {}
 
       try {
         const r = await query(
           `UPDATE admin_users SET password_hash = $2 WHERE lower(email) = lower($1)`,
           [email, hash]
-        ); if (r.rowCount) updated = true;
+        );
+        if (r.rowCount) updated = true;
       } catch {}
 
       try {
         const r = await query(
           `UPDATE admins SET password = $2 WHERE lower(email) = lower($1)`,
           [email, String(newPassword)]
-        ); if (r.rowCount) updated = true;
+        );
+        if (r.rowCount) updated = true;
       } catch {}
     } catch (e) {
       console.warn('[reset-password] hashing/update skipped:', e.message);
     }
 
-    // Envia e-mail
+    // Envio de e-mail
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT || 587),
