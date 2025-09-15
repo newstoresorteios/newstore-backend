@@ -7,40 +7,35 @@ const router = Router();
 
 /**
  * GET /api/me
- * Retorna dados do usuário autenticado.
+ * Retorna o usuário logado (id, name, email, is_admin).
  */
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const { rows } = await query(
-      'select id, name, email, is_admin from users where id = $1 limit 1',
-      [req.user.id]
+    const userId = req.user.id;
+    // busca no banco pra garantir dados atualizados
+    const r = await query(
+      'select id, name, email, is_admin from users where id = $1',
+      [userId]
     );
-    const u = rows[0] || req.user || {};
+    const u = r.rows[0] || req.user;
+
     return res.json({
       user: {
         id: u.id,
-        name: u.name ?? req.user?.name ?? null,
-        email: u.email ?? req.user?.email ?? null,
-        is_admin: !!(u.is_admin ?? req.user?.is_admin),
+        name: u.name || null,
+        email: u.email || null,
+        is_admin: !!u.is_admin,
       },
     });
   } catch (e) {
     console.error('[me] error:', e);
-    // fallback seguro
-    return res.json({
-      user: {
-        id: req.user?.id,
-        name: req.user?.name ?? null,
-        email: req.user?.email ?? null,
-        is_admin: !!req.user?.is_admin,
-      },
-    });
+    return res.status(500).json({ error: 'me_failed' });
   }
 });
 
 /**
  * GET /api/me/reservations
- * Lista reservas do usuário autenticado.
+ * (o seu endpoint já existente – mantive igual)
  */
 router.get('/reservations', requireAuth, async (req, res) => {
   try {
@@ -61,7 +56,7 @@ router.get('/reservations', requireAuth, async (req, res) => {
       amount_cents: (Array.isArray(row.numbers) ? row.numbers.length : 0) * priceCents,
       status: row.status,
       created_at: row.created_at,
-      expires_at: row.expires_at,
+      expires_at: row.expires_at
     }));
 
     res.json({ reservations });
