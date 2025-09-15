@@ -2,6 +2,8 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import nodemailer from 'nodemailer';
+
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 
@@ -158,6 +160,75 @@ router.post('/logout', (_req, res) => {
 
 router.get('/me', requireAuth, (req, res) => {
   return res.json({ ok: true, user: req.user });
+});
+
+
+// POST /api/auth/reset-password
+// body: { email: string, newPassword?: string }
+// - Gera (ou usa) uma senha nova
+// - Tenta gravar hash em users.password_hash (best-effort; ignora se não existir)
+// - Envia e-mail; se não houver SMTP configurado, apenas loga e retorna ok
+router.post('/reset-password', async (req, res) => {
+  try {
+    let { email, newPassword } = req.body || {};
+    email = String(email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'invalid_email' });
+
+    // gera senha aleatória de 6 caracteres se não vier pronta
+    if (!newPassword) {
+      const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+      newPassword = Array.from({ length: 6 }, () =>
+        alphabet[Math.floor(Math.random() * alphabet.length)]
+      ).join('');
+    }
+
+    // 1) Tenta atualizar a senha no banco (best-effort)
+    try {
+      const hash = await bcrypt.hash(String(newPassword), 10);
+      await query(
+        `UPDATE users
+           SET password_hash = $2
+         WHERE lower(email) = lower($1)`,
+        [email, hash]
+      );
+    } catch (e) {
+      // se a tabela/coluna não existir, seguimos — o e-mail ainda será enviado
+      console.warn('[reset-password] DB update skipped:', e.message);
+    }
+
+    // 2) Envia o e-mail (ou apenas loga em dev)
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+      auth: process.env.SMTP_USER
+        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+        : undefined,
+    });
+
+    const mail = {
+      from: 'administracao@newstoresorteios.com.br',
+      to: email,
+      subject: 'Reset de senha - New Store Sorteios',
+      text:
+        `Sua senha foi resetada.\n\n` +
+        `Nova Senha: ${newPassword}\n\n` +
+        `Se você não solicitou, ignore este e-mail.`,
+    };
+
+    // Sem SMTP configurado? Não falha; apenas loga e retorna ok.
+    if (!process.env.SMTP_HOST && !process.env.SMTP_USER) {
+      console.log('[reset-password] DEV EMAIL ->', mail);
+      return res.json({ ok: true, delivered: false, dev: true });
+    }
+
+    await transporter.sendMail(mail);
+    return res.json({ ok: true, delivered: true });
+  } catch (err) {
+    console.error('[reset-password] error:', err);
+    // Mesmo se o e-mail falhar, não travamos o fluxo do front.
+    return res.json({ ok: true, delivered: false });
+  }
 });
 
 export default router;
