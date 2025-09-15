@@ -40,19 +40,18 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
-// Busca usuário por e-mail em esquemas legados/combinados
+// Busca usuário por e-mail tentando colunas/tabelas conhecidas, SEM quebrar se não existirem
 async function findUserByEmail(emailRaw) {
   const email = String(emailRaw).trim();
 
   // ping leve para manter pool ativo
-  await query('SELECT 1', []);
+  try { await query('SELECT 1', []); } catch {}
 
-  const tries = [
-    // users: aceita pass_hash, password_hash OU password (texto)
+  const variants = [
+    // users.pass_hash (bcrypt) — PRIORIDADE
     {
-      q: `
-        SELECT id, email,
-               COALESCE(pass_hash, password_hash, password) AS hash,
+      sql: `
+        SELECT id, email, pass_hash AS hash,
                CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
           FROM users
          WHERE LOWER(email) = LOWER($1)
@@ -60,9 +59,31 @@ async function findUserByEmail(emailRaw) {
       `,
       args: [email],
     },
-    // admin_users: normalmente password_hash
+    // users.password_hash (bcrypt)
     {
-      q: `
+      sql: `
+        SELECT id, email, password_hash AS hash,
+               CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
+          FROM users
+         WHERE LOWER(email) = LOWER($1)
+         LIMIT 1
+      `,
+      args: [email],
+    },
+    // users.password (texto-plain legado)
+    {
+      sql: `
+        SELECT id, email, password AS hash,
+               CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role
+          FROM users
+         WHERE LOWER(email) = LOWER($1)
+         LIMIT 1
+      `,
+      args: [email],
+    },
+    // admin_users.password_hash (bcrypt)
+    {
+      sql: `
         SELECT id, email, password_hash AS hash, role
           FROM admin_users
          WHERE LOWER(email) = LOWER($1)
@@ -70,9 +91,9 @@ async function findUserByEmail(emailRaw) {
       `,
       args: [email],
     },
-    // admins: legado com password em texto
+    // admins.password (texto-plain legado)
     {
-      q: `
+      sql: `
         SELECT id, email, password AS hash, 'admin' AS role
           FROM admins
          WHERE LOWER(email) = LOWER($1)
@@ -82,9 +103,13 @@ async function findUserByEmail(emailRaw) {
     },
   ];
 
-  for (const t of tries) {
-    const { rows } = await query(t.q, t.args);
-    if (rows.length) return rows[0];
+  for (const v of variants) {
+    try {
+      const { rows } = await query(v.sql, v.args);
+      if (rows && rows.length) return rows[0];
+    } catch {
+      // ignora 42P01/42703 etc. e tenta a próxima variante
+    }
   }
   return null;
 }
@@ -266,7 +291,7 @@ router.post('/reset-password', async (req, res) => {
     });
 
     const mail = {
-      from: 'tironinho@hotmail.com',
+      from: 'administracao@newstoresorteios.com.br',
       to: email,
       subject: 'Reset de senha - New Store Sorteios',
       text:
