@@ -1,51 +1,47 @@
-// backend/src/routes/draws.js
 import { Router } from 'express';
 import { query } from '../db.js';
 
 const router = Router();
 
 /**
- * GET /api/draws
- * Lista sorteios. Aceita ?status=open|closed (opcional).
- * Retorna campos padronizados que o front entende.
+ * Função de listagem reaproveitável
+ * - status: 'open' | 'closed' | null
+ */
+async function listDraws(status) {
+  let sql = `
+    select
+      d.id,
+      d.status,
+      coalesce(d.opened_at, d.created_at) as opened_at,
+      d.closed_at,
+      d.realized_at,
+      d.winner_name
+    from draws d
+  `;
+  const params = [];
+
+  if (status === 'open') {
+    sql += ` where d.status = 'open'`;
+  } else if (status === 'closed') {
+    // considera fechado se status='closed' OU se já tem closed_at
+    sql += ` where d.status = 'closed' or d.closed_at is not null`;
+  }
+
+  sql += ` order by d.id desc`;
+
+  const { rows } = await query(sql, params);
+  return rows || [];
+}
+
+/**
+ * GET /api/draws?status=open|closed
+ * Pública
  */
 router.get('/draws', async (req, res) => {
   try {
     const status = String(req.query.status || '').toLowerCase();
-
-    let sql = `
-      select
-        d.id,
-        d.status,
-        coalesce(d.opened_at, d.created_at) as opened_at,
-        d.closed_at,
-        d.realized_at,
-        -- usa winner_name que existe na tabela
-        d.winner_name
-      from draws d
-    `;
-    const args = [];
-
-    if (status === 'open' || status === 'closed') {
-      sql += ` where d.status = $1`;
-      args.push(status);
-    }
-
-    sql += ` order by d.id desc`;
-
-    const { rows } = await query(sql, args);
-
-    // Normaliza payload
-    const draws = (rows || []).map(r => ({
-      id: r.id,
-      status: r.status,
-      opened_at: r.opened_at,
-      closed_at: r.closed_at,
-      realized_at: r.realized_at,
-      winner_name: r.winner_name || null,
-    }));
-
-    return res.json({ draws });
+    const rows = await listDraws(status || null);
+    return res.json({ draws: rows });
   } catch (e) {
     console.error('[draws] list error', e);
     return res.status(500).json({ error: 'list_failed' });
@@ -54,38 +50,15 @@ router.get('/draws', async (req, res) => {
 
 /**
  * GET /api/draws/history
- * Versão pública: só sorteios fechados.
+ * Atalho para closed (pública)
  */
 router.get('/draws/history', async (_req, res) => {
   try {
-    const { rows } = await query(
-      `
-      select
-        d.id,
-        d.status,
-        coalesce(d.opened_at, d.created_at) as opened_at,
-        d.closed_at,
-        d.realized_at,
-        d.winner_name
-      from draws d
-      where d.status = 'closed' or d.closed_at is not null
-      order by d.id desc
-      `
-    );
-
-    const history = (rows || []).map(r => ({
-      id: r.id,
-      status: r.status,
-      opened_at: r.opened_at,
-      closed_at: r.closed_at,
-      realized_at: r.realized_at,
-      winner_name: r.winner_name || null,
-    }));
-
-    return res.json({ history });
+    const rows = await listDraws('closed');
+    return res.json({ history: rows });
   } catch (e) {
     console.error('[draws/history] error', e);
-    return res.status(500).json({ error: 'history_failed' });
+    return res.status(500).json({ error: 'list_failed' });
   }
 });
 
