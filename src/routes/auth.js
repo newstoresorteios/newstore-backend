@@ -34,6 +34,22 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
+// ---------- util: garantir colunas que usamos ----------
+async function ensureUserColumns() {
+  try {
+    await query(`
+      ALTER TABLE IF EXISTS users
+        ADD COLUMN IF NOT EXISTS is_admin boolean DEFAULT false,
+        ADD COLUMN IF NOT EXISTS coupon_code text,
+        ADD COLUMN IF NOT EXISTS coupon_updated_at timestamptz,
+        ADD COLUMN IF NOT EXISTS tray_coupon_id text,
+        ADD COLUMN IF NOT EXISTS coupon_value_cents int4 DEFAULT 0
+    `);
+  } catch (e) {
+    // ok ignorar; se não conseguir, o fallback do hydrate cobre
+  }
+}
+
 // Gera um cupom determinístico por usuário (só se ainda não existir)
 function makeUserCouponCode(userId) {
   const id = Number(userId || 0);
@@ -43,43 +59,71 @@ function makeUserCouponCode(userId) {
   return `${base}-${tail}`;
 }
 
+// Carrega usuário do DB (tolerante a colunas ausentes)
 async function hydrateUserFromDB(id, email) {
-  let r = null;
-  if (id) {
-    r = await query(
-      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
-         FROM users WHERE id=$1 LIMIT 1`, [id]
-    );
-  }
-  if ((!r || !r.rows.length) && email) {
-    r = await query(
-      `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
-         FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]
-    );
-  }
-  if (!r || !r.rows.length) return null;
-  let u = r.rows[0];
+  await ensureUserColumns();
 
-  // cria o coupon_code se ainda não existir (não mexe em tray aqui)
-  if (!u.coupon_code) {
-    const code = makeUserCouponCode(u.id);
-    const upd = await query(
-      `UPDATE users SET coupon_code=$2, coupon_updated_at=NOW()
-        WHERE id=$1
+  // 1) tentativa “completa” (pode falhar com 42703 se faltar coluna)
+  try {
+    let r = null;
+    if (id) {
+      r = await query(
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+           FROM users WHERE id=$1 LIMIT 1`, [id]
+      );
+    }
+    if ((!r || !r.rows.length) && email) {
+      r = await query(
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
+           FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]
+      );
+    }
+    if (!r || !r.rows.length) return null;
+
+    let u = r.rows[0];
+
+    // cria o coupon_code se ainda não existir (não mexe na Tray aqui)
+    if (!u.coupon_code) {
+      const code = makeUserCouponCode(u.id);
+      const upd = await query(
+        `UPDATE users
+            SET coupon_code=$2, coupon_updated_at=NOW()
+          WHERE id=$1
         RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at`,
-      [u.id, code]
-    );
-    u = upd.rows[0];
-  }
+        [u.id, code]
+      );
+      u = upd.rows[0];
+    }
 
-  return {
-    id: u.id,
-    name: u.name,
-    email: u.email,
-    role: u.is_admin ? 'admin' : 'user',
-    coupon_code: u.coupon_code || null,
-    coupon_updated_at: u.coupon_updated_at || null,
-  };
+    return {
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      role: u.is_admin ? 'admin' : 'user',
+      coupon_code: u.coupon_code || null,
+      coupon_updated_at: u.coupon_updated_at || null,
+    };
+  } catch (e) {
+    // 2) fallback minimalista: só pega colunas “seguras”
+    // evita quebrar o /login com 42703
+    const r = await query(
+      `SELECT id, name, email
+         FROM users
+        WHERE ${id ? 'id = $1' : 'LOWER(email)=LOWER($1)'}
+        LIMIT 1`,
+      [id || email]
+    );
+    if (!r.rows.length) return null;
+    const u = r.rows[0];
+    return {
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      role: 'user',
+      coupon_code: null,
+      coupon_updated_at: null,
+    };
+  }
 }
 
 // Busca usuário por e-mail cobrindo colunas/tabelas legadas
@@ -104,10 +148,14 @@ async function findUserByEmail(emailRaw) {
     try {
       const { rows } = await query(v.sql, v.args);
       if (rows && rows.length) return rows[0];
-    } catch {/* ignora 42P01/42703 etc. */}
+    } catch {
+      // ignora 42P01/42703 etc. e tenta a próxima
+    }
   }
   return null;
 }
+
+// ===================== ROTAS =====================
 
 router.post('/register', async (req, res) => {
   try {
@@ -163,7 +211,7 @@ router.post('/login', async (req, res) => {
 
     const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
 
-    // usuário “hidratado” (traz coupon_code caso exista/precise criar)
+    // usuário “hidratado” (tolerante a colunas)
     const full = await hydrateUserFromDB(user.id, user.email) || {
       id: user.id, email: user.email, role: user.role || 'user',
     };
@@ -196,7 +244,6 @@ router.post('/logout', (_req, res) => {
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const u = await hydrateUserFromDB(req.user?.id, req.user?.email);
-    // O front já espera o objeto diretamente
     return res.json(u || req.user);
   } catch (e) {
     console.error('[auth] /me error', e?.message || e);
@@ -204,9 +251,6 @@ router.get('/me', requireAuth, async (req, res) => {
   }
 });
 
-/**
- * POST /api/auth/reset-password
- */
 router.post('/reset-password', async (req, res) => {
   try {
     let { email, newPassword } = req.body || {};
