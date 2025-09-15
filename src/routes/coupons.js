@@ -8,11 +8,18 @@ const router = Router();
 
 const VALID_DAYS = Number(process.env.TRAY_COUPON_VALID_DAYS || 180);
 
+// backend/src/routes/coupons.js
+// ...
+
+// ✅ Código estável e único por usuário (id → NSU-0003-XH)
 function codeForUser(userId) {
-  // único e "aleatório", usando o id do usuário + rand
-  const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
-  return `NS${userId}-${rand}`;
+  const id = Number(userId || 0);
+  const base = `NSU-${String(id).padStart(4, '0')}`;
+  const salt = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const tail = salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
+  return `${base}-${tail}`;
 }
+
 function fmtDate(d) {
   // YYYY-MM-DD
   const y = d.getFullYear();

@@ -1,85 +1,63 @@
 // backend/src/services/tray.js
-let cache = { token: null, exp: 0 };
+const API = (process.env.TRAY_API_ADDRESS || 'https://www.newstorerj.com.br/web_api').replace(/\/+$/,'');
+const CK  = process.env.TRAY_CONSUMER_KEY || '';
+const CS  = process.env.TRAY_CONSUMER_SECRET || '';
+const CODE = process.env.TRAY_CODE || '';
 
-const API_BASE   = process.env.TRAY_API_BASE;           // https://loja/web_api
-const CKEY       = process.env.TRAY_CONSUMER_KEY;
-const CSECRET    = process.env.TRAY_CONSUMER_SECRET;
-const STORE_CODE = process.env.TRAY_STORE_CODE;
-
-function form(obj) {
-  const p = new URLSearchParams();
-  for (const [k, v] of Object.entries(obj)) p.append(k, v ?? "");
-  return p.toString();
-}
-
-export async function trayToken() {
-  if (!API_BASE || !CKEY || !CSECRET || !STORE_CODE) {
-    throw new Error("tray_env_missing");
-  }
-  if (cache.token && Date.now() < cache.exp) return cache.token;
-
-  const r = await fetch(`${API_BASE}/auth`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form({
-      consumer_key: CKEY,
-      consumer_secret: CSECRET,
-      code: STORE_CODE,
-    }),
+async function trayAuth() {
+  const body = new URLSearchParams({
+    consumer_key: CK,
+    consumer_secret: CS,
+    code: CODE,
   });
-  if (!r.ok) throw new Error("tray_auth_failed");
+
+  const r = await fetch(`${API}/auth`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
   const j = await r.json().catch(() => ({}));
-  const token = j?.access_token || j?.accessToken || j?.token;
-  if (!token) throw new Error("tray_auth_no_token");
-  // 50 min de vida se não vier expires_in
-  const ttl = (j?.expires_in ? (j.expires_in - 60) : 3000) * 1000;
-  cache = { token, exp: Date.now() + ttl };
-  return token;
+  if (!r.ok || !j?.access_token) {
+    console.error('[tray.auth] fail', r.status, j);
+    throw new Error('tray_auth_failed');
+  }
+  return j.access_token;
 }
 
+// Cria cupom (valor em número decimal: 10.00). 'type' = '$' para R$.
 export async function trayCreateCoupon({ code, value, startsAt, endsAt, description }) {
-  const token = await trayToken();
-  const url = `${API_BASE}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
+  const token = await trayAuth();
 
   const body = new URLSearchParams();
-  body.append("DiscountCoupon[code]", code);
-  body.append("DiscountCoupon[description]", description || "Crédito New Store");
-  body.append("DiscountCoupon[starts_at]", startsAt);
-  body.append("DiscountCoupon[ends_at]", endsAt);
-  body.append("DiscountCoupon[value]", Number(value).toFixed(2)); // R$ fixo
-  body.append("DiscountCoupon[type]", "3");                       // valor (fixo)
-  body.append("DiscountCoupon[cumulative_discount]", "1");
-  body.append("DiscountCoupon[usage_counter_limit_customer]", "999999"); // sem limite por cliente
+  body.append('DiscountCoupon[code]', String(code));
+  body.append('DiscountCoupon[description]', String(description || `Cupom ${code}`));
+  body.append('DiscountCoupon[starts_at]', String(startsAt)); // YYYY-MM-DD
+  body.append('DiscountCoupon[ends_at]',   String(endsAt));   // YYYY-MM-DD
+  body.append('DiscountCoupon[value]',     Number(value).toFixed(2)); // "10.00"
+  body.append('DiscountCoupon[type]',      '$');                       // desconto em R$
 
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
+  const r = await fetch(`${API}/discount_coupons/?access_token=${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
   });
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`tray_create_failed ${r.status} ${txt}`);
-  }
   const j = await r.json().catch(() => ({}));
-  // normaliza id
-  const id =
-    j?.DiscountCoupon?.id ??
-    j?.id ??
-    j?.data?.id ??
-    j?.discount_coupon?.id ??
-    null;
-  if (!id) throw new Error("tray_create_no_id");
-  return { id, raw: j };
+  if (!r.ok || !j?.DiscountCoupon?.id) {
+    console.error('[tray.create] fail', r.status, j);
+    throw new Error('tray_create_coupon_failed');
+  }
+  return j.DiscountCoupon; // { id, ... }
 }
 
-export async function trayDeleteCoupon(id) {
-  if (!id) return;
-  const token = await trayToken();
-  const url = `${API_BASE}/discount_coupons/${encodeURIComponent(id)}?access_token=${encodeURIComponent(token)}`;
-  const r = await fetch(url, { method: "DELETE" });
-  // Tray pode devolver 200/204/201; se 404, ignora
+export async function trayDeleteCoupon(couponId) {
+  if (!couponId) return;
+  const token = await trayAuth();
+  const r = await fetch(`${API}/discount_coupons/${couponId}?access_token=${encodeURIComponent(token)}`, {
+    method: 'DELETE',
+  });
+  // Tray retorna 200/204. Se vier 404, ignoramos.
   if (!r.ok && r.status !== 404) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`tray_delete_failed ${r.status} ${txt}`);
+    const t = await r.text().catch(() => '');
+    console.warn('[tray.delete] warn', r.status, t);
   }
 }
