@@ -17,6 +17,7 @@ import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
 import adminDrawsRouter from "./routes/admin_draws.js";
 import couponsRouter from "./routes/coupons.js";
+import drawsRouter from './routes/draws.js';
 
 import { query, getPool } from './db.js';
 import { ensureSchema } from './seed.js';
@@ -65,6 +66,7 @@ app.use('/api/draws-ext', drawsExtRoutes);
 app.use('/api/admin', adminRoutes);
 
 app.use("/api/admin/draws", adminDrawsRouter);
+app.use('/api/draws', drawsRouter);
 
 app.use("/api/coupons", couponsRouter);
 
