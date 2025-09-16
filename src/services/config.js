@@ -1,3 +1,4 @@
+// src/services/config.js
 import { query } from "../db.js";
 
 export async function ensureAppConfig() {
@@ -19,7 +20,6 @@ export async function ensureAppConfig() {
 
 let cache = { v: null, ts: 0 };
 export async function getTicketPriceCents() {
-  // cache (10s) para reduzir round-trips
   if (Date.now() - cache.ts < 10_000 && Number.isFinite(cache.v)) return cache.v;
   const r = await query(`select value from app_config where key='ticket_price_cents'`);
   const n = Number(r.rows?.[0]?.value ?? process.env.PRICE_CENTS ?? 5500);
@@ -35,7 +35,6 @@ export async function setTicketPriceCents(v) {
      on conflict (key) do update set value=excluded.value, updated_at=now()`,
     [String(n)]
   );
-  // invalida cache
   cache = { v: n, ts: Date.now() };
   return n;
 }
