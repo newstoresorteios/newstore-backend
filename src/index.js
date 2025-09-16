@@ -28,6 +28,8 @@ import adminConfigRouter from "./routes/admin_config.js";
 // Router admin genérico (DEIXAR POR ÚLTIMO entre /api/admin/*)
 import adminRoutes from "./routes/admin.js";
 
+import purchaseLimitRouter from "./routes/purchase_limit.js"
+
 import couponsRouter from "./routes/coupons.js";
 
 import { query, getPool } from "./db.js";
@@ -90,6 +92,8 @@ app.use("/api/admin/config", adminConfigRouter);
 
 // ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);
+
+app.use("/api/purchase-limit", purchaseLimitRouter);
 
 // Cupons
 app.use("/api/coupons", couponsRouter);
