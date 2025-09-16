@@ -3,8 +3,8 @@ import { query } from "../db.js";
 
 const MAX = Number(process.env.MAX_NUMBERS_PER_USER || 20);
 
-// Status aceitos (cubra nomes em pt e en, conforme seu schema)
-const STATUSES = ['reservado','pago','reserved','paid','taken','sold'];
+// Status aceitos (ajuste conforme seu schema real)
+const STATUSES = ["reservado","pago","reserved","paid","taken","sold"];
 
 export async function getUserCountInDraw(userId, drawId) {
   const { rows } = await query(
@@ -20,14 +20,14 @@ export async function getUserCountInDraw(userId, drawId) {
   return rows?.[0]?.cnt ?? 0;
 }
 
-// Versão "read-only" para a rota de checagem
+// Checagem "read-only" (para o endpoint)
 export async function checkUserLimit(userId, drawId, addingCount = 1) {
   const current = await getUserCountInDraw(userId, drawId);
   const blocked = current >= MAX || current + addingCount > MAX;
   return { blocked, current, max: MAX };
 }
 
-// Versão "hard" para ser usada nos fluxos de reserva/checkout
+// Checagem "hard" (use na reserva/checkout)
 export async function assertUserUnderLimit(userId, drawId, addingCount = 1) {
   const { blocked, current, max } = await checkUserLimit(userId, drawId, addingCount);
   if (blocked) {

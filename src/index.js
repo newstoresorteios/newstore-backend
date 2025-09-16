@@ -39,13 +39,14 @@ const app = express();
 
 const PORT = process.env.PORT || 4000;
 
-// Se não setar CORS_ORIGIN, usamos uma allowlist padrão
+// Se não setar CORS_ORIGIN, usamos esta allowlist padrão
 const ORIGIN = process.env.CORS_ORIGIN
   || "http://localhost:3000,https://newstore-frontend-ten.vercel.app,https://newstorerj.com.br,https://www.newstorerj.com.br";
 
+// ⚠️ CORS_ORIGIN deve conter SOMENTE origens (sem /api, sem paths)
 const ORIGINS = ORIGIN.split(",").map(s => s.trim()).filter(Boolean);
 
-// Ping de saúde no DB (mantém a conexão acordada em hosts free)
+// Saúde do DB (mantém conexão viva em hosts free)
 setInterval(() => {
   query("SELECT 1").catch((e) =>
     console.warn("[health] db ping failed:", e.code || e.message)
@@ -54,23 +55,19 @@ setInterval(() => {
 
 // ── Middlewares ─────────────────────────────────────────────
 const corsOptions = {
-  origin(origin, cb) {
-    if (!origin) return cb(null, true); // server-to-server, curl, healthchecks
-    const ok = ORIGINS.includes("*") || ORIGINS.includes(origin);
-    return cb(ok ? null : new Error("Not allowed by CORS"), ok);
-  },
+  origin: ORIGINS,               // array de origens permitidas
   credentials: true,
   methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization","X-Requested-With"],
+  // Deixe allowedHeaders indefinido para refletir os headers solicitados no preflight
   optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));   // responde preflight
+app.options("*", cors(corsOptions));            // responde TODOS os preflights
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
-// Healthcheck simples
+// Healthcheck
 app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
@@ -132,5 +129,4 @@ async function bootstrap() {
     process.exit(1);
   }
 }
-
 bootstrap();
