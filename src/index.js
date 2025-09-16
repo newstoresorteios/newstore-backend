@@ -15,22 +15,24 @@ import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
 
-// Routers admin ESPECÍFICOS (monte antes do /api/admin genérico)
+// Routers ADMIN específicos (monte ANTES do /api/admin genérico)
 import adminDrawsRouter from "./routes/admin_draws.js";
 import adminClientsRouter from "./routes/admin_clients.js";
 import adminWinnersRouter from "./routes/admin_winners.js";
 import adminDashboardRouter from "./routes/admin_dashboard.js";
 
+// Config pública (front lê o preço) e admin (atualiza o preço)
 import configPublicRouter from "./routes/config_public.js";
 import adminConfigRouter from "./routes/admin_config.js";
 
-// Router /api/admin genérico (deixe por último entre os de /api/admin)
+// Router admin genérico (DEIXAR POR ÚLTIMO entre /api/admin/*)
 import adminRoutes from "./routes/admin.js";
 
 import couponsRouter from "./routes/coupons.js";
 
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
+// Garantir que a tabela de configuração e o preço existam
 import { ensureAppConfig } from "./services/config.js";
 
 const app = express();
@@ -38,14 +40,14 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const ORIGIN = process.env.CORS_ORIGIN || "*";
 
-// ping de saúde no DB
+// Ping de saúde no DB (mantém a conexão acordada em hosts free)
 setInterval(() => {
   query("SELECT 1").catch((e) =>
-    console.warn("[health] db ping failed", e.code || e.message)
+    console.warn("[health] db ping failed:", e.code || e.message)
   );
 }, 60_000);
 
-// ── middlewares ─────────────────────────────────────────────
+// ── Middlewares ─────────────────────────────────────────────
 app.use(
   cors({
     origin: ORIGIN === "*" ? true : ORIGIN.split(",").map((s) => s.trim()),
@@ -55,20 +57,20 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
-// Health
+// Healthcheck simples
 app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ── rotas públicas/gerais ───────────────────────────────────
+// ── Rotas públicas/gerais ───────────────────────────────────
 app.use("/api/auth", authRoutes);
 app.use("/api/numbers", numbersRoutes);
 app.use("/api/reservations", reservationsRoutes);
 
-// monta uma única vez o payments **correto**
+// Pagamentos (montar apenas uma vez)
 app.use("/api/payments", paymentsRoutes);
 
-// aliases para compatibilidade com o front
+// Aliases p/ compatibilidade (se o front antigo ainda chamar estes paths)
 app.use("/api/orders", paymentsRoutes);
 app.use("/api/participations", paymentsRoutes);
 
@@ -76,37 +78,40 @@ app.use("/api/me", meRoutes);
 app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
 
-// ── rotas admin ESPECÍFICAS (antes do genérico) ────────────
+// ── Rotas ADMIN específicas (antes do genérico) ────────────
 app.use("/api/admin/draws", adminDrawsRouter);
 app.use("/api/admin/clients", adminClientsRouter);
 app.use("/api/admin/winners", adminWinnersRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
 
-// preço (pública para exibir no site) e admin para atualizar
+// Config (pública e admin)
 app.use("/api/config", configPublicRouter);
 app.use("/api/admin/config", adminConfigRouter);
 
-// ── router admin GENÉRICO (deixa por último) ───────────────
+// ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);
 
+// Cupons
 app.use("/api/coupons", couponsRouter);
 
-// 404
+// 404 padrão (evita leak de HTML em produção)
 app.use((req, res) => {
   res.status(404).json({ error: "not_found", path: req.originalUrl });
 });
 
-// ── bootstrap ───────────────────────────────────────────────
+// ── Bootstrap ───────────────────────────────────────────────
 async function bootstrap() {
   try {
-    await ensureSchema();
-    await ensureAppConfig(); // garante que o preço existe na app_config
+    await ensureSchema();       // cria o schema base/tabelas
+    await ensureAppConfig();    // garante app_config e ticket_price_cents
+
     const pool = await getPool();
     await pool.query("SELECT 1");
     console.log("[db] warmup ok");
 
     app.listen(PORT, () => {
       console.log(`API listening on :${PORT}`);
+      console.log(`[cors] origin = ${ORIGIN}`);
     });
   } catch (e) {
     console.error("[bootstrap] falha ao iniciar backend:", e);
