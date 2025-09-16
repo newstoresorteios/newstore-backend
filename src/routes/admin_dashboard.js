@@ -2,58 +2,56 @@
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
-import { getTicketPriceCents, setTicketPriceCents } from "../config.js";
+import { getTicketPriceCents, setTicketPriceCents } from "../lib/app_config.js";
 
 const router = Router();
 
 /**
  * GET /api/admin/dashboard/summary
- * - draw_id aberto
- * - total, sold, remaining
- * - price_cents (preço atual do ticket)
+ * Resumo do sorteio atual (aberto) + preço do ticket (em centavos)
  */
 router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
   try {
-    console.log("[admin/dashboard/summary] IN");
     const r = await query(`
-      with d as (
+      with cur as (
         select id
           from draws
-         where lower(coalesce(status,'')) = 'open'
-         order by opened_at desc nulls last, id desc
+         where status = 'open'
+         order by id asc
          limit 1
       ),
-      c as (
+      counts as (
         select
-          (select id from d)                           as draw_id,
-          count(*)::int                                as total,
-          count(*) filter (
-            where lower(coalesce(n.status,'')) in ('sold','paid','approved','completed')
-          )::int                                       as sold,
-          count(*) filter (
-            where lower(coalesce(n.status,'')) in ('available','free','open')
-          )::int                                       as available
+          n.draw_id,
+          count(*) filter (where n.status = 'sold')        as sold,
+          count(*) filter (where n.status = 'available')   as available,
+          count(*) filter (where n.status = 'reserved')    as reserved
         from numbers n
-        join d on n.draw_id = d.id
+        join cur on cur.id = n.draw_id
+        group by n.draw_id
       )
-      select * from c
+      select
+        coalesce(c.draw_id, 0)                         as draw_id,
+        coalesce(c.sold, 0)                            as sold,
+        coalesce(c.available, 0)                       as available,
+        coalesce(c.reserved, 0)                        as reserved
+      from counts c
+      right join cur on cur.id = c.draw_id
     `);
 
-    const row = r.rows?.[0] || null;
-    const price_cents = getTicketPriceCents();
+    const row = r.rows?.[0] || { draw_id: 0, sold: 0, available: 0, reserved: 0 };
+    const priceCents = await getTicketPriceCents();
 
-    if (!row || row.draw_id == null) {
-      return res.json({ draw_id: null, total: 0, sold: 0, remaining: 0, price_cents });
-    }
-    const remaining = Math.max(0, (row.available ?? (row.total - row.sold)));
+    const payload = {
+      draw_id: Number(row.draw_id) || 0,
+      sold: Number(row.sold) || 0,
+      remaining: Number(row.available) || 0, // “disponíveis”
+      reserved: Number(row.reserved) || 0,
+      price_cents: Number(priceCents) || 0,
+    };
 
-    return res.json({
-      draw_id: row.draw_id,
-      total: row.total,
-      sold: row.sold,
-      remaining,
-      price_cents,
-    });
+    console.log("[admin/dashboard/summary] payload:", payload);
+    return res.json(payload);
   } catch (e) {
     console.error("[admin/dashboard/summary] error:", e);
     return res.status(500).json({ error: "summary_failed" });
@@ -61,19 +59,18 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /**
- * GET /api/admin/dashboard/ticket-price
- * PUT /api/admin/dashboard/ticket-price  { price_cents }
+ * POST /api/admin/dashboard/price
+ * Body: { price_cents: number }
+ * Atualiza o valor do ticket em centavos
  */
-router.get("/ticket-price", requireAuth, requireAdmin, (_req, res) => {
-  return res.json({ price_cents: getTicketPriceCents() });
-});
-
-router.put("/ticket-price", requireAuth, requireAdmin, async (req, res) => {
+router.post("/price", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const cents = setTicketPriceCents(req.body?.price_cents);
-    return res.json({ ok: true, price_cents: cents });
+    const v = req.body?.price_cents;
+    const saved = await setTicketPriceCents(v);
+    console.log("[admin/dashboard/price] set to:", saved);
+    return res.json({ price_cents: saved });
   } catch (e) {
-    console.error("[admin/dashboard/ticket-price] error:", e?.message || e);
+    console.error("[admin/dashboard/price] error:", e);
     return res.status(400).json({ error: "invalid_price" });
   }
 });
