@@ -287,7 +287,7 @@ router.post('/reset-password', async (req, res) => {
     });
 
     const mail = {
-      from: 'contato@newstorerj.com.br',
+      from: 'tironinho@hotmail.com',
       to: email,
       subject: 'Reset de senha - New Store Sorteios',
       text: `Sua senha foi resetada.\n\nNova Senha: ${newPassword}\n\nSe você não solicitou, ignore este e-mail.`,
