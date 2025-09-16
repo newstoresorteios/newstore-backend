@@ -67,7 +67,6 @@ app.use('/api/draws-ext', drawsExtRoutes);
 app.use('/api/admin', adminRoutes);
 
 app.use("/api/admin/draws", adminDrawsRouter);
-app.use('/api/draws', drawsRouter);
 app.use("/api/admin/clients", adminClientsRouter);
 
 app.use("/api/coupons", couponsRouter);
