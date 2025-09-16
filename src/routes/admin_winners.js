@@ -7,15 +7,7 @@ const router = Router();
 
 /**
  * GET /api/admin/winners
- * Lista sorteios que já foram realizados (realized_at IS NOT NULL)
- * Campos retornados:
- *  - draw_id
- *  - winner_name (fallback para nome do usuário/e-mail se necessário)
- *  - realized_at
- *  - closed_at
- *  - redeemed (boolean)
- *  - status ("RESGATADO" | "NÃO RESGATADO")
- *  - days_since (dias desde realized_at)
+ * Lista sorteios com realized_at (já houve vencedor)
  */
 router.get("/", requireAuth, requireAdmin, async (_req, res) => {
   try {
@@ -36,9 +28,7 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
     const now = Date.now();
     const winners = (r.rows || []).map(row => {
       const realized = row.realized_at ? new Date(row.realized_at) : null;
-      const daysSince = realized
-        ? Math.max(0, Math.floor((now - realized.getTime()) / 86400000))
-        : 0;
+      const daysSince = realized ? Math.max(0, Math.floor((now - realized.getTime()) / 86400000)) : 0;
       const redeemed = !!row.closed_at;
       return {
         draw_id: row.draw_id,
@@ -51,7 +41,8 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
       };
     });
 
-    return res.json({ winners });
+    // força 200 + JSON mesmo se vazio (evita 204 em alguma camada)
+    return res.status(200).json({ winners });
   } catch (e) {
     console.error("[admin/winners] error:", e);
     return res.status(500).json({ error: "list_failed" });
