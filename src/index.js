@@ -19,7 +19,7 @@ import drawsExtRoutes from './routes/draws_ext.js';
 import adminDrawsRouter from './routes/admin_draws.js';
 import adminClientsRouter from './routes/admin_clients.js';
 import adminWinnersRouter from './routes/admin_winners.js';
-import adminDashboardRouter from "./routes/admin_dashboard.js";
+import adminDashboardRouter from './routes/admin_dashboard.js';
 
 import configPublicRouter from './routes/config_public.js';
 import adminConfigRouter from './routes/admin_config.js';
@@ -78,10 +78,11 @@ app.use('/api/draws-ext', drawsExtRoutes);
 app.use('/api/admin/draws', adminDrawsRouter);
 app.use('/api/admin/clients', adminClientsRouter);
 app.use('/api/admin/winners', adminWinnersRouter);
-app.use("/api/admin/dashboard", adminDashboardRouter);
+app.use('/api/admin/dashboard', adminDashboardRouter);
 
-app.use('/api/config', configPublicRouter);          // pública (front lê o preço para exibição)
-app.use('/api/admin/config', adminConfigRouter);     // admin (salva preço)
+// config pública (front lê o preço) e admin (salva preço)
+app.use('/api/config', configPublicRouter);
+app.use('/api/admin/config', adminConfigRouter);
 
 // ── router admin GENÉRICO (deixa por último) ───────────────
 app.use('/api/admin', adminRoutes);
@@ -96,7 +97,10 @@ app.use((req, res) => {
 // ── bootstrap ───────────────────────────────────────────────
 async function bootstrap() {
   try {
+    // garante estrutura e app_config antes de subir o server
     await ensureSchema();
+    await ensureAppConfig();
+
     const pool = await getPool();
     await pool.query('SELECT 1');
     console.log('[db] warmup ok');
@@ -111,6 +115,3 @@ async function bootstrap() {
 }
 
 bootstrap();
-
-await ensureSchema();
-await ensureAppConfig(); 
