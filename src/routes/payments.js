@@ -4,6 +4,7 @@ import { MercadoPagoConfig, Payment } from 'mercadopago';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
+import { getTicketPriceCents } from '../services/config.js';
 
 const router = Router();
 
@@ -58,12 +59,8 @@ router.post('/pix', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'reservation_expired' });
     }
 
-    // Valor (preço * quantidade)
-    const priceCents = Number(
-      process.env.PRICE_CENTS ||
-        (Number(process.env.REACT_APP_PIX_PRICE) * 100) ||
-        5500
-    );
+    // Valor (preço * quantidade) — agora vindo do banco
+    const priceCents = await getTicketPriceCents();
     const amount = Number(((rs.numbers.length * priceCents) / 100).toFixed(2));
 
     // Descrição e webhook

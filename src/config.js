@@ -14,3 +14,9 @@ export function setTicketPriceCents(v) {
   console.log("[config] ticket price set to", _ticketPriceCents, "cents");
   return _ticketPriceCents;
 }
+
+export {
+  ensureAppConfig,
+  getTicketPriceCents,
+  setTicketPriceCents,
+} from './services/config.js';

@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { getTicketPriceCents } from '../services/config.js';
 
 const router = Router();
 
@@ -35,7 +36,6 @@ router.get('/', requireAuth, async (req, res) => {
 
 /**
  * GET /api/me/reservations
- * (o seu endpoint já existente – mantive igual)
  */
 router.get('/reservations', requireAuth, async (req, res) => {
   try {
@@ -48,7 +48,7 @@ router.get('/reservations', requireAuth, async (req, res) => {
       [userId]
     );
 
-    const priceCents = Number(process.env.PRICE_CENTS || 5500);
+    const priceCents = await getTicketPriceCents();
     const reservations = r.rows.map(row => ({
       id: row.id,
       draw_id: row.draw_id,

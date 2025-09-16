@@ -21,6 +21,10 @@ import adminClientsRouter from './routes/admin_clients.js';
 import adminWinnersRouter from './routes/admin_winners.js';
 import adminDashboardRouter from "./routes/admin_dashboard.js";
 
+import configPublicRouter from './routes/config_public.js';
+import adminConfigRouter from './routes/admin_config.js';
+import { ensureAppConfig } from './services/config.js';
+
 // Router /api/admin genérico (deixa por último entre os de /api/admin)
 import adminRoutes from './routes/admin.js';
 
@@ -76,6 +80,9 @@ app.use('/api/admin/clients', adminClientsRouter);
 app.use('/api/admin/winners', adminWinnersRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
 
+app.use('/api/config', configPublicRouter);          // pública (front lê o preço para exibição)
+app.use('/api/admin/config', adminConfigRouter);     // admin (salva preço)
+
 // ── router admin GENÉRICO (deixa por último) ───────────────
 app.use('/api/admin', adminRoutes);
 
@@ -104,3 +111,6 @@ async function bootstrap() {
 }
 
 bootstrap();
+
+await ensureSchema();
+await ensureAppConfig(); 

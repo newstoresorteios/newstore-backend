@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { getTicketPriceCents } from "../config.js";
+import { getTicketPriceCents } from '../services/config.js';
 
 const router = Router();
 
@@ -46,8 +46,7 @@ router.get('/reservations', requireAuth, requireAdmin, async (req, res) => {
        limit ${pageSize} offset ${offset}`;
     const listRes = await query(listSql, params);
 
-   // const priceCents = Number(process.env.PRICE_CENTS || 5500);
-   const priceCents = getTicketPriceCents();
+    const priceCents = await getTicketPriceCents();
     const reservations = listRes.rows.map(row => ({
       id: row.id,
       user_id: row.user_id,
