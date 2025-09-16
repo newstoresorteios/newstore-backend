@@ -28,19 +28,22 @@ import adminConfigRouter from "./routes/admin_config.js";
 // Router admin genérico (DEIXAR POR ÚLTIMO entre /api/admin/*)
 import adminRoutes from "./routes/admin.js";
 
-import purchaseLimitRouter from "./routes/purchase_limit.js"
-
+import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
 
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
-// Garantir que a tabela de configuração e o preço existam
 import { ensureAppConfig } from "./services/config.js";
 
 const app = express();
 
 const PORT = process.env.PORT || 4000;
-const ORIGIN = process.env.CORS_ORIGIN || "*";
+
+// Se não setar CORS_ORIGIN, usamos uma allowlist padrão
+const ORIGIN = process.env.CORS_ORIGIN
+  || "http://localhost:3000,https://newstore-frontend-ten.vercel.app,https://newstorerj.com.br,https://www.newstorerj.com.br";
+
+const ORIGINS = ORIGIN.split(",").map(s => s.trim()).filter(Boolean);
 
 // Ping de saúde no DB (mantém a conexão acordada em hosts free)
 setInterval(() => {
@@ -50,12 +53,20 @@ setInterval(() => {
 }, 60_000);
 
 // ── Middlewares ─────────────────────────────────────────────
-app.use(
-  cors({
-    origin: ORIGIN === "*" ? true : ORIGIN.split(",").map((s) => s.trim()),
-    credentials: true,
-  })
-);
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // server-to-server, curl, healthchecks
+    const ok = ORIGINS.includes("*") || ORIGINS.includes(origin);
+    return cb(ok ? null : new Error("Not allowed by CORS"), ok);
+  },
+  credentials: true,
+  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization","X-Requested-With"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));   // responde preflight
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
@@ -69,12 +80,10 @@ app.use("/api/auth", authRoutes);
 app.use("/api/numbers", numbersRoutes);
 app.use("/api/reservations", reservationsRoutes);
 
-// Pagamentos (montar apenas uma vez)
+// Pagamentos
 app.use("/api/payments", paymentsRoutes);
-
-// Aliases p/ compatibilidade (se o front antigo ainda chamar estes paths)
-app.use("/api/orders", paymentsRoutes);
-app.use("/api/participations", paymentsRoutes);
+app.use("/api/orders", paymentsRoutes);          // aliases
+app.use("/api/participations", paymentsRoutes);  // aliases
 
 app.use("/api/me", meRoutes);
 app.use("/api/draws", drawsRoutes);
@@ -93,12 +102,13 @@ app.use("/api/admin/config", adminConfigRouter);
 // ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);
 
+// ✅ Limite de compras
 app.use("/api/purchase-limit", purchaseLimitRouter);
 
 // Cupons
 app.use("/api/coupons", couponsRouter);
 
-// 404 padrão (evita leak de HTML em produção)
+// 404 padrão
 app.use((req, res) => {
   res.status(404).json({ error: "not_found", path: req.originalUrl });
 });
@@ -115,7 +125,7 @@ async function bootstrap() {
 
     app.listen(PORT, () => {
       console.log(`API listening on :${PORT}`);
-      console.log(`[cors] origin = ${ORIGIN}`);
+      console.log(`[cors] origins = ${ORIGINS.join(", ")}`);
     });
   } catch (e) {
     console.error("[bootstrap] falha ao iniciar backend:", e);
