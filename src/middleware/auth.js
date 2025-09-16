@@ -6,7 +6,7 @@ const JWT_SECRET =
   process.env.JWT_SECRET ||
   process.env.JWT_SECRET_KEY ||
   process.env.SUPABASE_JWT_SECRET ||
-  'dev-secret';
+  'change-me-in-env';
 
 // você pode manter AUTH_COOKIE_NAME, mas também aceitaremos nomes comuns
 const COOKIE_NAMES = [
