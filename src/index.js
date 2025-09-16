@@ -19,6 +19,7 @@ import drawsExtRoutes from './routes/draws_ext.js';
 import adminDrawsRouter from './routes/admin_draws.js';
 import adminClientsRouter from './routes/admin_clients.js';
 import adminWinnersRouter from './routes/admin_winners.js';
+import adminDashboardRouter from "./routes/admin_dashboard.js";
 
 // Router /api/admin genérico (deixa por último entre os de /api/admin)
 import adminRoutes from './routes/admin.js';
@@ -73,6 +74,7 @@ app.use('/api/draws-ext', drawsExtRoutes);
 app.use('/api/admin/draws', adminDrawsRouter);
 app.use('/api/admin/clients', adminClientsRouter);
 app.use('/api/admin/winners', adminWinnersRouter);
+app.use("/api/admin/dashboard", adminDashboardRouter);
 
 // ── router admin GENÉRICO (deixa por último) ───────────────
 app.use('/api/admin', adminRoutes);
