@@ -19,6 +19,7 @@ import adminDrawsRouter from "./routes/admin_draws.js";
 import couponsRouter from "./routes/coupons.js";
 import drawsRouter from './routes/draws.js';
 import adminClientsRouter from "./routes/admin_clients.js";
+import adminWinnersRouter from "./routes/admin_winners.js";
 
 import { query, getPool } from './db.js';
 import { ensureSchema } from './seed.js';
@@ -68,6 +69,7 @@ app.use('/api/admin', adminRoutes);
 
 app.use("/api/admin/draws", adminDrawsRouter);
 app.use("/api/admin/clients", adminClientsRouter);
+app.use("/api/admin/winners", adminWinnersRouter);
 
 app.use("/api/coupons", couponsRouter);
 
