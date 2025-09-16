@@ -15,7 +15,7 @@ import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
 
-// Routers admin ESPECÍFICOS (antes do /api/admin genérico)
+// Routers admin ESPECÍFICOS (monte antes do /api/admin genérico)
 import adminDrawsRouter from "./routes/admin_draws.js";
 import adminClientsRouter from "./routes/admin_clients.js";
 import adminWinnersRouter from "./routes/admin_winners.js";
@@ -23,7 +23,9 @@ import adminDashboardRouter from "./routes/admin_dashboard.js";
 
 import configPublicRouter from "./routes/config_public.js";
 import adminConfigRouter from "./routes/admin_config.js";
-import adminRoutes from "./routes/admin.js"; // genérico (deixe por último entre /api/admin/*)
+
+// Router /api/admin genérico (deixe por último entre os de /api/admin)
+import adminRoutes from "./routes/admin.js";
 
 import couponsRouter from "./routes/coupons.js";
 
@@ -98,7 +100,7 @@ app.use((req, res) => {
 async function bootstrap() {
   try {
     await ensureSchema();
-    await ensureAppConfig(); // <— garante que o preço existe
+    await ensureAppConfig(); // garante que o preço existe na app_config
     const pool = await getPool();
     await pool.query("SELECT 1");
     console.log("[db] warmup ok");
