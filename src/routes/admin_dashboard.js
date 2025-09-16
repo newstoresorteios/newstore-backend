@@ -1,4 +1,4 @@
-// src/routes/admin_dashboard.js
+// backend/src/routes/admin_dashboard.js
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
@@ -78,8 +78,7 @@ router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
     const newId = ins.rows[0].id;
     log("novo draw id =", newId);
 
-    const tuples = [];
-    for (let i = 0; i < 100; i++) tuples.push(`(${newId}, ${i}, 'available', null)`);
+    const tuples = Array.from({ length: 100 }, (_, i) => `(${newId}, ${i}, 'available', null)`);
     await query(
       `insert into numbers(draw_id, n, status, reservation_id)
        values ${tuples.join(",")}`
@@ -93,17 +92,30 @@ router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /**
+ * Rota canônica:
  * POST /api/admin/dashboard/price
  * Body: { price_cents }
  */
 router.post("/price", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const raw = req.body?.price_cents;
-    log("POST /price", raw);
-    const saved = await setTicketPriceCents(raw);
+    const saved = await setTicketPriceCents(req.body?.price_cents);
     return res.json({ ok: true, price_cents: saved });
   } catch (e) {
     console.error("[admin/dashboard] /price error:", e);
+    return res.status(400).json({ error: "invalid_price" });
+  }
+});
+
+/**
+ * Alias opcional para compatibilidade:
+ * POST /api/admin/dashboard/ticket-price
+ */
+router.post("/ticket-price", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const saved = await setTicketPriceCents(req.body?.price_cents);
+    return res.json({ ok: true, price_cents: saved });
+  } catch (e) {
+    console.error("[admin/dashboard] /ticket-price error:", e);
     return res.status(400).json({ error: "invalid_price" });
   }
 });
