@@ -14,12 +14,16 @@ import paymentsRoutes from './routes/payments.js';
 import meRoutes from './routes/me.js';
 import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
+
+// Routers "admin" específicos (monte antes do /api/admin genérico)
+import adminDrawsRouter from './routes/admin_draws.js';
+import adminClientsRouter from './routes/admin_clients.js';
+import adminWinnersRouter from './routes/admin_winners.js';
+
+// Router /api/admin genérico (deixa por último entre os de /api/admin)
 import adminRoutes from './routes/admin.js';
-import adminDrawsRouter from "./routes/admin_draws.js";
-import couponsRouter from "./routes/coupons.js";
-import drawsRouter from './routes/draws.js';
-import adminClientsRouter from "./routes/admin_clients.js";
-import adminWinnersRouter from "./routes/admin_winners.js";
+
+import couponsRouter from './routes/coupons.js';
 
 import { query, getPool } from './db.js';
 import { ensureSchema } from './seed.js';
@@ -49,7 +53,7 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ── rotas ───────────────────────────────────────────────────
+// ── rotas públicas/gerais ───────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/numbers', numbersRoutes);
 app.use('/api/reservations', reservationsRoutes);
@@ -57,21 +61,23 @@ app.use('/api/reservations', reservationsRoutes);
 // monta uma única vez o payments **correto**
 app.use('/api/payments', paymentsRoutes);
 
-// aliases para compatibilidade com o front:
-// /api/orders/me e /api/participations/me
+// aliases para compatibilidade com o front
 app.use('/api/orders', paymentsRoutes);
 app.use('/api/participations', paymentsRoutes);
 
 app.use('/api/me', meRoutes);
 app.use('/api/draws', drawsRoutes);
 app.use('/api/draws-ext', drawsExtRoutes);
+
+// ── rotas admin ESPECÍFICAS (antes do genérico) ────────────
+app.use('/api/admin/draws', adminDrawsRouter);
+app.use('/api/admin/clients', adminClientsRouter);
+app.use('/api/admin/winners', adminWinnersRouter);
+
+// ── router admin GENÉRICO (deixa por último) ───────────────
 app.use('/api/admin', adminRoutes);
 
-app.use("/api/admin/draws", adminDrawsRouter);
-app.use("/api/admin/clients", adminClientsRouter);
-app.use("/api/admin/winners", adminWinnersRouter);
-
-app.use("/api/coupons", couponsRouter);
+app.use('/api/coupons', couponsRouter);
 
 // 404
 app.use((req, res) => {
