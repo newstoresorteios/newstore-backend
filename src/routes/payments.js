@@ -95,7 +95,7 @@ router.post('/pix', requireAuth, async (req, res) => {
     // Normaliza QR/copia-e-cola
     let { qr_code, qr_code_base64 } = td;
     if (typeof qr_code_base64 === 'string') qr_code_base64 = qr_code_base64.replace(/\s+/g, '');
-    if (typeof qr_code === 'string') qr_code = qr_code.replace(/\s+/g, '');
+    if (typeof qr_code === 'string') qr_code = qr_code.trim();
 
     // Persiste o pagamento
     await query(
