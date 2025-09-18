@@ -1,7 +1,6 @@
 // src/routes/config.js
 import { Router } from "express";
 import {
-  ensureAppConfig,
   getTicketPriceCents,
   setTicketPriceCents,
   getBannerTitle,
@@ -14,70 +13,55 @@ const router = Router();
 
 /**
  * GET /api/config
- * Retorna configurações públicas para o front.
+ * Retorna as chaves públicas usadas no front.
  */
 router.get("/", async (_req, res) => {
   try {
-    await ensureAppConfig(); // garante a tabela/seed
-    const [price_cents, banner_title, max_select] = await Promise.all([
+    const [price_cents, banner_title, max_numbers_per_selection] = await Promise.all([
       getTicketPriceCents(),
       getBannerTitle(),
       getMaxNumbersPerSelection(),
     ]);
+
     res.json({
       ticket_price_cents: price_cents,
       banner_title,
-      max_numbers_per_selection: max_select,
+      max_numbers_per_selection,
     });
   } catch (e) {
-    console.error("[config][GET] error:", e);
+    console.error("[config][GET] error", e);
     res.status(500).json({ error: "config_failed" });
   }
 });
 
 /**
  * POST /api/config
- * Atualiza chaves (admin deve proteger essa rota via auth/ACL).
- * body: { ticket_price_cents?, banner_title?, max_numbers_per_selection? }
+ * Atualiza banner_title e max_numbers_per_selection (e opcionalmente price_cents).
+ * O preço você já atualiza pela rota antiga; aqui deixo suportado também.
  */
 router.post("/", async (req, res) => {
   try {
-    const b = req.body || {};
+    const { banner_title, max_numbers_per_selection, ticket_price_cents } = req.body || {};
 
-    const writes = [];
-
-    if (b.ticket_price_cents != null) {
-      const cents = Math.max(0, Math.floor(Number(b.ticket_price_cents)));
-      writes.push(setTicketPriceCents(cents));
+    if (banner_title !== undefined) {
+      await setBannerTitle(banner_title);
     }
-    if (b.banner_title != null) {
-      writes.push(setBannerTitle(String(b.banner_title)));
+    if (max_numbers_per_selection !== undefined) {
+      await setMaxNumbersPerSelection(max_numbers_per_selection);
     }
-    if (b.max_numbers_per_selection != null) {
-      const n = Math.max(1, Math.floor(Number(b.max_numbers_per_selection)));
-      writes.push(setMaxNumbersPerSelection(n));
+    if (ticket_price_cents !== undefined) {
+      await setTicketPriceCents(ticket_price_cents);
     }
 
-    if (writes.length === 0) {
-      return res.status(400).json({ error: "no_fields_to_update" });
-    }
+    const payload = {
+      ticket_price_cents: await getTicketPriceCents(),
+      banner_title: await getBannerTitle(),
+      max_numbers_per_selection: await getMaxNumbersPerSelection(),
+    };
 
-    await Promise.all(writes);
-
-    const [price_cents, banner_title, max_select] = await Promise.all([
-      getTicketPriceCents(),
-      getBannerTitle(),
-      getMaxNumbersPerSelection(),
-    ]);
-
-    res.json({
-      ok: true,
-      ticket_price_cents: price_cents,
-      banner_title,
-      max_numbers_per_selection: max_select,
-    });
+    res.json({ ok: true, ...payload });
   } catch (e) {
-    console.error("[config][POST] error:", e);
+    console.error("[config][POST] error", e);
     res.status(500).json({ error: "config_update_failed" });
   }
 });
