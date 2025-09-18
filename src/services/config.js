@@ -45,11 +45,6 @@ export async function getConfigValue(key) {
   return r.rows[0]?.value ?? null;
 }
 
-export async function getTicketPriceCents() {
-  const v = await getConfigValue('ticket_price_cents');
-  const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100; // fallback 100 centavos
-}
 
 export async function getBannerTitle() {
   return (await getConfigValue('banner_title')) || '';
