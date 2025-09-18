@@ -31,6 +31,8 @@ import adminRoutes from "./routes/admin.js";
 import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
 
+import configRoute from './routes/config.js';
+
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
 import { ensureAppConfig } from "./services/config.js";
@@ -104,6 +106,8 @@ app.use("/api/purchase-limit", purchaseLimitRouter);
 
 // Cupons
 app.use("/api/coupons", couponsRouter);
+
+app.use('/api/config', configRoute);
 
 // 404 padrão
 app.use((req, res) => {

@@ -38,3 +38,25 @@ export async function setTicketPriceCents(v) {
   cache = { v: n, ts: Date.now() };
   return n;
 }
+
+
+export async function getConfigValue(key) {
+  const r = await query(`SELECT value FROM app_config WHERE key = $1`, [key]);
+  return r.rows[0]?.value ?? null;
+}
+
+export async function getTicketPriceCents() {
+  const v = await getConfigValue('ticket_price_cents');
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100; // fallback 100 centavos
+}
+
+export async function getBannerTitle() {
+  return (await getConfigValue('banner_title')) || '';
+}
+
+export async function getMaxNumbersPerSelection() {
+  const v = await getConfigValue('max_numbers_per_selection');
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 5; // fallback 5
+}
