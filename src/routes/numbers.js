@@ -4,6 +4,20 @@ import { query } from '../db.js';
 
 const router = Router();
 
+// gera duas iniciais a partir do nome; se não tiver nome, usa o usuário do e-mail
+function initialsFromNameOrEmail(name, email) {
+  const nm = String(name || '').trim();
+  if (nm) {
+    const parts = nm.split(/\s+/).filter(Boolean);
+    const first = parts[0]?.[0] || '';
+    const last = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0]?.[1] || '');
+    return (first + last).toUpperCase();
+  }
+  const mail = String(email || '').trim();
+  const user = mail.includes('@') ? mail.split('@')[0] : mail;
+  return user.slice(0, 2).toUpperCase();
+}
+
 /**
  * GET /api/numbers
  * - Pega o draw aberto
@@ -12,6 +26,7 @@ const router = Router();
  * - Marca como "reserved" os números com reserva ativa (não expirada)
  * - Faz lazy-expire das reservas vencidas (best-effort)
  * - Retorna o status final para cada número
+ * - (NOVO) Para números vendidos, inclui "owner_initials" (iniciais do comprador)
  */
 router.get('/', async (_req, res) => {
   try {
@@ -28,17 +43,29 @@ router.get('/', async (_req, res) => {
       [drawId]
     );
 
-    // 3) pagos => SOLD (UI espera "sold")
+    // 3) pagos => SOLD + iniciais do comprador
+    //    Usamos UNNEST para explodir o array de números pagos
     const pays = await query(
-      `SELECT numbers
-         FROM payments
-        WHERE draw_id = $1
-          AND lower(status) IN ('approved','paid','pago')`,
+      `
+      SELECT
+        num.n::int       AS n,
+        u.name           AS owner_name,
+        u.email          AS owner_email
+      FROM payments p
+      LEFT JOIN users u ON u.id = p.user_id
+      CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
+      WHERE p.draw_id = $1
+        AND lower(p.status) IN ('approved','paid','pago')
+      `,
       [drawId]
     );
     const sold = new Set();
-    for (const p of pays.rows || []) {
-      for (const n of (p.numbers || [])) sold.add(Number(n));
+    const initialsByN = new Map();
+    for (const row of pays.rows || []) {
+      const num = Number(row.n);
+      sold.add(num);
+      const ini = initialsFromNameOrEmail(row.owner_name, row.owner_email);
+      initialsByN.set(num, ini);
     }
 
     // 4) reservas ativas; ignora expiradas (e tenta expirar em background)
@@ -71,11 +98,14 @@ router.get('/', async (_req, res) => {
       }
     }
 
-    // 5) status final por número
+    // 5) status final por número (+ owner_initials quando sold)
     const numbers = base.rows.map(({ n }) => {
-      if (sold.has(n))     return { n, status: 'sold' };      // <<< ajuste aqui
-      if (reserved.has(n)) return { n, status: 'reserved' };
-      return { n, status: 'available' };
+      const num = Number(n);
+      if (sold.has(num)) {
+        return { n: num, status: 'sold', owner_initials: initialsByN.get(num) || null };
+      }
+      if (reserved.has(num)) return { n: num, status: 'reserved' };
+      return { n: num, status: 'available' };
     });
 
     res.json({ drawId, numbers });
