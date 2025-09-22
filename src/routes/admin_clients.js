@@ -83,8 +83,8 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
 
 /**
  * GET /api/admin/clients/:userId/coupon
- * Retorna o cupom do usuário no formato esperado pelo front.
- * Resposta: { user_id, code, cents }
+ * Retorna o cupom atual do usuário a partir da TABELA USERS.
+ * Resposta esperada pelo front: { user_id, code, cents }
  */
 router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   const userId = Number(req.params.userId);
@@ -93,60 +93,28 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   }
 
   try {
-    // 1) Primeira tentativa: ler direto da tabela users (coupon_code / coupon_cents)
-    //    (é o que aparece no seu Supabase)
-    try {
-      const ru = await query(
-        `
-        SELECT coupon_code, coupon_cents
-        FROM users
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [userId]
-      );
+    const r = await query(
+      `
+      SELECT
+        u.coupon_code,
+        COALESCE(u.coupon_cents, 0)::bigint AS coupon_cents
+      FROM users u
+      WHERE u.id = $1
+      LIMIT 1
+      `,
+      [userId]
+    );
 
-      if (ru.rowCount && ru.rows[0]) {
-        const u = ru.rows[0];
-        return res.json({
-          user_id: userId,
-          code: u.coupon_code || null,
-          cents: Number(u.coupon_cents || 0),
-        });
-      }
-    } catch (e) {
-      // Se as colunas não existirem (42703) apenas segue para o fallback
-      if (e?.code && e.code !== "42703") throw e;
+    if (!r.rowCount) {
+      return res.status(404).json({ error: "user_not_found" });
     }
 
-    // 2) Fallback opcional: tabela coupons (se existir)
-    try {
-      const rc = await query(
-        `
-        SELECT code, cents
-        FROM coupons
-        WHERE user_id = $1
-        ORDER BY updated_at DESC NULLS LAST, id DESC
-        LIMIT 1
-        `,
-        [userId]
-      );
-
-      if (rc.rowCount && rc.rows[0]) {
-        const c = rc.rows[0];
-        return res.json({
-          user_id: userId,
-          code: c.code || null,
-          cents: Number(c.cents || 0),
-        });
-      }
-    } catch (e) {
-      // 42P01 = relation (tabela) não existe → ignore e continua
-      if (e?.code && e.code !== "42P01") throw e;
-    }
-
-    // Sem cupom registrado
-    return res.json({ user_id: userId, code: null, cents: 0 });
+    const row = r.rows[0];
+    return res.json({
+      user_id: userId,
+      code: row.coupon_code || null,
+      cents: Number(row.coupon_cents || 0),
+    });
   } catch (e) {
     console.error("[admin/clients/:userId/coupon] error:", e);
     return res.status(500).json({ error: "coupon_lookup_failed" });
