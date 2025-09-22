@@ -7,7 +7,7 @@ const router = Router();
 
 /**
  * GET /api/admin/clients/active
- * Lista clientes com saldo ativo (última compra aprovada < 6 meses)
+ * Lista clientes com saldo ativo (última compra aprovada < 6 meses) + CUPOM
  */
 router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
   try {
@@ -16,21 +16,9 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
       WITH pays AS (
         SELECT
           p.user_id,
-          COUNT(*) FILTER (
-            WHERE lower(trim(coalesce(p.status,''))) = 'approved'
-          )                                   AS compras,
-
-          COALESCE(
-            SUM(p.amount_cents) FILTER (
-              WHERE lower(trim(coalesce(p.status,''))) = 'approved'
-            ), 0
-          )::bigint                           AS total_cents,
-
-          MAX(
-            COALESCE(p.paid_at, p.created_at)
-          ) FILTER (
-            WHERE lower(trim(coalesce(p.status,''))) = 'approved'
-          )                                   AS last_buy
+          COUNT(*) FILTER (WHERE lower(trim(coalesce(p.status,''))) = 'approved') AS compras,
+          COALESCE(SUM(p.amount_cents) FILTER (WHERE lower(trim(coalesce(p.status,''))) = 'approved'), 0)::bigint AS total_cents,
+          MAX(COALESCE(p.paid_at, p.created_at)) FILTER (WHERE lower(trim(coalesce(p.status,''))) = 'approved') AS last_buy
         FROM payments p
         GROUP BY p.user_id
       ),
@@ -50,10 +38,20 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
         pa.last_buy,
         COALESCE(w.wins, 0)                       AS wins,
         (pa.last_buy + INTERVAL '6 months')::date AS expires_at,
-        ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire
+        ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire,
+        cu.code  AS coupon_code,
+        cu.cents AS coupon_cents
       FROM users u
       JOIN pays pa ON pa.user_id = u.id
       LEFT JOIN wins w ON w.user_id = u.id
+      /* Pega o ÚLTIMO cupom do usuário (se existir) */
+      LEFT JOIN LATERAL (
+        SELECT c.code, c.cents
+        FROM coupons c
+        WHERE c.user_id = u.id
+        ORDER BY c.updated_at DESC NULLS LAST, c.id DESC
+        LIMIT 1
+      ) cu ON true
       WHERE pa.last_buy >= NOW() - INTERVAL '6 months'
       ORDER BY expires_at ASC, pa.total_cents DESC
       `
@@ -70,6 +68,9 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
       wins: row.wins || 0,
       expires_at: row.expires_at,
       days_to_expire: Math.max(0, Number(row.days_to_expire) || 0),
+      /* >>> Cupom já no payload <<< */
+      coupon_code: row.coupon_code || null,
+      coupon_cents: Number(row.coupon_cents || 0),
     }));
 
     return res.json({ clients: items });
@@ -80,18 +81,15 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /**
- * GET /api/admin/clients/:userId/coupon
- * Retorna o cupom do usuário (apenas leitura).
- * Resposta: { user_id, code, cents }
+ * (Opcional) GET /api/admin/clients/:userId/coupon
+ * Mantido para compatibilidade, mas o front não precisa mais chamar.
  */
 router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isFinite(userId) || userId <= 0) {
     return res.status(400).json({ error: "invalid_user_id" });
   }
-
   try {
-    // lê o último cupom do usuário (ajuste nomes de colunas se necessário)
     const r = await query(
       `
       SELECT code, cents
@@ -102,23 +100,12 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
       `,
       [userId]
     );
-
     if (r.rowCount && r.rows[0]) {
-      const row = r.rows[0];
-      return res.json({
-        user_id: userId,
-        code: row.code || null,
-        cents: Number(row.cents || 0),
-      });
+      return res.json({ user_id: userId, code: r.rows[0].code || null, cents: Number(r.rows[0].cents || 0) });
     }
-
-    // sem cupom registrado
     return res.json({ user_id: userId, code: null, cents: 0 });
   } catch (e) {
-    // 42P01 = relation/table not found (PostgreSQL)
-    if (e?.code === "42P01") {
-      return res.status(404).json({ error: "coupons_table_missing" });
-    }
+    if (e?.code === "42P01") return res.status(404).json({ error: "coupons_table_missing" });
     console.error("[admin/clients/:userId/coupon] error:", e);
     return res.status(500).json({ error: "coupon_lookup_failed" });
   }
