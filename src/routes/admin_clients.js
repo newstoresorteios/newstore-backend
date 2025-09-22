@@ -1,4 +1,3 @@
-// src/routes/admin_clients.js
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
@@ -79,8 +78,8 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
 
 /**
  * GET /api/admin/clients/:userId/coupon
- * Retorna { user_id, code, cents } lendo da TABELA users (colunas coupon_code, coupon_cents).
- * Sempre responde 200; se não houver cupom, devolve { code: null, cents: 0 }.
+ * Lê da tabela public.users (colunas: coupon_code, coupon_cents).
+ * Responde { user_id, code, cents }. Se não existir, devolve code:null, cents:0 (sempre 200).
  */
 router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   const userId = Number(req.params.userId);
@@ -92,8 +91,8 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
     const r = await query(
       `
       SELECT
-        COALESCE(u.coupon_code, NULL)            AS code,
-        COALESCE(u.coupon_cents, 0)::bigint      AS cents
+        NULLIF(TRIM(u.coupon_code), '') AS code,
+        COALESCE(u.coupon_cents, 0)::bigint AS cents
       FROM public.users u
       WHERE u.id = $1
       LIMIT 1
@@ -101,20 +100,19 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
       [userId]
     );
 
-    if (r.rowCount === 0) {
-      // Usuário não encontrado: mantém contrato estável para o front
+    if (!r.rowCount) {
       return res.json({ user_id: userId, code: null, cents: 0 });
     }
 
-    const { code, cents } = r.rows[0] || {};
+    const { code, cents } = r.rows[0];
     return res.json({
       user_id: userId,
       code: code || null,
       cents: Number(cents || 0),
     });
   } catch (e) {
-    console.error("[admin/clients/:userId/coupon] error:", e?.code, e?.message, e?.detail);
-    // Mantém contrato estável, evitando quebrar o front mesmo em erros transientes
+    console.error("[admin/clients/:userId/coupon] error:", e?.code, e?.message);
+    // Mantém contrato estável pro front:
     return res.json({ user_id: userId, code: null, cents: 0 });
   }
 });
