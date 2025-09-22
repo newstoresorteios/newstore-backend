@@ -8,7 +8,7 @@ const router = Router();
 /**
  * GET /api/admin/clients/active
  * Lista clientes com saldo ativo (última compra aprovada < 6 meses)
- * ➜ Agora também devolve o cupom do usuário (coupon_code, coupon_cents) direto do public.users
+ * ➜ Acrescenta apenas coupon_code (sem tocar em coupon_cents para não quebrar ambientes onde não existe)
  */
 router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
   try {
@@ -50,9 +50,8 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
         COALESCE(w.wins, 0)                       AS wins,
         (pa.last_buy + INTERVAL '6 months')::date AS expires_at,
         ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire,
-        -- ▼ cupom direto da tabela users
-        NULLIF(TRIM(u.coupon_code), '')          AS coupon_code,
-        COALESCE(u.coupon_cents, 0)::bigint      AS coupon_cents
+        -- cupom direto da users, sem tocar em coupon_cents para evitar 42703
+        NULLIF(TRIM(u.coupon_code), '')          AS coupon_code
       FROM public.users u
       JOIN pays pa ON pa.user_id = u.id
       LEFT JOIN wins w ON w.user_id = u.id
@@ -73,22 +72,23 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
       expires_at: row.expires_at,
       days_to_expire: Math.max(0, Number(row.days_to_expire) || 0),
 
-      // campos de cupom esperados pelo front (o extractCoupon pega coupon_code)
+      // o front lê via extractCoupon(c) => pega coupon_code
       coupon_code: row.coupon_code || null,
-      coupon_cents: Number(row.coupon_cents || 0),
+      // mantemos a chave para compat, mas não usamos aqui
+      coupon_cents: 0,
     }));
 
     return res.json({ clients: items });
   } catch (e) {
-    console.error("[admin/clients/active] error:", e);
+    console.error("[admin/clients/active] error:", e?.code, e?.message);
     return res.status(500).json({ error: "list_failed" });
   }
 });
 
 /**
  * GET /api/admin/clients/:userId/coupon
- * Lê da tabela public.users (colunas: coupon_code, coupon_cents).
- * Responde { user_id, code, cents }. Se não existir, devolve code:null, cents:0 (sempre 200).
+ * Lê da tabela public.users (campos: coupon_code e, se existir, coupon_cents).
+ * Responde sempre 200 com { user_id, code, cents }.
  */
 router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   const userId = Number(req.params.userId);
@@ -97,31 +97,41 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   }
 
   try {
-    const r = await query(
-      `
-      SELECT
-        NULLIF(TRIM(u.coupon_code), '') AS code,
-        COALESCE(u.coupon_cents, 0)::bigint AS cents
-      FROM public.users u
-      WHERE u.id = $1
-      LIMIT 1
-      `,
-      [userId]
-    );
-
-    if (!r.rowCount) {
-      return res.json({ user_id: userId, code: null, cents: 0 });
+    // 1ª tentativa: code + cents (para bancos que já têm coupon_cents)
+    try {
+      const r = await query(
+        `
+        SELECT
+          NULLIF(TRIM(u.coupon_code), '')     AS code,
+          COALESCE(u.coupon_cents, 0)::bigint AS cents
+        FROM public.users u
+        WHERE u.id = $1
+        LIMIT 1
+        `,
+        [userId]
+      );
+      if (!r.rowCount) return res.json({ user_id: userId, code: null, cents: 0 });
+      const { code, cents } = r.rows[0];
+      return res.json({ user_id: userId, code: code || null, cents: Number(cents || 0) });
+    } catch (e1) {
+      // Se a coluna coupon_cents não existir (42703), tenta só coupon_code
+      if (e1?.code !== "42703") throw e1;
+      const r2 = await query(
+        `
+        SELECT NULLIF(TRIM(u.coupon_code), '') AS code
+        FROM public.users u
+        WHERE u.id = $1
+        LIMIT 1
+        `,
+        [userId]
+      );
+      if (!r2.rowCount) return res.json({ user_id: userId, code: null, cents: 0 });
+      const { code } = r2.rows[0];
+      return res.json({ user_id: userId, code: code || null, cents: 0 });
     }
-
-    const { code, cents } = r.rows[0];
-    return res.json({
-      user_id: userId,
-      code: code || null,
-      cents: Number(cents || 0),
-    });
   } catch (e) {
     console.error("[admin/clients/:userId/coupon] error:", e?.code, e?.message);
-    // mantém contrato estável, sem quebrar a tela
+    // contrato estável para o front mesmo em erro
     return res.json({ user_id: userId, code: null, cents: 0 });
   }
 });
