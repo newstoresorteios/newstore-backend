@@ -8,7 +8,6 @@ const router = Router();
 /**
  * GET /api/admin/clients/active
  * Lista clientes com saldo ativo (última compra aprovada < 6 meses)
- * Agora também retorna o cupom mais recente de cada usuário (coupon_code, coupon_cents).
  */
 router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
   try {
@@ -20,11 +19,14 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
           COUNT(*) FILTER (
             WHERE lower(trim(coalesce(p.status,''))) = 'approved'
           )                                   AS compras,
+
+          -- seu schema usa amount_cents
           COALESCE(
             SUM(p.amount_cents) FILTER (
               WHERE lower(trim(coalesce(p.status,''))) = 'approved'
             ), 0
           )::bigint                           AS total_cents,
+
           MAX(
             COALESCE(p.paid_at, p.created_at)
           ) FILTER (
@@ -38,14 +40,6 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
         FROM draws
         WHERE winner_user_id IS NOT NULL
         GROUP BY winner_user_id
-      ),
-      last_coupon AS (
-        SELECT DISTINCT ON (c.user_id)
-          c.user_id,
-          c.code  AS coupon_code,
-          c.cents AS coupon_cents
-        FROM coupons c
-        ORDER BY c.user_id, c.updated_at DESC NULLS LAST, c.id DESC
       )
       SELECT
         u.id,
@@ -57,13 +51,11 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
         pa.last_buy,
         COALESCE(w.wins, 0)                       AS wins,
         (pa.last_buy + INTERVAL '6 months')::date AS expires_at,
-        ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire,
-        lc.coupon_code,
-        lc.coupon_cents
+        ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire
       FROM users u
       JOIN pays pa ON pa.user_id = u.id
       LEFT JOIN wins w ON w.user_id = u.id
-      LEFT JOIN last_coupon lc ON lc.user_id = u.id
+      -- saldo ativo: última compra aprovada há menos de 6 meses
       WHERE pa.last_buy >= NOW() - INTERVAL '6 months'
       ORDER BY expires_at ASC, pa.total_cents DESC
       `
@@ -80,10 +72,6 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
       wins: row.wins || 0,
       expires_at: row.expires_at,
       days_to_expire: Math.max(0, Number(row.days_to_expire) || 0),
-
-      // ▼ campos de cupom (o AdminClientes.jsx já lê via extractCoupon)
-      coupon_code: row.coupon_code || null,
-      coupon_cents: Number(row.coupon_cents || 0),
     }));
 
     return res.json({ clients: items });
@@ -93,46 +81,5 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
-/**
- * GET /api/admin/clients/:userId/coupon
- * Retorna o cupom do usuário (apenas leitura).
- * Resposta: { user_id, code, cents }
- */
-router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
-  const userId = Number(req.params.userId);
-  if (!Number.isFinite(userId) || userId <= 0) {
-    return res.status(400).json({ error: "invalid_user_id" });
-  }
-
-  try {
-    const r = await query(
-      `
-      SELECT code, cents
-      FROM coupons
-      WHERE user_id = $1
-      ORDER BY updated_at DESC NULLS LAST, id DESC
-      LIMIT 1
-      `,
-      [userId]
-    );
-
-    if (r.rowCount && r.rows[0]) {
-      const row = r.rows[0];
-      return res.json({
-        user_id: userId,
-        code: row.code || null,
-        cents: Number(row.cents || 0),
-      });
-    }
-
-    return res.json({ user_id: userId, code: null, cents: 0 });
-  } catch (e) {
-    if (e?.code === "42P01") {
-      return res.status(404).json({ error: "coupons_table_missing" });
-    }
-    console.error("[admin/clients/:userId/coupon] error:", e);
-    return res.status(500).json({ error: "coupon_lookup_failed" });
-  }
-});
-
 export default router;
+    
