@@ -1,3 +1,4 @@
+// src/routes/admin_clients.js
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
@@ -7,6 +8,7 @@ const router = Router();
 /**
  * GET /api/admin/clients/active
  * Lista clientes com saldo ativo (última compra aprovada < 6 meses)
+ * ➜ Agora também devolve o cupom do usuário (coupon_code, coupon_cents) direto do public.users
  */
 router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
   try {
@@ -47,7 +49,10 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
         pa.last_buy,
         COALESCE(w.wins, 0)                       AS wins,
         (pa.last_buy + INTERVAL '6 months')::date AS expires_at,
-        ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire
+        ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire,
+        -- ▼ cupom direto da tabela users
+        NULLIF(TRIM(u.coupon_code), '')          AS coupon_code,
+        COALESCE(u.coupon_cents, 0)::bigint      AS coupon_cents
       FROM public.users u
       JOIN pays pa ON pa.user_id = u.id
       LEFT JOIN wins w ON w.user_id = u.id
@@ -67,6 +72,10 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
       wins: row.wins || 0,
       expires_at: row.expires_at,
       days_to_expire: Math.max(0, Number(row.days_to_expire) || 0),
+
+      // campos de cupom esperados pelo front (o extractCoupon pega coupon_code)
+      coupon_code: row.coupon_code || null,
+      coupon_cents: Number(row.coupon_cents || 0),
     }));
 
     return res.json({ clients: items });
@@ -112,7 +121,7 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
     });
   } catch (e) {
     console.error("[admin/clients/:userId/coupon] error:", e?.code, e?.message);
-    // Mantém contrato estável pro front:
+    // mantém contrato estável, sem quebrar a tela
     return res.json({ user_id: userId, code: null, cents: 0 });
   }
 });
