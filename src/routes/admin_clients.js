@@ -20,7 +20,6 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
             WHERE lower(trim(coalesce(p.status,''))) = 'approved'
           )                                   AS compras,
 
-          -- seu schema usa amount_cents
           COALESCE(
             SUM(p.amount_cents) FILTER (
               WHERE lower(trim(coalesce(p.status,''))) = 'approved'
@@ -55,7 +54,6 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
       FROM users u
       JOIN pays pa ON pa.user_id = u.id
       LEFT JOIN wins w ON w.user_id = u.id
-      -- saldo ativo: última compra aprovada há menos de 6 meses
       WHERE pa.last_buy >= NOW() - INTERVAL '6 months'
       ORDER BY expires_at ASC, pa.total_cents DESC
       `
@@ -81,5 +79,49 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
+/**
+ * GET /api/admin/clients/:userId/coupon
+ * Retorna o cupom do usuário (apenas leitura).
+ * Resposta: { user_id, code, cents }
+ */
+router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isFinite(userId) || userId <= 0) {
+    return res.status(400).json({ error: "invalid_user_id" });
+  }
+
+  try {
+    // lê o último cupom do usuário (ajuste nomes de colunas se necessário)
+    const r = await query(
+      `
+      SELECT code, cents
+      FROM coupons
+      WHERE user_id = $1
+      ORDER BY updated_at DESC NULLS LAST, id DESC
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    if (r.rowCount && r.rows[0]) {
+      const row = r.rows[0];
+      return res.json({
+        user_id: userId,
+        code: row.code || null,
+        cents: Number(row.cents || 0),
+      });
+    }
+
+    // sem cupom registrado
+    return res.json({ user_id: userId, code: null, cents: 0 });
+  } catch (e) {
+    // 42P01 = relation/table not found (PostgreSQL)
+    if (e?.code === "42P01") {
+      return res.status(404).json({ error: "coupons_table_missing" });
+    }
+    console.error("[admin/clients/:userId/coupon] error:", e);
+    return res.status(500).json({ error: "coupon_lookup_failed" });
+  }
+});
+
 export default router;
-    
