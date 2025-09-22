@@ -19,25 +19,22 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
           COUNT(*) FILTER (
             WHERE lower(trim(coalesce(p.status,''))) = 'approved'
           )                                   AS compras,
-
-          -- seu schema usa amount_cents
           COALESCE(
             SUM(p.amount_cents) FILTER (
               WHERE lower(trim(coalesce(p.status,''))) = 'approved'
             ), 0
           )::bigint                           AS total_cents,
-
           MAX(
             COALESCE(p.paid_at, p.created_at)
           ) FILTER (
             WHERE lower(trim(coalesce(p.status,''))) = 'approved'
           )                                   AS last_buy
-        FROM payments p
+        FROM public.payments p
         GROUP BY p.user_id
       ),
       wins AS (
         SELECT winner_user_id AS user_id, COUNT(*) AS wins
-        FROM draws
+        FROM public.draws
         WHERE winner_user_id IS NOT NULL
         GROUP BY winner_user_id
       )
@@ -52,10 +49,9 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
         COALESCE(w.wins, 0)                       AS wins,
         (pa.last_buy + INTERVAL '6 months')::date AS expires_at,
         ((pa.last_buy + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire
-      FROM users u
+      FROM public.users u
       JOIN pays pa ON pa.user_id = u.id
       LEFT JOIN wins w ON w.user_id = u.id
-      -- saldo ativo: última compra aprovada há menos de 6 meses
       WHERE pa.last_buy >= NOW() - INTERVAL '6 months'
       ORDER BY expires_at ASC, pa.total_cents DESC
       `
@@ -83,8 +79,8 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
 
 /**
  * GET /api/admin/clients/:userId/coupon
- * Retorna o cupom atual do usuário a partir da TABELA USERS.
- * Resposta esperada pelo front: { user_id, code, cents }
+ * Retorna { user_id, code, cents } lendo da TABELA users (colunas coupon_code, coupon_cents).
+ * Sempre responde 200; se não houver cupom, devolve { code: null, cents: 0 }.
  */
 router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   const userId = Number(req.params.userId);
@@ -96,28 +92,30 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
     const r = await query(
       `
       SELECT
-        u.coupon_code,
-        COALESCE(u.coupon_cents, 0)::bigint AS coupon_cents
-      FROM users u
+        COALESCE(u.coupon_code, NULL)            AS code,
+        COALESCE(u.coupon_cents, 0)::bigint      AS cents
+      FROM public.users u
       WHERE u.id = $1
       LIMIT 1
       `,
       [userId]
     );
 
-    if (!r.rowCount) {
-      return res.status(404).json({ error: "user_not_found" });
+    if (r.rowCount === 0) {
+      // Usuário não encontrado: mantém contrato estável para o front
+      return res.json({ user_id: userId, code: null, cents: 0 });
     }
 
-    const row = r.rows[0];
+    const { code, cents } = r.rows[0] || {};
     return res.json({
       user_id: userId,
-      code: row.coupon_code || null,
-      cents: Number(row.coupon_cents || 0),
+      code: code || null,
+      cents: Number(cents || 0),
     });
   } catch (e) {
-    console.error("[admin/clients/:userId/coupon] error:", e);
-    return res.status(500).json({ error: "coupon_lookup_failed" });
+    console.error("[admin/clients/:userId/coupon] error:", e?.code, e?.message, e?.detail);
+    // Mantém contrato estável, evitando quebrar o front mesmo em erros transientes
+    return res.json({ user_id: userId, code: null, cents: 0 });
   }
 });
 
