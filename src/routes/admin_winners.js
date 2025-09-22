@@ -18,10 +18,11 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       select
         d.id                                                as draw_id,
         coalesce(nullif(d.winner_name,''), u.name, u.email, '-') as winner_name,
+        d.winner_number,                                    -- <=== NOVO
         d.realized_at,
         d.closed_at
-      from draws d
-      left join users u on u.id = d.winner_user_id
+      from public.draws d
+      left join public.users u on u.id = d.winner_user_id
       where d.realized_at is not null
       order by d.realized_at desc, d.id desc
       `
@@ -37,6 +38,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       return {
         draw_id: row.draw_id,
         winner_name: row.winner_name || "-",
+        winner_number: row.winner_number ?? null,   // <=== NOVO
         realized_at: row.realized_at,
         closed_at: row.closed_at,
         redeemed,
