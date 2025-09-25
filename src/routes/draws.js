@@ -83,26 +83,28 @@ router.get('/:id/numbers', async (req, res) => {
 
 /**
  * GET /api/draws/:id/participants
- * Lista participantes (nome/email) e seus respectivos números do sorteio.
- * Requer usuário autenticado. Ajuste os filtros no WHERE se quiser apenas pagos.
+ * Lista participantes (nome/email) e seus respectivos números (explode o array reservations.numbers).
+ * Requer usuário autenticado.
  */
 router.get('/:id/participants', requireAuth, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
     if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
 
+    // Se quiser só pagos/aprovados, ative os filtros comentados.
     const sql = `
       select
-        r.id                              as reservation_id,
+        r.id as reservation_id,
         r.draw_id,
         r.user_id,
-        r.number                          as number,
-        r.status                          as status,
+        num as number,
+        r.status as status,
         r.created_at,
-        coalesce(nullif(u.name,''), u.email, '-'::text) as user_name,
-        u.email                          as user_email
+        coalesce(nullif(u.name,''), u.email, '-') as user_name,
+        u.email as user_email
       from reservations r
       left join users u on u.id = r.user_id
+      cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
         -- and coalesce(r.status,'') not in ('cancelled','canceled')
         -- and coalesce(r.paid,false) = true
@@ -118,7 +120,6 @@ router.get('/:id/participants', requireAuth, async (req, res) => {
 
 /**
  * Alias: GET /api/draws/:id/players
- * Devolve o mesmo payload de /:id/participants
  */
 router.get('/:id/players', requireAuth, async (req, res) => {
   try {
@@ -127,16 +128,17 @@ router.get('/:id/players', requireAuth, async (req, res) => {
 
     const sql = `
       select
-        r.id                              as reservation_id,
+        r.id as reservation_id,
         r.draw_id,
         r.user_id,
-        r.number                          as number,
-        r.status                          as status,
+        num as number,
+        r.status as status,
         r.created_at,
-        coalesce(nullif(u.name,''), u.email, '-'::text) as user_name,
-        u.email                          as user_email
+        coalesce(nullif(u.name,''), u.email, '-') as user_name,
+        u.email as user_email
       from reservations r
       left join users u on u.id = r.user_id
+      cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
       order by user_name asc, number asc
     `;
