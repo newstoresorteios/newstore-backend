@@ -83,15 +83,13 @@ router.get('/:id/numbers', async (req, res) => {
 
 /**
  * GET /api/draws/:id/participants
- * Lista participantes (nome/email) e seus respectivos números (explode o array reservations.numbers).
- * Requer usuário autenticado.
+ * Apenas números pagos (status='paid' ou r.paid=true).
  */
 router.get('/:id/participants', requireAuth, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
     if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
 
-    // Se quiser só pagos/aprovados, ative os filtros comentados.
     const sql = `
       select
         r.id as reservation_id,
@@ -106,8 +104,7 @@ router.get('/:id/participants', requireAuth, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
-        -- and coalesce(r.status,'') not in ('cancelled','canceled')
-        -- and coalesce(r.paid,false) = true
+        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
@@ -120,6 +117,7 @@ router.get('/:id/participants', requireAuth, async (req, res) => {
 
 /**
  * Alias: GET /api/draws/:id/players
+ * Apenas pagos.
  */
 router.get('/:id/players', requireAuth, async (req, res) => {
   try {
@@ -140,6 +138,7 @@ router.get('/:id/players', requireAuth, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
+        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);

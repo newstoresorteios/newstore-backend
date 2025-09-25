@@ -4,7 +4,6 @@ import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
-// Checagem simples de admin — ajuste se seu flag for diferente
 async function requireAdmin(req, res, next) {
   try {
     const userId = req?.user?.id;
@@ -27,27 +26,26 @@ router.get('/history', requireAuth, requireAdmin, async (_req, res) => {
       select
         d.id,
         d.status,
-        coalesce(d.opened_at, d.created_at)           as opened_at,
+        coalesce(d.opened_at, d.created_at) as opened_at,
         d.closed_at,
         d.realized_at,
         round(
           extract(epoch from (coalesce(d.closed_at, now()) - coalesce(d.opened_at, d.created_at)))
           / 86400.0
-        )::int                                        as days_open,
-        coalesce(d.winner_name, '-')                  as winner_name
+        )::int as days_open,
+        coalesce(d.winner_name, '-') as winner_name
       from draws d
       where d.status = 'closed' or d.closed_at is not null
       order by d.id desc
     `);
-
-    return res.json({ history: r.rows || [] });
+    res.json({ history: r.rows || [] });
   } catch (e) {
     console.error('[admin/draws/history] error', e);
-    return res.status(500).json({ error: 'list_failed' });
+    res.status(500).json({ error: 'list_failed' });
   }
 });
 
-/** GET /api/admin/draws/:id/participants */
+/** GET /api/admin/draws/:id/participants — apenas pagos */
 router.get('/:id/participants', requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
@@ -67,17 +65,18 @@ router.get('/:id/participants', requireAuth, requireAdmin, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
+        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
-    return res.json({ draw_id: drawId, participants: r.rows || [] });
+    res.json({ draw_id: drawId, participants: r.rows || [] });
   } catch (e) {
     console.error('[admin/draws/:id/participants] error', e);
-    return res.status(500).json({ error: 'participants_failed' });
+    res.status(500).json({ error: 'participants_failed' });
   }
 });
 
-// Alias opcional /players
+/** Alias /players — apenas pagos */
 router.get('/:id/players', requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
@@ -97,13 +96,14 @@ router.get('/:id/players', requireAuth, requireAdmin, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
+        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
-    return res.json({ draw_id: drawId, participants: r.rows || [] });
+    res.json({ draw_id: drawId, participants: r.rows || [] });
   } catch (e) {
     console.error('[admin/draws/:id/players] error', e);
-    return res.status(500).json({ error: 'participants_failed' });
+    res.status(500).json({ error: 'participants_failed' });
   }
 });
 
