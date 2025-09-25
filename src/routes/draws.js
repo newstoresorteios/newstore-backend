@@ -1,6 +1,7 @@
 // backend/src/routes/draws.js
 import { Router } from 'express';
 import { query } from '../db.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -77,6 +78,73 @@ router.get('/:id/numbers', async (req, res) => {
   } catch (e) {
     console.error('[draws/:id/numbers] error:', e);
     res.status(500).json({ error: 'numbers_failed' });
+  }
+});
+
+/**
+ * GET /api/draws/:id/participants
+ * Lista participantes (nome/email) e seus respectivos números do sorteio.
+ * Requer usuário autenticado. Ajuste os filtros no WHERE se quiser apenas pagos.
+ */
+router.get('/:id/participants', requireAuth, async (req, res) => {
+  try {
+    const drawId = Number(req.params.id);
+    if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+
+    const sql = `
+      select
+        r.id                              as reservation_id,
+        r.draw_id,
+        r.user_id,
+        r.number                          as number,
+        r.status                          as status,
+        r.created_at,
+        coalesce(nullif(u.name,''), u.email, '-'::text) as user_name,
+        u.email                          as user_email
+      from reservations r
+      left join users u on u.id = r.user_id
+      where r.draw_id = $1
+        -- and coalesce(r.status,'') not in ('cancelled','canceled')
+        -- and coalesce(r.paid,false) = true
+      order by user_name asc, number asc
+    `;
+    const r = await query(sql, [drawId]);
+    return res.json({ draw_id: drawId, participants: r.rows || [] });
+  } catch (e) {
+    console.error('[draws/:id/participants] error:', e);
+    return res.status(500).json({ error: 'participants_failed' });
+  }
+});
+
+/**
+ * Alias: GET /api/draws/:id/players
+ * Devolve o mesmo payload de /:id/participants
+ */
+router.get('/:id/players', requireAuth, async (req, res) => {
+  try {
+    const drawId = Number(req.params.id);
+    if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+
+    const sql = `
+      select
+        r.id                              as reservation_id,
+        r.draw_id,
+        r.user_id,
+        r.number                          as number,
+        r.status                          as status,
+        r.created_at,
+        coalesce(nullif(u.name,''), u.email, '-'::text) as user_name,
+        u.email                          as user_email
+      from reservations r
+      left join users u on u.id = r.user_id
+      where r.draw_id = $1
+      order by user_name asc, number asc
+    `;
+    const r = await query(sql, [drawId]);
+    return res.json({ draw_id: drawId, participants: r.rows || [] });
+  } catch (e) {
+    console.error('[draws/:id/players] error:', e);
+    return res.status(500).json({ error: 'participants_failed' });
   }
 });
 
