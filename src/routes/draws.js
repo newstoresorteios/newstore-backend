@@ -83,7 +83,7 @@ router.get('/:id/numbers', async (req, res) => {
 
 /**
  * GET /api/draws/:id/participants
- * Apenas números pagos (status='paid' ou r.paid=true).
+ * Somente pagos: lê da tabela payments (status aprovado/pago) e "explode" o array numbers.
  */
 router.get('/:id/participants', requireAuth, async (req, res) => {
   try {
@@ -92,19 +92,21 @@ router.get('/:id/participants', requireAuth, async (req, res) => {
 
     const sql = `
       select
-        r.id as reservation_id,
-        r.draw_id,
-        r.user_id,
-        num as number,
-        r.status as status,
-        r.created_at,
+        p.id                                    as payment_id,
+        p.draw_id,
+        p.user_id,
+        num                                     as number,
+        case when lower(coalesce(p.status,'')) = 'approved' then 'paid'
+             else lower(coalesce(p.status,'')) end
+                                                 as status,
+        p.created_at,
         coalesce(nullif(u.name,''), u.email, '-') as user_name,
-        u.email as user_email
-      from reservations r
-      left join users u on u.id = r.user_id
-      cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
-      where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        u.email                                  as user_email
+      from payments p
+      left join users u on u.id = p.user_id
+      cross join lateral unnest(coalesce(p.numbers, '{}'::int[])) as num
+      where p.draw_id = $1
+        and lower(coalesce(p.status,'')) in ('approved','paid','confirmed')
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
@@ -117,7 +119,7 @@ router.get('/:id/participants', requireAuth, async (req, res) => {
 
 /**
  * Alias: GET /api/draws/:id/players
- * Apenas pagos.
+ * Mesmo filtro (somente pagos).
  */
 router.get('/:id/players', requireAuth, async (req, res) => {
   try {
@@ -126,19 +128,21 @@ router.get('/:id/players', requireAuth, async (req, res) => {
 
     const sql = `
       select
-        r.id as reservation_id,
-        r.draw_id,
-        r.user_id,
-        num as number,
-        r.status as status,
-        r.created_at,
+        p.id                                    as payment_id,
+        p.draw_id,
+        p.user_id,
+        num                                     as number,
+        case when lower(coalesce(p.status,'')) = 'approved' then 'paid'
+             else lower(coalesce(p.status,'')) end
+                                                 as status,
+        p.created_at,
         coalesce(nullif(u.name,''), u.email, '-') as user_name,
-        u.email as user_email
-      from reservations r
-      left join users u on u.id = r.user_id
-      cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
-      where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        u.email                                  as user_email
+      from payments p
+      left join users u on u.id = p.user_id
+      cross join lateral unnest(coalesce(p.numbers, '{}'::int[])) as num
+      where p.draw_id = $1
+        and lower(coalesce(p.status,'')) in ('approved','paid','confirmed')
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
