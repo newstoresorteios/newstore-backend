@@ -20,9 +20,7 @@ const mapUser = (r) => ({
 });
 
 const toPgIntArrayText = (arr) =>
-  "{" +
-  (Array.isArray(arr) ? arr.map((n) => (Number.isFinite(+n) ? (n | 0) : 0)).join(",") : "") +
-  "}";
+  "{" + (Array.isArray(arr) ? arr.map((n) => (Number.isFinite(+n) ? (n | 0) : 0)).join(",") : "") + "}";
 
 const normStr = (v, max = 255) => String(v ?? "").trim().slice(0, max);
 const toInt = (v, def = 0) => {
@@ -30,7 +28,6 @@ const toInt = (v, def = 0) => {
   return Number.isFinite(n) ? (n | 0) : def;
 };
 
-// Se quiser travar por admin, descomente este middleware e o use abaixo
 // function requireAdmin(req, res, next) {
 //   if (req?.user?.is_admin) return next();
 //   return res.status(403).json({ error: "forbidden" });
@@ -81,9 +78,8 @@ router.get("/", async (req, res, next) => {
 
     const params = hasQ ? [limit, offset, like] : [limit, offset];
 
-    // total para paginação
     const totalSql = `SELECT COUNT(1)::int AS total ${base}${where}`;
-    const listSql = `SELECT ${cols} ${base}${where}${order}${limoff}`;
+    const listSql  = `SELECT ${cols} ${base}${where}${order}${limoff}`;
 
     const [countR, listR] = await Promise.all([
       query(totalSql, hasQ ? [like] : []),
@@ -108,7 +104,6 @@ router.get("/", async (req, res, next) => {
 });
 
 /* =============== OBTER 1 =============== */
-/** GET /api/admin/users/:id */
 router.get("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -127,7 +122,7 @@ router.get("/:id", async (req, res, next) => {
 
 /* =============== CRIAR =============== */
 /** POST /api/admin/users
- * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents? }
+ * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents?, pass_hash?/password? }
  */
 router.post("/", async (req, res, next) => {
   try {
@@ -138,12 +133,18 @@ router.post("/", async (req, res, next) => {
       is_admin = false,
       coupon_code = "",
       coupon_value_cents = 0,
+      pass_hash,   // opcional
+      password,    // opcional (alias)
     } = req.body || {};
+
+    // `users.pass_hash` é NOT NULL — use placeholder se nada for enviado
+    const passHash = normStr(pass_hash ?? password ?? "-", 255) || "-";
 
     const vals = [
       normStr(name, 255),
       normStr(email, 255),
       normStr(phone, 40),
+      passHash,                    // <— agora inserimos pass_hash
       !!is_admin,
       normStr(coupon_code, 64),
       toInt(coupon_value_cents, 0),
@@ -151,8 +152,8 @@ router.post("/", async (req, res, next) => {
 
     const { rows } = await query(
       `INSERT INTO public.users
-         (name, email, phone, is_admin, coupon_code, coupon_value_cents)
-       VALUES ($1,$2,$3,$4,$5,$6)
+         (name, email, phone, pass_hash, is_admin, coupon_code, coupon_value_cents)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       vals
     );
@@ -165,21 +166,28 @@ router.post("/", async (req, res, next) => {
 
 /* =============== ATUALIZAR =============== */
 /** PUT /api/admin/users/:id
- * body: { name?, email?, phone?, is_admin?, coupon_code?, coupon_value_cents? }
+ * body: { name?, email?, phone?, is_admin?, coupon_code?, coupon_value_cents?, pass_hash?/password? }
  */
 router.put("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const { name, email, phone, is_admin, coupon_code, coupon_value_cents } = req.body || {};
+    const { name, email, phone, is_admin, coupon_code, coupon_value_cents, pass_hash, password } = req.body || {};
+
+    // atualização opcional do hash (caso queira)
+    const newPassHash =
+      pass_hash != null ? normStr(pass_hash, 255)
+      : password != null ? normStr(password, 255)
+      : null;
 
     const { rows } = await query(
       `UPDATE public.users
-          SET name                 = COALESCE($2, name),
-              email                = COALESCE($3, email),
-              phone                = COALESCE($4, phone),
-              is_admin             = COALESCE($5, is_admin),
-              coupon_code          = COALESCE($6, coupon_code),
-              coupon_value_cents   = COALESCE($7, coupon_value_cents)
+          SET name               = COALESCE($2, name),
+              email              = COALESCE($3, email),
+              phone              = COALESCE($4, phone),
+              is_admin           = COALESCE($5, is_admin),
+              coupon_code        = COALESCE($6, coupon_code),
+              coupon_value_cents = COALESCE($7, coupon_value_cents),
+              pass_hash          = COALESCE($8, pass_hash)
         WHERE id = $1
         RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       [
@@ -190,6 +198,7 @@ router.put("/:id", async (req, res, next) => {
         typeof is_admin === "boolean" ? !!is_admin : null,
         coupon_code != null ? normStr(coupon_code, 64) : null,
         coupon_value_cents != null ? toInt(coupon_value_cents, 0) : null,
+        newPassHash,
       ]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
@@ -201,7 +210,6 @@ router.put("/:id", async (req, res, next) => {
 });
 
 /* =============== EXCLUIR =============== */
-/** DELETE /api/admin/users/:id */
 router.delete("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -214,12 +222,6 @@ router.delete("/:id", async (req, res, next) => {
 });
 
 /* =============== ATRIBUIR NÚMEROS =============== */
-/**
- * POST /api/admin/users/:id/assign-numbers
- * body: { draw_id: number, numbers: number[], amount_cents?: number }
- * - Checa conflitos em payments aprovados e reservas ativas
- * - Se ok, insere um payment 'approved' para o usuário
- */
 router.post("/:id/assign-numbers", async (req, res, next) => {
   const pool = await getPool();
   const client = await pool.connect();
