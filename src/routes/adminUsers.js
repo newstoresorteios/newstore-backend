@@ -12,15 +12,23 @@ const mapUser = (r) => ({
   id: Number(r.id),
   name: r.name || "",
   email: r.email || "",
-  phone: r.phone || r.celular || "", // fallback se sua base ainda usar "celular"
+  phone: r.phone || r.celular || "",
   is_admin: !!r.is_admin,
   created_at: r.created_at,
+  coupon_code: r.coupon_code || "",
+  coupon_value_cents: Number(r.coupon_value_cents || 0),
 });
 
 const toPgIntArrayText = (arr) =>
   "{" +
   (Array.isArray(arr) ? arr.map((n) => (Number.isFinite(+n) ? (n | 0) : 0)).join(",") : "") +
   "}";
+
+const normStr = (v, max = 255) => String(v ?? "").trim().slice(0, max);
+const toInt = (v, def = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? (n | 0) : def;
+};
 
 // Se quiser travar por admin, descomente este middleware e o use abaixo
 // function requireAdmin(req, res, next) {
@@ -32,28 +40,68 @@ const toPgIntArrayText = (arr) =>
 /* =============== LISTAR (com busca/paginação) =============== */
 /**
  * GET /api/admin/users
- * ?q=texto&page=1&pageSize=50
+ * Suporta AMBOS:
+ *   - ?q=texto&page=1&pageSize=50
+ *   - ?q=texto&limit=50&offset=0
  */
 router.get("/", async (req, res, next) => {
   try {
-    const { q = "", page = "1", pageSize = "50" } = req.query;
-    const p = Math.max(1, parseInt(page, 10) || 1);
-    const ps = Math.min(200, Math.max(1, parseInt(pageSize, 10) || 50));
-    const off = (p - 1) * ps;
+    const { q = "" } = req.query;
+
+    // aceita limit/offset OU page/pageSize
+    let limit = toInt(req.query.limit, 0);
+    let offset = toInt(req.query.offset, 0);
+
+    if (!(limit > 0)) {
+      const page = Math.max(1, toInt(req.query.page, 1));
+      const pageSize = Math.min(500, Math.max(1, toInt(req.query.pageSize, 50)));
+      limit = pageSize;
+      offset = (page - 1) * pageSize;
+    } else {
+      limit = Math.min(500, Math.max(1, limit));
+      offset = Math.max(0, offset);
+    }
 
     const like = `%${String(q).trim()}%`;
     const hasQ = String(q).trim().length > 0;
 
-    const base = "SELECT id, name, email, phone, is_admin, created_at FROM public.users";
+    const cols = `
+      id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents
+    `;
+    const base = `FROM public.users`;
     const where = hasQ
-      ? " WHERE (name ILIKE $3 OR email ILIKE $3 OR phone ILIKE $3 OR CAST(id AS text) ILIKE $3)"
-      : "";
-    const order = " ORDER BY id DESC";
-    const limit = " LIMIT $1 OFFSET $2";
-    const params = hasQ ? [ps, off, like] : [ps, off];
+      ? ` WHERE (name ILIKE $3
+                OR email ILIKE $3
+                OR phone ILIKE $3
+                OR coupon_code ILIKE $3
+                OR CAST(id AS text) ILIKE $3)`
+      : ``;
+    const order = ` ORDER BY id DESC`;
+    const limoff = ` LIMIT $1 OFFSET $2`;
 
-    const { rows } = await query(base + where + order + limit, params);
-    res.json({ users: rows.map(mapUser), page: p, pageSize: ps });
+    const params = hasQ ? [limit, offset, like] : [limit, offset];
+
+    // total para paginação
+    const totalSql = `SELECT COUNT(1)::int AS total ${base}${where}`;
+    const listSql = `SELECT ${cols} ${base}${where}${order}${limoff}`;
+
+    const [countR, listR] = await Promise.all([
+      query(totalSql, hasQ ? [like] : []),
+      query(listSql, params),
+    ]);
+
+    const total = Number(countR.rows?.[0]?.total || 0);
+    const items = (listR.rows || []).map(mapUser);
+
+    res.json({
+      users: items,
+      total,
+      limit,
+      offset,
+      page: Math.floor(offset / limit) + 1,
+      pageSize: limit,
+      hasMore: offset + items.length < total,
+    });
   } catch (e) {
     next(e);
   }
@@ -65,7 +113,9 @@ router.get("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const { rows } = await query(
-      "SELECT id, name, email, phone, is_admin, created_at FROM public.users WHERE id = $1",
+      `SELECT id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents
+         FROM public.users
+        WHERE id = $1`,
       [id]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
@@ -76,15 +126,35 @@ router.get("/:id", async (req, res, next) => {
 });
 
 /* =============== CRIAR =============== */
-/** POST /api/admin/users  { name, email, phone, is_admin } */
+/** POST /api/admin/users
+ * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents? }
+ */
 router.post("/", async (req, res, next) => {
   try {
-    const { name = "", email = "", phone = "", is_admin = false } = req.body || {};
+    const {
+      name = "",
+      email = "",
+      phone = "",
+      is_admin = false,
+      coupon_code = "",
+      coupon_value_cents = 0,
+    } = req.body || {};
+
+    const vals = [
+      normStr(name, 255),
+      normStr(email, 255),
+      normStr(phone, 40),
+      !!is_admin,
+      normStr(coupon_code, 64),
+      toInt(coupon_value_cents, 0),
+    ];
+
     const { rows } = await query(
-      `INSERT INTO public.users (name, email, phone, is_admin)
-       VALUES ($1,$2,$3,$4)
-       RETURNING id, name, email, phone, is_admin, created_at`,
-      [String(name).trim(), String(email).trim(), String(phone).trim(), !!is_admin]
+      `INSERT INTO public.users
+         (name, email, phone, is_admin, coupon_code, coupon_value_cents)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
+      vals
     );
     res.status(201).json(mapUser(rows[0]));
   } catch (e) {
@@ -94,25 +164,32 @@ router.post("/", async (req, res, next) => {
 });
 
 /* =============== ATUALIZAR =============== */
-/** PUT /api/admin/users/:id  { name?, email?, phone?, is_admin? } */
+/** PUT /api/admin/users/:id
+ * body: { name?, email?, phone?, is_admin?, coupon_code?, coupon_value_cents? }
+ */
 router.put("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const { name, email, phone, is_admin } = req.body || {};
+    const { name, email, phone, is_admin, coupon_code, coupon_value_cents } = req.body || {};
+
     const { rows } = await query(
       `UPDATE public.users
-         SET name     = COALESCE($2, name),
-             email    = COALESCE($3, email),
-             phone    = COALESCE($4, phone),
-             is_admin = COALESCE($5, is_admin)
-       WHERE id = $1
-       RETURNING id, name, email, phone, is_admin, created_at`,
+          SET name                 = COALESCE($2, name),
+              email                = COALESCE($3, email),
+              phone                = COALESCE($4, phone),
+              is_admin             = COALESCE($5, is_admin),
+              coupon_code          = COALESCE($6, coupon_code),
+              coupon_value_cents   = COALESCE($7, coupon_value_cents)
+        WHERE id = $1
+        RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       [
         id,
-        name != null ? String(name).trim() : null,
-        email != null ? String(email).trim() : null,
-        phone != null ? String(phone).trim() : null,
-        typeof is_admin === "boolean" ? is_admin : null,
+        name != null ? normStr(name, 255) : null,
+        email != null ? normStr(email, 255) : null,
+        phone != null ? normStr(phone, 40) : null,
+        typeof is_admin === "boolean" ? !!is_admin : null,
+        coupon_code != null ? normStr(coupon_code, 64) : null,
+        coupon_value_cents != null ? toInt(coupon_value_cents, 0) : null,
       ]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
