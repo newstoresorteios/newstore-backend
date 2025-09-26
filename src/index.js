@@ -32,7 +32,7 @@ import adminRoutes from "./routes/admin.js";
 import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
 
-import adminUsersRouter from "./routes/admin_users.js";
+import adminUsersRouter from "./routes/adminUsers.js";
 
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
