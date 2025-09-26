@@ -19,20 +19,28 @@ const mapUser = (r) => ({
   coupon_value_cents: Number(r.coupon_value_cents || 0),
 });
 
-const toPgIntArrayText = (arr) =>
-  "{" + (Array.isArray(arr) ? arr.map((n) => (Number.isFinite(+n) ? (n | 0) : 0)).join(",") : "") + "}";
-
 const normStr = (v, max = 255) => String(v ?? "").trim().slice(0, max);
 const toInt = (v, def = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? (n | 0) : def;
 };
 
-// function requireAdmin(req, res, next) {
-//   if (req?.user?.is_admin) return next();
-//   return res.status(403).json({ error: "forbidden" });
-// }
-// router.use(requireAdmin);
+// Normaliza "numbers": aceita array ou CSV e retorna int[] 0..99 (mantém 00 como 0)
+function parseNumbers(input) {
+  if (Array.isArray(input)) {
+    return input
+      .map((n) => Number(n))
+      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
+  }
+  const s = String(input || "");
+  if (!s) return [];
+  return s
+    .split(/[,\s;]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => Number(t))
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
+}
 
 /* =============== LISTAR (com busca/paginação) =============== */
 /**
@@ -78,8 +86,9 @@ router.get("/", async (req, res, next) => {
 
     const params = hasQ ? [limit, offset, like] : [limit, offset];
 
+    // total para paginação
     const totalSql = `SELECT COUNT(1)::int AS total ${base}${where}`;
-    const listSql  = `SELECT ${cols} ${base}${where}${order}${limoff}`;
+    const listSql = `SELECT ${cols} ${base}${where}${order}${limoff}`;
 
     const [countR, listR] = await Promise.all([
       query(totalSql, hasQ ? [like] : []),
@@ -104,6 +113,7 @@ router.get("/", async (req, res, next) => {
 });
 
 /* =============== OBTER 1 =============== */
+/** GET /api/admin/users/:id */
 router.get("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -122,7 +132,7 @@ router.get("/:id", async (req, res, next) => {
 
 /* =============== CRIAR =============== */
 /** POST /api/admin/users
- * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents?, pass_hash?/password? }
+ * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents? }
  */
 router.post("/", async (req, res, next) => {
   try {
@@ -133,18 +143,12 @@ router.post("/", async (req, res, next) => {
       is_admin = false,
       coupon_code = "",
       coupon_value_cents = 0,
-      pass_hash,   // opcional
-      password,    // opcional (alias)
     } = req.body || {};
-
-    // `users.pass_hash` é NOT NULL — use placeholder se nada for enviado
-    const passHash = normStr(pass_hash ?? password ?? "-", 255) || "-";
 
     const vals = [
       normStr(name, 255),
       normStr(email, 255),
       normStr(phone, 40),
-      passHash,                    // <— agora inserimos pass_hash
       !!is_admin,
       normStr(coupon_code, 64),
       toInt(coupon_value_cents, 0),
@@ -152,8 +156,8 @@ router.post("/", async (req, res, next) => {
 
     const { rows } = await query(
       `INSERT INTO public.users
-         (name, email, phone, pass_hash, is_admin, coupon_code, coupon_value_cents)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+         (name, email, phone, is_admin, coupon_code, coupon_value_cents)
+       VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       vals
     );
@@ -166,28 +170,21 @@ router.post("/", async (req, res, next) => {
 
 /* =============== ATUALIZAR =============== */
 /** PUT /api/admin/users/:id
- * body: { name?, email?, phone?, is_admin?, coupon_code?, coupon_value_cents?, pass_hash?/password? }
+ * body: { name?, email?, phone?, is_admin?, coupon_code?, coupon_value_cents? }
  */
 router.put("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const { name, email, phone, is_admin, coupon_code, coupon_value_cents, pass_hash, password } = req.body || {};
-
-    // atualização opcional do hash (caso queira)
-    const newPassHash =
-      pass_hash != null ? normStr(pass_hash, 255)
-      : password != null ? normStr(password, 255)
-      : null;
+    const { name, email, phone, is_admin, coupon_code, coupon_value_cents } = req.body || {};
 
     const { rows } = await query(
       `UPDATE public.users
-          SET name               = COALESCE($2, name),
-              email              = COALESCE($3, email),
-              phone              = COALESCE($4, phone),
-              is_admin           = COALESCE($5, is_admin),
-              coupon_code        = COALESCE($6, coupon_code),
-              coupon_value_cents = COALESCE($7, coupon_value_cents),
-              pass_hash          = COALESCE($8, pass_hash)
+          SET name                 = COALESCE($2, name),
+              email                = COALESCE($3, email),
+              phone                = COALESCE($4, phone),
+              is_admin             = COALESCE($5, is_admin),
+              coupon_code          = COALESCE($6, coupon_code),
+              coupon_value_cents   = COALESCE($7, coupon_value_cents)
         WHERE id = $1
         RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       [
@@ -198,7 +195,6 @@ router.put("/:id", async (req, res, next) => {
         typeof is_admin === "boolean" ? !!is_admin : null,
         coupon_code != null ? normStr(coupon_code, 64) : null,
         coupon_value_cents != null ? toInt(coupon_value_cents, 0) : null,
-        newPassHash,
       ]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
@@ -210,6 +206,7 @@ router.put("/:id", async (req, res, next) => {
 });
 
 /* =============== EXCLUIR =============== */
+/** DELETE /api/admin/users/:id */
 router.delete("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -222,34 +219,41 @@ router.delete("/:id", async (req, res, next) => {
 });
 
 /* =============== ATRIBUIR NÚMEROS =============== */
+/**
+ * POST /api/admin/users/:id/assign-numbers
+ * body: { draw_id: number, numbers: number[] | "csv", amount_cents?: number }
+ * - Checa conflitos em payments aprovados e reservas ativas
+ * - Se ok, insere um payment 'approved' para o usuário
+ */
 router.post("/:id/assign-numbers", async (req, res, next) => {
   const pool = await getPool();
   const client = await pool.connect();
   try {
     const user_id = Number(req.params.id);
     const draw_id = Number(req.body?.draw_id);
-    const rawNumbers = Array.isArray(req.body?.numbers) ? req.body.numbers : [];
+    const numbers = parseNumbers(req.body?.numbers);
     const amount_cents = Number.isFinite(+req.body?.amount_cents)
       ? Math.max(0, +req.body.amount_cents)
       : 0;
 
-    if (!Number.isInteger(user_id) || !Number.isInteger(draw_id) || rawNumbers.length === 0) {
+    if (!Number.isInteger(user_id) || !Number.isInteger(draw_id) || numbers.length === 0) {
       return res.status(400).json({ error: "bad_request" });
     }
 
-    const numbers = rawNumbers
-      .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
-    if (!numbers.length) return res.status(400).json({ error: "no_numbers" });
-
-    const pgArrayText = toPgIntArrayText(numbers);
-
     await client.query("BEGIN");
 
+    // garante que o usuário existe
     const u = await client.query("SELECT id FROM public.users WHERE id = $1", [user_id]);
     if (!u.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "user_not_found" });
+    }
+
+    // (opcional) garante sorteio existente
+    const d = await client.query("SELECT id FROM public.draws WHERE id = $1", [draw_id]);
+    if (!d.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "draw_not_found" });
     }
 
     // conflitos em payments aprovados
@@ -263,7 +267,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
              AND p.numbers && $2::int4[]
          ) s
          WHERE n = ANY ($2::int4[])`,
-      [draw_id, pgArrayText]
+      [draw_id, numbers]
     );
     if (payConf.rowCount) {
       await client.query("ROLLBACK");
@@ -290,7 +294,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
            AND r.n = ANY($2::int4[])
        ) x
        WHERE n IS NOT NULL`,
-      [draw_id, pgArrayText]
+      [draw_id, numbers]
     );
     if (resvConf.rowCount) {
       await client.query("ROLLBACK");
@@ -306,7 +310,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
       `INSERT INTO public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
        VALUES ($1, $2, $3::int4[], $4, 'approved', NOW())
        RETURNING id, user_id, draw_id, numbers, amount_cents, status, created_at`,
-      [user_id, draw_id, pgArrayText, amount_cents]
+      [user_id, draw_id, numbers, amount_cents]
     );
 
     await client.query("COMMIT");
