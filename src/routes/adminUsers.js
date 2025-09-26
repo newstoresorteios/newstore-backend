@@ -179,12 +179,12 @@ router.put("/:id", async (req, res, next) => {
 
     const { rows } = await query(
       `UPDATE public.users
-          SET name               = COALESCE($2, name),
-              email              = COALESCE($3, email),
-              phone              = COALESCE($4, phone),
-              is_admin           = COALESCE($5, is_admin),
-              coupon_code        = COALESCE($6, coupon_code),
-              coupon_value_cents = COALESCE($7, coupon_value_cents)
+          SET name                 = COALESCE($2, name),
+              email                = COALESCE($3, email),
+              phone                = COALESCE($4, phone),
+              is_admin             = COALESCE($5, is_admin),
+              coupon_code          = COALESCE($6, coupon_code),
+              coupon_value_cents   = COALESCE($7, coupon_value_cents)
         WHERE id = $1
         RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       [
@@ -222,8 +222,10 @@ router.delete("/:id", async (req, res, next) => {
 /**
  * POST /api/admin/users/:id/assign-numbers
  * body: { draw_id: number, numbers: number[] | "csv", amount_cents?: number }
- * - Checa conflitos em payments aprovados e reservas ativas/pending/paid
- * - Se ok, cria reservation('paid') e payment('approved') na mesma transação
+ * - Checa conflitos em payments aprovados e reservas ativas
+ * - Se ok, insere:
+ *    > reservations.status = 'paid'
+ *    > payments.status     = 'approved'
  */
 router.post("/:id/assign-numbers", async (req, res, next) => {
   const pool = await getPool();
@@ -242,15 +244,15 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
 
     await client.query("BEGIN");
 
-    // garante que o usuário existe
-    const u = await client.query("SELECT id FROM public.users WHERE id = $1", [user_id]);
+    // garante que o usuário e o sorteio existem
+    const [u, d] = await Promise.all([
+      client.query("SELECT id FROM public.users WHERE id = $1", [user_id]),
+      client.query("SELECT id FROM public.draws WHERE id = $1", [draw_id]),
+    ]);
     if (!u.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "user_not_found" });
     }
-
-    // garante que o sorteio existe
-    const d = await client.query("SELECT id FROM public.draws WHERE id = $1", [draw_id]);
     if (!d.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "draw_not_found" });
@@ -258,54 +260,86 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
 
     // conflitos em payments aprovados
     const payConf = await client.query(
-      `SELECT 1
-         FROM public.payments p
-        WHERE p.draw_id = $1
-          AND LOWER(p.status) IN ('approved','paid','pago')
-          AND p.numbers && $2::int4[]
-        LIMIT 1`,
+      `SELECT DISTINCT n
+         FROM (
+           SELECT unnest(p.numbers) AS n
+           FROM public.payments p
+           WHERE p.draw_id = $1
+             AND LOWER(p.status) IN ('approved','paid','pago')
+             AND p.numbers && $2::int4[]
+         ) s
+         WHERE n = ANY ($2::int4[])`,
       [draw_id, numbers]
     );
     if (payConf.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ error: "numbers_taken", where: "payments" });
+      return res.status(409).json({
+        error: "numbers_taken",
+        where: "payments",
+        conflicts: payConf.rows.map((r) => Number(r.n)).sort((a, b) => a - b),
+      });
     }
 
-    // conflitos em reservas ativas/pending/paid (apenas pelo array numbers; sem "r.n")
+    // conflitos em reservas ativas
     const resvConf = await client.query(
-      `SELECT 1
+      `SELECT DISTINCT n FROM (
+         SELECT unnest(r.numbers) AS n
          FROM public.reservations r
-        WHERE r.draw_id = $1
-          AND LOWER(r.status) IN ('active','pending','paid')
-          AND r.numbers && $2::int4[]
-        LIMIT 1`,
+         WHERE r.draw_id = $1
+           AND LOWER(r.status) IN ('active','pending')
+           AND r.numbers && $2::int4[]
+       ) x
+       WHERE n IS NOT NULL`,
       [draw_id, numbers]
     );
     if (resvConf.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ error: "numbers_reserved", where: "reservations" });
+      return res.status(409).json({
+        error: "numbers_reserved",
+        where: "reservations",
+        conflicts: resvConf.rows.map((r) => Number(r.n)).sort((a, b) => a - b),
+      });
     }
 
-    // cria RESERVATION 'paid'
-    const insertedResv = await client.query(
-      `INSERT INTO public.reservations (user_id, draw_id, numbers, status, created_at, expires_at)
-       VALUES ($1, $2, $3::int4[], 'paid', NOW(), NOW())
-       RETURNING id`,
-      [user_id, draw_id, numbers]
+    // ===== gera ID seguro para reservations (se a coluna não tiver DEFAULT) =====
+    let resvId;
+    const seqRow = await client.query(
+      `SELECT pg_get_serial_sequence('public.reservations','id') AS seq`
+    );
+    const seq = seqRow.rows?.[0]?.seq || null;
+    if (seq) {
+      const nv = await client.query(`SELECT nextval($1) AS id`, [seq]);
+      resvId = Number(nv.rows[0].id);
+    } else {
+      const mx = await client.query(
+        `SELECT COALESCE(MAX(id),0)+1 AS id FROM public.reservations`
+      );
+      resvId = Number(mx.rows[0].id);
+    }
+
+    // cria RESERVATION como 'paid'
+    await client.query(
+      `INSERT INTO public.reservations
+         (id, user_id, draw_id, numbers, status, expires_at, created_at)
+       VALUES
+         ($1, $2, $3, $4::int4[], 'paid', NOW() + interval '1 day', NOW())`,
+      [resvId, user_id, draw_id, numbers]
     );
 
-    // cria PAYMENT 'approved'
+    // cria PAYMENT como 'approved'
     const insertedPay = await client.query(
-      `INSERT INTO public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
-       VALUES ($1, $2, $3::int4[], $4, 'approved', NOW())
+      `INSERT INTO public.payments
+         (user_id, draw_id, numbers, amount_cents, status, created_at)
+       VALUES
+         ($1, $2, $3::int4[], $4, 'approved', NOW())
        RETURNING id, user_id, draw_id, numbers, amount_cents, status, created_at`,
       [user_id, draw_id, numbers, amount_cents]
     );
 
     await client.query("COMMIT");
     res.status(201).json({
-      reservation_id: insertedResv.rows[0].id,
       payment: insertedPay.rows[0],
+      reservation_id: resvId,
     });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
