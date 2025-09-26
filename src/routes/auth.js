@@ -1,4 +1,3 @@
-// backend/src/routes/auth.js
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -43,7 +42,8 @@ async function ensureUserColumns() {
         ADD COLUMN IF NOT EXISTS coupon_code text,
         ADD COLUMN IF NOT EXISTS coupon_updated_at timestamptz,
         ADD COLUMN IF NOT EXISTS tray_coupon_id text,
-        ADD COLUMN IF NOT EXISTS coupon_value_cents int4 DEFAULT 0
+        ADD COLUMN IF NOT EXISTS coupon_value_cents int4 DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS phone text
     `);
   } catch (e) {
     // ok ignorar; se não conseguir, o fallback do hydrate cobre
@@ -159,7 +159,7 @@ async function findUserByEmail(emailRaw) {
 
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password } = req.body || {};
+    const { name, email, password, phone } = req.body || {};
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'invalid_payload' });
     }
@@ -170,10 +170,11 @@ router.post('/register', async (req, res) => {
 
     const hash = await bcrypt.hash(String(password), 10);
     const ins = await query(
-      `INSERT INTO users (name, email, pass_hash)
-       VALUES ($1,$2,$3)
-       RETURNING id, name, email, CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role`,
-      [name, emailNorm, hash]
+      `INSERT INTO users (name, email, pass_hash, phone)
+       VALUES ($1,$2,$3,$4)
+       RETURNING id, name, email, phone,
+                 CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role`,
+      [name, emailNorm, hash, String(phone || '').trim() || null]
     );
 
     const u = ins.rows[0];
