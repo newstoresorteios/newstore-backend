@@ -59,8 +59,8 @@ export async function ensureSchema() {
   if (open.rows.length) {
     drawId = open.rows[0].id;
   } else {
-    const ins = await query(`insert into draws(status) values('open') returning id`);
-    drawId = ins.rows[0].id;
+    //const ins = await query(`insert into draws(status) values('open') returning id`);
+    //drawId = ins.rows[0].id;
   }
 
   // Garante 100 números (00-99)

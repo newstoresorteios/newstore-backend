@@ -29,6 +29,8 @@ import adminConfigRouter from "./routes/admin_config.js";
 // Router admin genérico (DEIXAR POR ÚLTIMO entre /api/admin/*)
 import adminRoutes from "./routes/admin.js";
 
+import adminUsersRouter from "./routes/admin_users.js";
+
 import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
 
@@ -106,6 +108,8 @@ app.use("/api/purchase-limit", purchaseLimitRouter);
 
 // Cupons
 app.use("/api/coupons", couponsRouter);
+
+app.use("/api/admin/users", adminUsersRouter);
 
 // 404 padrão
 app.use((req, res) => {
