@@ -29,10 +29,10 @@ import adminConfigRouter from "./routes/admin_config.js";
 // Router admin genérico (DEIXAR POR ÚLTIMO entre /api/admin/*)
 import adminRoutes from "./routes/admin.js";
 
-import adminUsersRouter from "./routes/admin_users.js";
-
 import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
+
+import adminUsersRouter from "./routes/admin_users.js";
 
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
