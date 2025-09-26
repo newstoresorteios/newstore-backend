@@ -1,4 +1,6 @@
 // backend/src/routes/admin_users.js
+// ESM | CRUD de usuários + atribuição de números (isolado deste router)
+
 import express from "express";
 import { query, getPool } from "../db.js";
 
@@ -23,13 +25,7 @@ const toInt = (v, def = 0) => {
   return Number.isFinite(n) ? (n | 0) : def;
 };
 
-// Postgres espera {1,2,3} para int[]; garantimos isso:
-const toPgIntArrayText = (arr) =>
-  "{" +
-  (Array.isArray(arr) ? arr.map((n) => (Number.isFinite(+n) ? (n | 0) : 0)).join(",") : "") +
-  "}";
-
-// Normaliza "numbers": aceita array ou CSV e retorna int[] 0..99
+// Normaliza "numbers": aceita array ou CSV e retorna int[] 0..99 (mantém 00 como 0)
 function parseNumbers(input) {
   if (Array.isArray(input)) {
     return input
@@ -39,18 +35,23 @@ function parseNumbers(input) {
   const s = String(input || "");
   if (!s) return [];
   return s
-    .split(/[,\s;]+/)
-    .map((t) => t.trim())
-    .filter(Boolean)
+    .split(/[,\s;]+/).map((t) => t.trim()).filter(Boolean)
     .map((t) => Number(t))
     .filter((n) => Number.isInteger(n) && n >= 0 && n <= 99);
 }
 
 /* =============== LISTAR (com busca/paginação) =============== */
+/**
+ * GET /api/admin/users
+ * Suporta AMBOS:
+ *   - ?q=texto&page=1&pageSize=50
+ *   - ?q=texto&limit=50&offset=0
+ */
 router.get("/", async (req, res, next) => {
   try {
     const { q = "" } = req.query;
 
+    // aceita limit/offset OU page/pageSize
     let limit = toInt(req.query.limit, 0);
     let offset = toInt(req.query.offset, 0);
 
@@ -83,6 +84,7 @@ router.get("/", async (req, res, next) => {
 
     const params = hasQ ? [limit, offset, like] : [limit, offset];
 
+    // total para paginação
     const totalSql = `SELECT COUNT(1)::int AS total ${base}${where}`;
     const listSql  = `SELECT ${cols} ${base}${where}${order}${limoff}`;
 
@@ -103,10 +105,13 @@ router.get("/", async (req, res, next) => {
       pageSize: limit,
       hasMore: offset + items.length < total,
     });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 /* =============== OBTER 1 =============== */
+/** GET /api/admin/users/:id */
 router.get("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -118,10 +123,15 @@ router.get("/:id", async (req, res, next) => {
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
     res.json(mapUser(rows[0]));
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 /* =============== CRIAR =============== */
+/** POST /api/admin/users
+ * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents? }
+ */
 router.post("/", async (req, res, next) => {
   try {
     const {
@@ -157,6 +167,9 @@ router.post("/", async (req, res, next) => {
 });
 
 /* =============== ATUALIZAR =============== */
+/** PUT /api/admin/users/:id
+ * body: { name?, email?, phone?, is_admin?, coupon_code?, coupon_value_cents? }
+ */
 router.put("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -164,12 +177,12 @@ router.put("/:id", async (req, res, next) => {
 
     const { rows } = await query(
       `UPDATE public.users
-          SET name               = COALESCE($2, name),
-              email              = COALESCE($3, email),
-              phone              = COALESCE($4, phone),
-              is_admin           = COALESCE($5, is_admin),
-              coupon_code        = COALESCE($6, coupon_code),
-              coupon_value_cents = COALESCE($7, coupon_value_cents)
+          SET name                 = COALESCE($2, name),
+              email                = COALESCE($3, email),
+              phone                = COALESCE($4, phone),
+              is_admin             = COALESCE($5, is_admin),
+              coupon_code          = COALESCE($6, coupon_code),
+              coupon_value_cents   = COALESCE($7, coupon_value_cents)
         WHERE id = $1
         RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       [
@@ -178,8 +191,8 @@ router.put("/:id", async (req, res, next) => {
         email != null ? normStr(email, 255) : null,
         phone != null ? normStr(phone, 40)  : null,
         typeof is_admin === "boolean" ? !!is_admin : null,
-        coupon_code        != null ? normStr(coupon_code, 64) : null,
-        coupon_value_cents != null ? toInt(coupon_value_cents, 0) : null,
+        coupon_code         != null ? normStr(coupon_code, 64) : null,
+        coupon_value_cents  != null ? toInt(coupon_value_cents, 0) : null,
       ]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
@@ -191,20 +204,26 @@ router.put("/:id", async (req, res, next) => {
 });
 
 /* =============== EXCLUIR =============== */
+/** DELETE /api/admin/users/:id */
 router.delete("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const r = await query("DELETE FROM public.users WHERE id = $1", [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: "not_found" });
     res.status(204).end();
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 /* =============== ATRIBUIR NÚMEROS =============== */
 /**
  * POST /api/admin/users/:id/assign-numbers
  * body: { draw_id: number, numbers: number[] | "csv", amount_cents?: number }
- * - Cria payments(status='approved') e reservations(status='paid')
+ * - Checa conflitos em payments aprovados e reservas ativas
+ * - Se ok, cria:
+ *    - payments(status='approved')
+ *    - reservations(status='paid')
  */
 router.post("/:id/assign-numbers", async (req, res, next) => {
   const pool = await getPool();
@@ -212,8 +231,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
   try {
     const user_id = Number(req.params.id);
     const draw_id = Number(req.body?.draw_id);
-    const numbers  = parseNumbers(req.body?.numbers);
-    const arrText  = toPgIntArrayText(numbers); // <-- garante int4[]
+    const numbers = parseNumbers(req.body?.numbers);
     const amount_cents = Number.isFinite(+req.body?.amount_cents)
       ? Math.max(0, +req.body.amount_cents)
       : 0;
@@ -224,12 +242,19 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
 
     await client.query("BEGIN");
 
-    // usuário e sorteio existem?
+    // garante que o usuário existe
     const u = await client.query("SELECT id FROM public.users WHERE id = $1", [user_id]);
-    if (!u.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "user_not_found" }); }
+    if (!u.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "user_not_found" });
+    }
 
+    // garante sorteio existente
     const d = await client.query("SELECT id FROM public.draws WHERE id = $1", [draw_id]);
-    if (!d.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "draw_not_found" }); }
+    if (!d.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "draw_not_found" });
+    }
 
     // conflitos em payments aprovados
     const payConf = await client.query(
@@ -242,7 +267,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
              AND p.numbers && $2::int4[]
          ) s
          WHERE n = ANY ($2::int4[])`,
-      [draw_id, arrText]
+      [draw_id, numbers]
     );
     if (payConf.rowCount) {
       await client.query("ROLLBACK");
@@ -253,7 +278,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
       });
     }
 
-    // conflitos em reservas (ativas/pending/paid)
+    // conflitos em reservas ativas (somente pelo array)
     const resvConf = await client.query(
       `SELECT DISTINCT n
          FROM (
@@ -264,7 +289,7 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
              AND r.numbers && $2::int4[]
          ) x
          WHERE n = ANY ($2::int4[])`,
-      [draw_id, arrText]
+      [draw_id, numbers]
     );
     if (resvConf.rowCount) {
       await client.query("ROLLBACK");
@@ -275,20 +300,25 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
       });
     }
 
-    // grava payment approved
+    // --------- INSERTS ---------
+    // payments.id é NOT NULL (tipo text); usamos epoch ms (13 dígitos) como nos seus dados atuais
+    const payId = Date.now().toString();
+
     const pay = await client.query(
-      `INSERT INTO public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
-       VALUES ($1, $2, $3::int4[], $4, 'approved', NOW())
+      `INSERT INTO public.payments
+         (id, user_id, draw_id, numbers, amount_cents, status, created_at)
+       VALUES ($1, $2, $3, $4::int4[], $5, 'approved', NOW())
        RETURNING id, user_id, draw_id, numbers, amount_cents, status, created_at`,
-      [user_id, draw_id, arrText, amount_cents]
+      [payId, user_id, draw_id, numbers, amount_cents]
     );
 
-    // grava reserva paid (gera UUID explicitamente)
+    // reserva paga; PK uuid gerada pelo banco
     const resv = await client.query(
-      `INSERT INTO public.reservations (id, user_id, draw_id, numbers, status, created_at, expires_at)
+      `INSERT INTO public.reservations
+         (id, user_id, draw_id, numbers, status, created_at, expires_at)
        VALUES (gen_random_uuid(), $1, $2, $3::int4[], 'paid', NOW(), NOW() + INTERVAL '30 minutes')
        RETURNING id`,
-      [user_id, draw_id, arrText]
+      [user_id, draw_id, numbers]
     );
 
     await client.query("COMMIT");
