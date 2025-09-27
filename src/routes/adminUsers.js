@@ -130,7 +130,7 @@ router.get("/:id", async (req, res, next) => {
 
 /* =============== CRIAR =============== */
 /** POST /api/admin/users
- * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents?, password? }
+ * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents? }
  */
 router.post("/", async (req, res, next) => {
   try {
@@ -152,57 +152,17 @@ router.post("/", async (req, res, next) => {
       toInt(coupon_value_cents, 0),
     ];
 
-    const ins = await query(
+    // Senha padrão "newstore" (hash em bcrypt via pgcrypto)
+    const DEFAULT_PASSWORD = "newstore";
+
+    const { rows } = await query(
       `INSERT INTO public.users
-         (name, email, phone, is_admin, coupon_code, coupon_value_cents)
-       VALUES ($1,$2,$3,$4,$5,$6)
+         (name, email, phone, is_admin, coupon_code, coupon_value_cents, pass_hash)
+       VALUES ($1,$2,$3,$4,$5,$6, crypt($7, gen_salt('bf')))
        RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
-      vals
+      [...vals, DEFAULT_PASSWORD]
     );
-
-    const created = ins.rows[0];
-    const newId = created.id;
-
-    // >>> AJUSTE: definir senha padrão "newstore" na criação
-    try {
-      // tenta habilitar pgcrypto (se permitido) para usar bcrypt/crypt
-      try { await query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); } catch {}
-      const cols = await query(
-        `SELECT column_name
-           FROM information_schema.columns
-          WHERE table_schema='public'
-            AND table_name='users'
-            AND column_name IN ('password_hash','password')`
-      );
-      const hasHash = cols.rows.some(r => r.column_name === "password_hash");
-      const hasPlain = cols.rows.some(r => r.column_name === "password");
-      const rawPwd = normStr(req.body?.password ?? "newstore", 255);
-
-      if (rawPwd) {
-        if (hasHash) {
-          await query(
-            `UPDATE public.users
-                SET password_hash = crypt($2, gen_salt('bf'))
-              WHERE id = $1
-                AND (password_hash IS NULL OR password_hash = '')`,
-            [newId, rawPwd]
-          );
-        } else if (hasPlain) {
-          await query(
-            `UPDATE public.users
-                SET password = $2
-              WHERE id = $1
-                AND (password IS NULL OR password = '')`,
-            [newId, rawPwd]
-          );
-        }
-      }
-    } catch {
-      // silencioso: se não conseguir setar a senha, seguimos sem quebrar o fluxo
-    }
-    // <<< AJUSTE
-
-    res.status(201).json(mapUser(created));
+    res.status(201).json(mapUser(rows[0]));
   } catch (e) {
     if (e.code === "23505") return res.status(409).json({ error: "duplicated" });
     next(e);
