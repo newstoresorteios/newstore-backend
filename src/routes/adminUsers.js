@@ -130,7 +130,7 @@ router.get("/:id", async (req, res, next) => {
 
 /* =============== CRIAR =============== */
 /** POST /api/admin/users
- * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents? }
+ * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents?, password? }
  */
 router.post("/", async (req, res, next) => {
   try {
@@ -152,14 +152,57 @@ router.post("/", async (req, res, next) => {
       toInt(coupon_value_cents, 0),
     ];
 
-    const { rows } = await query(
+    const ins = await query(
       `INSERT INTO public.users
          (name, email, phone, is_admin, coupon_code, coupon_value_cents)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       vals
     );
-    res.status(201).json(mapUser(rows[0]));
+
+    const created = ins.rows[0];
+    const newId = created.id;
+
+    // >>> AJUSTE: definir senha padrão "newstore" na criação
+    try {
+      // tenta habilitar pgcrypto (se permitido) para usar bcrypt/crypt
+      try { await query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); } catch {}
+      const cols = await query(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema='public'
+            AND table_name='users'
+            AND column_name IN ('password_hash','password')`
+      );
+      const hasHash = cols.rows.some(r => r.column_name === "password_hash");
+      const hasPlain = cols.rows.some(r => r.column_name === "password");
+      const rawPwd = normStr(req.body?.password ?? "newstore", 255);
+
+      if (rawPwd) {
+        if (hasHash) {
+          await query(
+            `UPDATE public.users
+                SET password_hash = crypt($2, gen_salt('bf'))
+              WHERE id = $1
+                AND (password_hash IS NULL OR password_hash = '')`,
+            [newId, rawPwd]
+          );
+        } else if (hasPlain) {
+          await query(
+            `UPDATE public.users
+                SET password = $2
+              WHERE id = $1
+                AND (password IS NULL OR password = '')`,
+            [newId, rawPwd]
+          );
+        }
+      }
+    } catch {
+      // silencioso: se não conseguir setar a senha, seguimos sem quebrar o fluxo
+    }
+    // <<< AJUSTE
+
+    res.status(201).json(mapUser(created));
   } catch (e) {
     if (e.code === "23505") return res.status(409).json({ error: "duplicated" });
     next(e);
