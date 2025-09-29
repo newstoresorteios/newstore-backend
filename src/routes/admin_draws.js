@@ -1,28 +1,85 @@
 // backend/src/routes/admin_draws.js
-import { Router } from 'express';
-import { query } from '../db.js';
-import { requireAuth } from '../middleware/auth.js';
-import { runAutopayForDraw } from '../services/autopayRunner.js';
+import { Router } from "express";
+import { query } from "../db.js";
+import { requireAuth } from "../middleware/auth.js";
+import { runAutopayForDraw } from "../services/autopayRunner.js";
 
 const router = Router();
 
 async function requireAdmin(req, res, next) {
   try {
     const userId = req?.user?.id;
-    if (!userId) return res.status(401).json({ error: 'unauthorized' });
-    const r = await query('select is_admin from users where id = $1', [userId]);
+    if (!userId) return res.status(401).json({ error: "unauthorized" });
+    const r = await query("select is_admin from users where id = $1", [userId]);
     if (!r.rows.length || !r.rows[0].is_admin) {
-      return res.status(403).json({ error: 'forbidden' });
+      return res.status(403).json({ error: "forbidden" });
     }
     return next();
   } catch (e) {
-    console.error('[admin check] error', e);
-    return res.status(500).json({ error: 'admin_check_failed' });
+    console.error("[admin check] error", e);
+    return res.status(500).json({ error: "admin_check_failed" });
   }
 }
 
-/** GET /api/admin/draws/history */
-router.get('/history', requireAuth, requireAdmin, async (_req, res) => {
+/* ------------------------------------------------------------------ *
+ * ADMIN: criar sorteio + rodar Autopay (opção B)
+ * ------------------------------------------------------------------ */
+/**
+ * POST /api/admin/draws/new
+ * body: { product_name?, product_link? }
+ *
+ * - Cria um novo sorteio status=open
+ * - Preenche product_name/product_link se enviados
+ * - Reseta autopay_ran_at
+ * - Dispara a cobrança automática (Autopay) imediatamente
+ */
+router.post("/new", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const product_name = String(req.body?.product_name || "").slice(0, 255) || null;
+    const product_link = String(req.body?.product_link || "").slice(0, 1024) || null;
+
+    const ins = await query(
+      `insert into draws (status, opened_at, product_name, product_link, autopay_ran_at)
+       values ('open', now(), $1, $2, null)
+       returning id, status, product_name, product_link`,
+      [product_name, product_link]
+    );
+
+    if (!ins.rowCount) {
+      return res.status(500).json({ error: "create_failed" });
+    }
+
+    const draw = ins.rows[0];
+    console.log("[admin/draws/new] novo draw id =", draw.id);
+
+    // dispara o autopay e retorna o resultado junto
+    const result = await runAutopayForDraw(draw.id);
+    if (!result?.ok) {
+      // ainda assim retornamos o draw criado; frontend pode re-tentar manualmente
+      return res.status(500).json({
+        error: "autopay_run_failed",
+        draw_id: draw.id,
+        draw,
+        autopay: result || null,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      draw_id: draw.id,
+      draw,
+      autopay: result,
+    });
+  } catch (e) {
+    console.error("[admin/draws/new] error", e);
+    return res.status(500).json({ error: "create_failed" });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Listagem de histórico (fechados)
+ * ------------------------------------------------------------------ */
+router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
   try {
     const r = await query(`
       select
@@ -42,16 +99,18 @@ router.get('/history', requireAuth, requireAdmin, async (_req, res) => {
     `);
     res.json({ history: r.rows || [] });
   } catch (e) {
-    console.error('[admin/draws/history] error', e);
-    res.status(500).json({ error: 'list_failed' });
+    console.error("[admin/draws/history] error", e);
+    res.status(500).json({ error: "list_failed" });
   }
 });
 
-/** GET /api/admin/draws/:id/participants — apenas pagos */
-router.get('/:id/participants', requireAuth, requireAdmin, async (req, res) => {
+/* ------------------------------------------------------------------ *
+ * Participantes (apenas pagos) via reservations
+ * ------------------------------------------------------------------ */
+router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
-    if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+    if (!Number.isFinite(drawId)) return res.status(400).json({ error: "invalid_draw_id" });
 
     const sql = `
       select
@@ -73,16 +132,16 @@ router.get('/:id/participants', requireAuth, requireAdmin, async (req, res) => {
     const r = await query(sql, [drawId]);
     res.json({ draw_id: drawId, participants: r.rows || [] });
   } catch (e) {
-    console.error('[admin/draws/:id/participants] error', e);
-    res.status(500).json({ error: 'participants_failed' });
+    console.error("[admin/draws/:id/participants] error", e);
+    res.status(500).json({ error: "participants_failed" });
   }
 });
 
 /** Alias /players — apenas pagos */
-router.get('/:id/players', requireAuth, requireAdmin, async (req, res) => {
+router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
-    if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+    if (!Number.isFinite(drawId)) return res.status(400).json({ error: "invalid_draw_id" });
 
     const sql = `
       select
@@ -104,20 +163,17 @@ router.get('/:id/players', requireAuth, requireAdmin, async (req, res) => {
     const r = await query(sql, [drawId]);
     res.json({ draw_id: drawId, participants: r.rows || [] });
   } catch (e) {
-    console.error('[admin/draws/:id/players] error', e);
-    res.status(500).json({ error: 'participants_failed' });
+    console.error("[admin/draws/:id/players] error", e);
+    res.status(500).json({ error: "participants_failed" });
   }
 });
 
-/** POST /api/admin/draws/:id/open
- *  - Abre o sorteio (status='open')
- *  - Zera flags de fechamento/realização
- *  - Zera autopay_ran_at para permitir execução
- *  - Dispara a cobrança automática (autopay)
- */
-router.post('/:id/open', requireAuth, requireAdmin, async (req, res) => {
+/* ------------------------------------------------------------------ *
+ * Abrir sorteio + rodar Autopay
+ * ------------------------------------------------------------------ */
+router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
   const drawId = Number(req.params.id);
-  if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+  if (!Number.isFinite(drawId)) return res.status(400).json({ error: "invalid_draw_id" });
 
   try {
     const up = await query(
@@ -131,27 +187,27 @@ router.post('/:id/open', requireAuth, requireAdmin, async (req, res) => {
         returning id, status`,
       [drawId]
     );
-    if (!up.rowCount) return res.status(404).json({ error: 'draw_not_found' });
+    if (!up.rowCount) return res.status(404).json({ error: "draw_not_found" });
   } catch (e) {
-    console.error('[admin/draws/:id/open] error', e);
-    return res.status(500).json({ error: 'open_failed' });
+    console.error("[admin/draws/:id/open] error", e);
+    return res.status(500).json({ error: "open_failed" });
   }
 
   // dispara o autopay e retorna o resultado
   const result = await runAutopayForDraw(drawId);
-  if (!result.ok) return res.status(500).json(result);
+  if (!result?.ok) return res.status(500).json(result);
   return res.json(result);
 });
 
-/** POST /api/admin/draws/:id/autopay-run
- *  - Executa manualmente a cobrança automática para um sorteio já "open"
- */
-router.post('/:id/autopay-run', requireAuth, requireAdmin, async (req, res) => {
+/* ------------------------------------------------------------------ *
+ * Rodar Autopay manualmente
+ * ------------------------------------------------------------------ */
+router.post("/:id/autopay-run", requireAuth, requireAdmin, async (req, res) => {
   const drawId = Number(req.params.id);
-  if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+  if (!Number.isFinite(drawId)) return res.status(400).json({ error: "invalid_draw_id" });
 
   const result = await runAutopayForDraw(drawId);
-  if (!result.ok) return res.status(500).json(result);
+  if (!result?.ok) return res.status(500).json(result);
   return res.json(result);
 });
 
