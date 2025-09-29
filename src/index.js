@@ -38,6 +38,8 @@ import autopayRouter from "./routes/autopay.js";
 
 import meDraws from "./routes/me_draws.js";
 
+import autopayRunnerRoute from "./routes/autopay_runner.js";
+
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
 import { ensureAppConfig } from "./services/config.js";
@@ -118,6 +120,8 @@ app.use("/api/admin/users", adminUsersRouter);
 app.use("/api", autopayRouter);
 
 app.use("/api/me/draws", meDraws);
+
+app.use("/api/admin/autopay", autopayRunnerRoute);
 
 // 404 padrão
 app.use((req, res) => {

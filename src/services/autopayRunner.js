@@ -3,7 +3,7 @@ import { getPool } from "../db.js";
 import { mpChargeCard } from "./mercadopago.js";
 
 /* ------------------------------------------------------- *
- * Helpers locais (mesmos do routes/autopay.js) + logging
+ * Helpers + logging
  * ------------------------------------------------------- */
 
 const LOG_PREFIX = "[autopayRunner]";
@@ -46,20 +46,27 @@ async function getTicketPriceCents(client) {
   return 300; // fallback
 }
 
+/**
+ * Verifica se o número N está livre no draw.
+ * (corrigido: remove uso de "n" fora de escopo e usa apenas ANY(numbers))
+ */
 async function isNumberFree(client, draw_id, n) {
   const q = `
     with
     p as (
-      select 1 from public.payments
-       where draw_id=$1
+      select 1
+        from public.payments
+       where draw_id = $1
          and lower(status) in ('approved','paid','pago')
-         and $2 = any(numbers) limit 1
+         and $2 = any(numbers)
+       limit 1
     ),
     r as (
-      select 1 from public.reservations
-       where draw_id=$1
+      select 1
+        from public.reservations
+       where draw_id = $1
          and lower(status) in ('active','pending','paid')
-         and ($2 = any(numbers) or n = $2)
+         and $2 = any(numbers)
        limit 1
     )
     select
