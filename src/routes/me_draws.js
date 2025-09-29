@@ -1,4 +1,3 @@
-// backend/src/routes/me_draws.js
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -11,6 +10,7 @@ const router = Router();
  * - isMine: números do usuário logado (payments aprovados/pagos)
  * - state: available | reserved | taken
  * - isWinner: número sorteado
+ * Também retorna product_name/product_link e o nome do vencedor (se houver).
  */
 router.get("/:id/board", requireAuth, async (req, res) => {
   try {
@@ -20,11 +20,20 @@ router.get("/:id/board", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "bad_draw_id" });
     }
 
-    // dados do sorteio (já suportamos winner_number)
+    // dados do sorteio + produto + nome do vencedor
     const d = await query(
-      `SELECT id, status, realized_at, winner_user_id, winner_number
-         FROM public.draws
-        WHERE id = $1
+      `SELECT d.id,
+              d.status,
+              d.realized_at,
+              d.winner_user_id,
+              d.winner_number,
+              d.product_name,
+              d.product_link,
+              u.name AS winner_name
+         FROM public.draws d
+    LEFT JOIN public.users u
+           ON u.id = d.winner_user_id
+        WHERE d.id = $1
         LIMIT 1`,
       [drawId]
     );
@@ -70,15 +79,15 @@ router.get("/:id/board", requireAuth, async (req, res) => {
       const isTaken  = setTaken.has(n);
       const isRes    = setResv.has(n);
       const state =
-        isMine ? "taken" :           // é meu = indisponível para os outros
+        isMine ? "taken" :
         isTaken ? "taken" :
         isRes ? "reserved" : "available";
       return {
-        n,                                // 0..99
+        n,
         label: String(n).padStart(2, "0"),
-        state,                            // available | reserved | taken
+        state,                  // available | reserved | taken
         isMine,
-        isWinner: winner === n
+        isWinner: winner === n  // usado no UI para estilizar e mostrar o nome
       };
     });
 
@@ -87,7 +96,10 @@ router.get("/:id/board", requireAuth, async (req, res) => {
         id: draw.id,
         status: draw.status,
         realized_at: draw.realized_at,
-        winner_number: winner
+        winner_number: winner,
+        product_name: draw.product_name || null,
+        product_link: draw.product_link || null,
+        winner_name: draw.winner_name || null,
       },
       my_numbers: Array.from(setMine).sort((a,b)=>a-b),
       board
