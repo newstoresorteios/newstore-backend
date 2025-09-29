@@ -1,6 +1,8 @@
+// backend/src/routes/admin_draws.js
 import { Router } from 'express';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { runAutopayForDraw } from '../services/autopayRunner.js';
 
 const router = Router();
 
@@ -105,6 +107,52 @@ router.get('/:id/players', requireAuth, requireAdmin, async (req, res) => {
     console.error('[admin/draws/:id/players] error', e);
     res.status(500).json({ error: 'participants_failed' });
   }
+});
+
+/** POST /api/admin/draws/:id/open
+ *  - Abre o sorteio (status='open')
+ *  - Zera flags de fechamento/realização
+ *  - Zera autopay_ran_at para permitir execução
+ *  - Dispara a cobrança automática (autopay)
+ */
+router.post('/:id/open', requireAuth, requireAdmin, async (req, res) => {
+  const drawId = Number(req.params.id);
+  if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+
+  try {
+    const up = await query(
+      `update draws
+          set status='open',
+              opened_at = coalesce(opened_at, now()),
+              closed_at = null,
+              realized_at = null,
+              autopay_ran_at = null
+        where id = $1
+        returning id, status`,
+      [drawId]
+    );
+    if (!up.rowCount) return res.status(404).json({ error: 'draw_not_found' });
+  } catch (e) {
+    console.error('[admin/draws/:id/open] error', e);
+    return res.status(500).json({ error: 'open_failed' });
+  }
+
+  // dispara o autopay e retorna o resultado
+  const result = await runAutopayForDraw(drawId);
+  if (!result.ok) return res.status(500).json(result);
+  return res.json(result);
+});
+
+/** POST /api/admin/draws/:id/autopay-run
+ *  - Executa manualmente a cobrança automática para um sorteio já "open"
+ */
+router.post('/:id/autopay-run', requireAuth, requireAdmin, async (req, res) => {
+  const drawId = Number(req.params.id);
+  if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'invalid_draw_id' });
+
+  const result = await runAutopayForDraw(drawId);
+  if (!result.ok) return res.status(500).json(result);
+  return res.json(result);
 });
 
 export default router;
