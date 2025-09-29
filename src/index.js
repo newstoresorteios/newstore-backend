@@ -34,6 +34,8 @@ import couponsRouter from "./routes/coupons.js";
 
 import adminUsersRouter from "./routes/adminUsers.js";
 
+import autopayRouter from "./routes/autopay.js";
+
 import meDraws from "./routes/me_draws.js";
 
 import { query, getPool } from "./db.js";
@@ -112,6 +114,8 @@ app.use("/api/purchase-limit", purchaseLimitRouter);
 app.use("/api/coupons", couponsRouter);
 
 app.use("/api/admin/users", adminUsersRouter);
+
+app.use("/api", autopayRouter);
 
 app.use("/api/me/draws", meDraws);
 
