@@ -15,6 +15,13 @@ import {
 
 const router = express.Router();
 
+// ====== MP token (server) — aceita várias chaves de env para evitar quebra ======
+const MP_TOKEN =
+  process.env.MP_ACCESS_TOKEN ||
+  process.env.MERCADOPAGO_ACCESS_TOKEN ||
+  process.env.REACT_APP_MP_ACCESS_TOKEN ||
+  null;
+
 /* ------------------------------------------------------------------ *
  * Utils
  * ------------------------------------------------------------------ */
@@ -183,6 +190,12 @@ router.post("/me/autopay", requireAuth, async (req, res) => {
       return res
         .status(400)
         .json({ error: "missing_holder_or_doc" });
+    }
+
+    // Se tentará salvar cartão mas o servidor não tem MP token, avisa claramente
+    if (card_token && !MP_TOKEN) {
+      console.error("[autopay] missing MP_ACCESS_TOKEN on server");
+      return res.status(503).json({ error: "mp_not_configured" });
     }
 
     await client.query("BEGIN");
@@ -356,6 +369,12 @@ router.post(
   requireAuth,
   requireAdmin,
   async (req, res) => {
+    // Sem token do MP não dá para cobrar
+    if (!MP_TOKEN) {
+      console.error("[autopay-run] missing MP_ACCESS_TOKEN on server");
+      return res.status(503).json({ error: "mp_not_configured" });
+    }
+
     const pool = await getPool();
     const client = await pool.connect();
     const draw_id = Number(req.params.id);
