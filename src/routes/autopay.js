@@ -282,6 +282,70 @@ router.post("/me/autopay", requireAuth, async (req, res) => {
   }
 });
 
+/* ------------------ NOVO: cancelar perfil/limpar cartão e números ------------------ */
+// POST /api/me/autopay/cancel
+router.post("/me/autopay/cancel", requireAuth, async (req, res) => {
+  const pool = await getPool();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Obtém (ou cria) perfil do usuário
+    const { rows } = await client.query(
+      `select * from public.autopay_profiles where user_id=$1 limit 1`,
+      [req.user.id]
+    );
+
+    if (!rows.length) {
+      // nenhum perfil: nada a cancelar, mas respondemos ok
+      await client.query("COMMIT");
+      return res.json({
+        ok: true,
+        canceled: true,
+        active: false,
+        numbers: [],
+        card: { has_card: false, brand: null, last4: null },
+      });
+    }
+
+    const profile = rows[0];
+
+    // limpa números
+    await client.query(
+      `delete from public.autopay_numbers where autopay_id=$1`,
+      [profile.id]
+    );
+
+    // desativa + apaga cartão (mantém holder/doc)
+    const up = await client.query(
+      `update public.autopay_profiles
+          set active=false,
+              mp_card_id=null,
+              brand=null,
+              last4=null,
+              updated_at=now()
+        where id=$1
+        returning *`,
+      [profile.id]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      ok: true,
+      canceled: true,
+      active: false,
+      numbers: [],
+      card: { has_card: false, brand: null, last4: null },
+    });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("[autopay/cancel] error:", e?.message || e);
+    res.status(500).json({ error: "cancel_failed" });
+  } finally {
+    client.release();
+  }
+});
+
 /* ------------------------------------------------------------------ *
  * ADMIN: rodar cobrança automática em um sorteio aberto
  * ------------------------------------------------------------------ */
