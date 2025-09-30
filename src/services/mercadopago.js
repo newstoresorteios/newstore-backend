@@ -80,8 +80,9 @@ async function mpFetch(
       json?.message ||
       json?.error?.message ||
       json?.error ||
-      `MercadoPago ${method} ${path} falhou (${res.status})` +
-        (causeText ? `: ${causeText}` : "");
+      `MercadoPago ${method} ${path} falhou (${res.status})${
+        causeText ? `: ${causeText}` : ""
+      }`;
 
     const err = new Error(msg);
     err.status = res.status;
@@ -159,6 +160,8 @@ export async function mpSaveCard({ customerId, card_token }) {
  * OBS: Algumas contas exigem CVV para tokenizar cartão salvo.
  *      Se não for passado em `security_code`, tentamos usar
  *      MP_DEFAULT_SECURITY_CODE/MP_SECURITY_CODE do ambiente.
+ *      Se mesmo assim não houver, lançamos `SECURITY_CODE_REQUIRED`
+ *      ANTES de chamar a API (para o log ficar claro).
  */
 export async function mpChargeCard({
   customerId,
@@ -175,36 +178,30 @@ export async function mpChargeCard({
     process.env.MP_SECURITY_CODE ||
     undefined;
 
-  // 1) token a partir do cartão salvo
+  if (!fallbackCVV) {
+    // Evita chamada inútil à API e deixa o log explícito
+    const err = new Error("security_code_required");
+    err.code = "SECURITY_CODE_REQUIRED";
+    throw err;
+  }
+
+  // 1) token a partir do cartão salvo (sempre enviando o CVV disponível)
   let cardTok;
   try {
     cardTok = await mpFetch("POST", "/v1/card_tokens", {
       customer_id: customerId,
       card_id: cardId,
-      // Enviar somente se temos um CVV para evitar rejeição por campo vazio
-      ...(fallbackCVV ? { security_code: String(fallbackCVV) } : {}),
+      security_code: String(fallbackCVV),
     });
   } catch (e) {
-    // Se o erro indicar CVV obrigatório, propaga com um code específico
-    const msg = String(e?.message || "");
-    const requiresCVV =
-      msg.toLowerCase().includes("security_code") ||
-      msg.toLowerCase().includes("security code") ||
-      msg.toLowerCase().includes("security_code_id");
-
-    if (requiresCVV && !fallbackCVV) {
-      const err = new Error("security_code_required");
-      err.code = "SECURITY_CODE_REQUIRED";
-      throw err;
-    }
-    throw e;
+    throw e; // mensagem já vem enriquecida pelo mpFetch
   }
 
   // 2) pagamento
   const amount = toBRL(amount_cents);
   const idempotencyKey = crypto.randomUUID();
 
-  // IMPORTANTE: Não enviar currency_id quando se usa token de cartão salvo.
+  // IMPORTANTE: Não enviar currency_id aqui.
   const pay = await mpFetch(
     "POST",
     "/v1/payments",
