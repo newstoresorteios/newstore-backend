@@ -2,21 +2,10 @@
 import { getPool } from "../db.js";
 import { mpChargeCard } from "./mercadopago.js";
 
-/* ------------------------------------------------------- *
- * Helpers + logging
- * ------------------------------------------------------- */
-
 const LOG_PREFIX = "[autopayRunner]";
-
-function log(...args) {
-  console.log(LOG_PREFIX, ...args);
-}
-function warn(...args) {
-  console.warn(LOG_PREFIX, ...args);
-}
-function err(...args) {
-  console.error(LOG_PREFIX, ...args);
-}
+const log  = (...a) => console.log(LOG_PREFIX, ...a);
+const warn = (...a) => console.warn(LOG_PREFIX, ...a);
+const err  = (...a) => console.error(LOG_PREFIX, ...a);
 
 async function getTicketPriceCents(client) {
   try {
@@ -46,10 +35,7 @@ async function getTicketPriceCents(client) {
   return 300; // fallback
 }
 
-/**
- * Verifica se o número N está livre no draw.
- * ⚠️ Casts explícitos para evitar conflito entre int[] x int2[].
- */
+/** Checa se o número N está livre no draw. */
 async function isNumberFree(client, draw_id, n) {
   const q = `
     with
@@ -58,7 +44,7 @@ async function isNumberFree(client, draw_id, n) {
         from public.payments
        where draw_id = $1
          and lower(status) in ('approved','paid','pago')
-         and $2::int = any( (numbers)::int[] )
+         and $2 = any(numbers)
        limit 1
     ),
     r as (
@@ -66,7 +52,7 @@ async function isNumberFree(client, draw_id, n) {
         from public.reservations
        where draw_id = $1
          and lower(status) in ('active','pending','paid')
-         and $2::int = any( (numbers)::int[] )
+         and $2 = any(numbers)
        limit 1
     )
     select
@@ -77,10 +63,7 @@ async function isNumberFree(client, draw_id, n) {
   return !(r.rows[0].taken_pay || r.rows[0].taken_resv);
 }
 
-/* ------------------------------------------------------- *
- * Núcleo: executa autopay para UM sorteio aberto
- * ------------------------------------------------------- */
-
+/** Autopay de UM sorteio aberto */
 export async function runAutopayForDraw(draw_id) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -89,7 +72,7 @@ export async function runAutopayForDraw(draw_id) {
   try {
     await client.query("BEGIN");
 
-    // valida e bloqueia linha do sorteio
+    // lock do draw
     const d = await client.query(
       `select id, status, autopay_ran_at
          from public.draws
@@ -170,9 +153,10 @@ export async function runAutopayForDraw(draw_id) {
         log("MP charge result ->", { user_id, status: charge?.status, id: charge?.paymentId });
       } catch (e) {
         const emsg = String(e?.message || e);
+        // ⚠️ CAST para int2[] evita abortar a transação
         await client.query(
           `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
-           values ($1,$2,$3,$4,'error',$5)`,
+           values ($1,$2,$3,$4::int2[],'error',$5)`,
           [p.id, user_id, draw_id, free, emsg]
         );
         err("falha ao cobrar MP", { user_id, emsg });
@@ -183,7 +167,7 @@ export async function runAutopayForDraw(draw_id) {
       if (!charge || String(charge.status).toLowerCase() !== "approved") {
         await client.query(
           `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
-           values ($1,$2,$3,$4,'error','not_approved')`,
+           values ($1,$2,$3,$4::int2[],'error','not_approved')`,
           [p.id, user_id, draw_id, free]
         );
         warn("pagamento não aprovado", { user_id, draw_id });
@@ -194,21 +178,21 @@ export async function runAutopayForDraw(draw_id) {
       // grava payment + reservation
       const pay = await client.query(
         `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
-         values ($1,$2,$3,$4,'approved', now())
+         values ($1,$2,$3::int2[],$4,'approved', now())
          returning id`,
-        [user_id, draw_id, free, amount_cents] // <-- sem cast explícito
+        [user_id, draw_id, free, amount_cents]
       );
       const resv = await client.query(
         `insert into public.reservations (id, user_id, draw_id, numbers, status, created_at, expires_at)
-         values (gen_random_uuid(), $1, $2, $3, 'paid', now(), now())
+         values (gen_random_uuid(), $1, $2, $3::int2[], 'paid', now(), now())
          returning id`,
-        [user_id, draw_id, free] // <-- sem cast explícito
+        [user_id, draw_id, free]
       );
 
       await client.query(
         `insert into public.autopay_runs
            (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,payment_id,reservation_id)
-         values ($1,$2,$3,$4,$5,$6,'ok',$7,$8)`,
+         values ($1,$2,$3,$4::int2[],$5::int2[],$6,'ok',$7,$8)`,
         [p.id, user_id, draw_id, free, free, amount_cents, pay.rows[0].id, resv.rows[0].id]
       );
 
@@ -241,10 +225,7 @@ export async function runAutopayForDraw(draw_id) {
   }
 }
 
-/* ------------------------------------------------------- *
- * Em lote / garantia
- * ------------------------------------------------------- */
-
+/** Em lote */
 export async function runAutopayForOpenDraws({ force = false, limit = 50 } = {}) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -281,6 +262,7 @@ export async function runAutopayForOpenDraws({ force = false, limit = 50 } = {})
   }
 }
 
+/** Idempotente para um draw */
 export async function ensureAutopayForDraw(draw_id, { force = false } = {}) {
   const pool = await getPool();
   const client = await pool.connect();
