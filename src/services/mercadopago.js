@@ -11,7 +11,7 @@ function getAccessToken() {
   return (
     process.env.MERCADOPAGO_ACCESS_TOKEN ||
     process.env.MP_ACCESS_TOKEN ||
-    process.env.REACT_APP_MP_ACCESS_TOKEN || // fallback (não recomendado, mas ajuda se ficou errado)
+    process.env.REACT_APP_MP_ACCESS_TOKEN || // fallback (não recomendado)
     ""
   );
 }
@@ -68,15 +68,21 @@ async function mpFetch(
   }
 
   if (!res.ok) {
-    const cause =
+    const causeText =
       Array.isArray(json?.cause) && json.cause.length
-        ? `: ${json.cause.map(c => c?.description || c?.message).filter(Boolean).join(" | ")}`
-        : "";
+        ? json.cause
+            .map((c) => c?.description || c?.message || c?.code)
+            .filter(Boolean)
+            .join(" | ")
+        : null;
+
     const msg =
       json?.message ||
       json?.error?.message ||
       json?.error ||
-      `MercadoPago ${method} ${path} falhou (${res.status})${cause}`;
+      `MercadoPago ${method} ${path} falhou (${res.status})` +
+        (causeText ? `: ${causeText}` : "");
+
     const err = new Error(msg);
     err.status = res.status;
     err.response = json;
@@ -84,6 +90,12 @@ async function mpFetch(
   }
 
   return json;
+}
+
+// Util: normaliza valor em reais com 2 casas
+function toBRL(amount_cents) {
+  const cents = Math.max(0, Math.round(Number(amount_cents || 0)));
+  return Number((cents / 100).toFixed(2));
 }
 
 /**
@@ -144,7 +156,9 @@ export async function mpSaveCard({ customerId, card_token }) {
  * 2) Cria o payment com esse token
  * Retorna: { status, paymentId }
  *
- * Opcional: passe { security_code } se sua conta exigir CVV na tokenização do cartão salvo.
+ * OBS: Algumas contas exigem CVV para tokenizar cartão salvo.
+ *      Se não for passado em `security_code`, tentamos usar
+ *      MP_DEFAULT_SECURITY_CODE/MP_SECURITY_CODE do ambiente.
  */
 export async function mpChargeCard({
   customerId,
@@ -154,21 +168,43 @@ export async function mpChargeCard({
   metadata,
   security_code, // opcional
 }) {
+  // Tenta obter CVV de fallback via env se não vier no argumento:
+  const fallbackCVV =
+    security_code ||
+    process.env.MP_DEFAULT_SECURITY_CODE ||
+    process.env.MP_SECURITY_CODE ||
+    undefined;
+
   // 1) token a partir do cartão salvo
-  const cardTok = await mpFetch("POST", "/v1/card_tokens", {
-    customer_id: customerId,
-    card_id: cardId,
-    security_code: security_code || undefined,
-  });
+  let cardTok;
+  try {
+    cardTok = await mpFetch("POST", "/v1/card_tokens", {
+      customer_id: customerId,
+      card_id: cardId,
+      // Enviar somente se temos um CVV para evitar rejeição por campo vazio
+      ...(fallbackCVV ? { security_code: String(fallbackCVV) } : {}),
+    });
+  } catch (e) {
+    // Se o erro indicar CVV obrigatório, propaga com um code específico
+    const msg = String(e?.message || "");
+    const requiresCVV =
+      msg.toLowerCase().includes("security_code") ||
+      msg.toLowerCase().includes("security code") ||
+      msg.toLowerCase().includes("security_code_id");
+
+    if (requiresCVV && !fallbackCVV) {
+      const err = new Error("security_code_required");
+      err.code = "SECURITY_CODE_REQUIRED";
+      throw err;
+    }
+    throw e;
+  }
 
   // 2) pagamento
-  const amount = Number(
-    (Math.round(Number(amount_cents || 0)) / 100).toFixed(2)
-  );
-
+  const amount = toBRL(amount_cents);
   const idempotencyKey = crypto.randomUUID();
 
-  // IMPORTANTE: NÃO enviar "currency_id" aqui; com token de cartão o MP rejeita esse campo.
+  // IMPORTANTE: Não enviar currency_id quando se usa token de cartão salvo.
   const pay = await mpFetch(
     "POST",
     "/v1/payments",
