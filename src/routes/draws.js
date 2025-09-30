@@ -25,57 +25,9 @@ async function requireAdmin(req, res, next) {
 }
 
 /* ------------------------------------------------------------------ *
- * PUBLIC: /api/draws — usado pelo front para pintar “Resultado”
- * ------------------------------------------------------------------ */
-
-// GET /api/draws  -> { draws: [...], status_by_id: { 4:'closed', 8:'closed', ... } }
-router.get("/", async (_req, res) => {
-  try {
-    const r = await query(`
-      select
-        id,
-        status,
-        coalesce(opened_at, created_at) as opened_at,
-        closed_at,
-        realized_at,
-        winner_user_id
-      from public.draws
-      order by id asc
-    `);
-    const draws = r.rows || [];
-    const status_by_id = {};
-    for (const d of draws) status_by_id[d.id] = String(d.status || "").toLowerCase();
-    res.json({ draws, status_by_id });
-  } catch (e) {
-    console.error("[draws] list error:", e?.message || e);
-    res.status(500).json({ error: "list_failed" });
-  }
-});
-
-// GET /api/draws/:id -> um sorteio específico
-router.get("/:id(\\d+)", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const r = await query(
-      `select id, status,
-              coalesce(opened_at, created_at) as opened_at,
-              closed_at, realized_at, winner_user_id
-         from public.draws
-        where id = $1
-        limit 1`,
-      [id]
-    );
-    if (!r.rows.length) return res.status(404).json({ error: "not_found" });
-    res.json(r.rows[0]);
-  } catch (e) {
-    console.error("[draws] get error:", e?.message || e);
-    res.status(500).json({ error: "get_failed" });
-  }
-});
-
-/* ------------------------------------------------------------------ *
  * Utils compartilhadas (mesmas da rota de autopay)
  * ------------------------------------------------------------------ */
+
 async function getTicketPriceCents(client) {
   try {
     const r1 = await client.query(
@@ -131,6 +83,7 @@ async function isNumberFree(client, draw_id, n) {
  * Retorna: { results, price_cents }
  */
 async function runAutopayForDraw(client, draw_id) {
+  // perfis ativos com cartão salvo
   const { rows: profiles } = await client.query(
     `select ap.*, array(
        select n from public.autopay_numbers an where an.autopay_id=ap.id order by n
@@ -155,6 +108,7 @@ async function runAutopayForDraw(client, draw_id) {
       continue;
     }
 
+    // filtra apenas os números ainda livres
     const free = [];
     for (const n of wants) {
       // eslint-disable-next-line no-await-in-loop
@@ -162,12 +116,17 @@ async function runAutopayForDraw(client, draw_id) {
       if (ok) free.push(n);
     }
     if (!free.length) {
-      results.push({ user_id, status: "skipped", reason: "none_available" });
+      results.push({
+        user_id,
+        status: "skipped",
+        reason: "none_available",
+      });
       continue;
     }
 
     const amount_cents = free.length * price_cents;
 
+    // cobra no cartão do Mercado Pago
     let charge;
     try {
       // eslint-disable-next-line no-await-in-loop
@@ -200,6 +159,7 @@ async function runAutopayForDraw(client, draw_id) {
       continue;
     }
 
+    // grava payment + reservation (status 'approved'/'paid')
     const pay = await client.query(
       `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
        values ($1,$2,$3::int2[],$4,'approved', now())
@@ -235,10 +195,10 @@ async function runAutopayForDraw(client, draw_id) {
 }
 
 /* ------------------------------------------------------------------ *
- * LISTAGENS ADMIN
+ * LISTAGENS (como estavam)
  * ------------------------------------------------------------------ */
 
-// GET /api/admin/draws/history
+/** GET /api/admin/draws/history */
 router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
   try {
     const r = await query(`
@@ -249,7 +209,8 @@ router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
         d.closed_at,
         d.realized_at,
         round(
-          extract(epoch from (coalesce(d.closed_at, now()) - coalesce(d.opened_at, d.created_at))) / 86400.0
+          extract(epoch from (coalesce(d.closed_at, now()) - coalesce(d.opened_at, d.created_at)))
+          / 86400.0
         )::int as days_open,
         coalesce(d.winner_name, '-') as winner_name
       from draws d
@@ -263,7 +224,7 @@ router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
-// GET /api/admin/draws/:id/participants
+/** GET /api/admin/draws/:id/participants — somente pagos (reservations) */
 router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
@@ -284,7 +245,7 @@ router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        and lower(coalesce(r.status,'')) = 'paid'
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
@@ -295,7 +256,7 @@ router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// Alias /players
+/** Alias /players — somente pagos */
 router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
@@ -316,7 +277,7 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        and lower(coalesce(r.status,'')) = 'paid'
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
@@ -328,28 +289,37 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ *
- * ABERTURA + AUTOPAY
+ * ABERTURA + AUTOPAY (compatível com seu painel)
  * ------------------------------------------------------------------ */
 
-// POST /api/admin/draws/new
+/**
+ * POST /api/admin/draws/new
+ * Abre um novo sorteio (status 'open') e roda AutoPay imediatamente.
+ * Compatível com o que seu painel chama hoje (logs mostram /new).
+ */
 router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   const pool = await getPool();
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
+    // cria sorteio
     const d = await client.query(
       `insert into public.draws (status, opened_at, product_name, product_link)
        values ('open', now(), $1, $2)
        returning id`,
-      [req.body?.product_name || null, req.body?.product_link || null]
+      [
+        req.body?.product_name || null,
+        req.body?.product_link || null,
+      ]
     );
     const draw_id = d.rows[0].id;
 
+    // roda AutoPay
     const { results, price_cents } = await runAutopayForDraw(client, draw_id);
 
     await client.query("COMMIT");
-    console.log("[admin/draws] novo draw id =", draw_id);
+    console.log("[admin/dashboard] novo draw id =", draw_id);
     return res.json({ ok: true, draw_id, autopay: { results, price_cents } });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
@@ -360,7 +330,10 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/draws/:id/open
+/**
+ * POST /api/admin/draws/:id/open
+ * Garante que o sorteio esteja 'open' (ou reabre) e roda AutoPay.
+ */
 router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
   const pool = await getPool();
   const client = await pool.connect();
@@ -375,9 +348,7 @@ router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
     await client.query(
       `update public.draws
           set status='open',
-              opened_at = coalesce(opened_at, now()),
-              closed_at = null,
-              realized_at = null
+              opened_at = coalesce(opened_at, now())
         where id=$1`,
       [draw_id]
     );
