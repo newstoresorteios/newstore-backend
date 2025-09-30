@@ -46,10 +46,8 @@ router.get("/", async (req, res) => {
         winner_user_id
       from public.draws
     `;
-    const params = [];
 
     if (qStatus === "closed" || qStatus === "fechado" || qStatus === "sorteado") {
-      // somente “realizados”
       sql += `
         where (
           lower(coalesce(status,'')) in ('closed','fechado','sorteado')
@@ -59,17 +57,15 @@ router.get("/", async (req, res) => {
         order by id desc
       `;
     } else if (qStatus === "open" || qStatus === "aberto") {
-      // somente abertos
       sql += `
         where lower(coalesce(status,'')) in ('open','aberto')
         order by id asc
       `;
     } else {
-      // todos
       sql += ` order by id asc `;
     }
 
-    const r = await query(sql, params);
+    const r = await query(sql, []);
     const draws = r.rows || [];
     const status_by_id = {};
     for (const d of draws) status_by_id[d.id] = String(d.status || "").toLowerCase();
@@ -298,21 +294,22 @@ router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
     if (!Number.isFinite(drawId))
       return res.status(400).json({ error: "invalid_draw_id" });
 
+    // ► Corrigido: remove r.paid (coluna não existe) e nomeia coluna do unnest
     const sql = `
       select
         r.id as reservation_id,
         r.draw_id,
         r.user_id,
-        num as number,
+        n as number,
         r.status as status,
         r.created_at,
         coalesce(nullif(u.name,''), u.email, '-') as user_name,
         u.email as user_email
       from reservations r
       left join users u on u.id = r.user_id
-      cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
+      cross join lateral unnest(coalesce(r.numbers, '{}'::int2[])) as t(n)
       where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        and lower(coalesce(r.status,'')) in ('paid','pago')
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
@@ -330,21 +327,22 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
     if (!Number.isFinite(drawId))
       return res.status(400).json({ error: "invalid_draw_id" });
 
+    // ► Mesma correção aplicada aqui
     const sql = `
       select
         r.id as reservation_id,
         r.draw_id,
         r.user_id,
-        num as number,
+        n as number,
         r.status as status,
         r.created_at,
         coalesce(nullif(u.name,''), u.email, '-') as user_name,
         u.email as user_email
       from reservations r
       left join users u on u.id = r.user_id
-      cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
+      cross join lateral unnest(coalesce(r.numbers, '{}'::int2[])) as t(n)
       where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        and lower(coalesce(r.status,'')) in ('paid','pago')
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
