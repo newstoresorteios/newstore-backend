@@ -6,45 +6,88 @@ import { mpChargeCard } from "./mercadopago.js";
  * Logging enxuto com contexto
  * ------------------------------------------------------- */
 const LP = "[autopayRunner]";
-const now = () => new Date().toISOString();
 const log  = (msg, extra = null) => console.log(`${LP} ${msg}`, extra ?? "");
 const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ?? "");
 const err  = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ?? "");
 
 /* ------------------------------------------------------- *
- * Preço do ticket — usar apenas app_config (evita erro 42703)
+ * Preço do ticket — prioriza app_config (key/value).
+ * Sem referenciar colunas inexistentes (evita 42703).
  * ------------------------------------------------------- */
 async function getTicketPriceCents(client) {
-  const t0 = Date.now();
+  // 1) app_config (key/value) – seu schema atual
   try {
-    log("SQL getTicketPriceCents/app_config -> start", { at: now() });
+    const r = await client.query(
+      `select value
+         from public.app_config
+        where key in ('ticket_price_cents','price_cents')
+        order by updated_at desc
+        limit 1`
+    );
+    if (r.rowCount) {
+      const v = Number(r.rows[0].value);
+      if (Number.isFinite(v) && v > 0) return v | 0;
+    }
+  } catch {}
+
+  // 2) kv_store (detecta se é key/value ou k/v)
+  try {
+    const { rows: cols } = await client.query(
+      `select column_name
+         from information_schema.columns
+        where table_schema='public'
+          and table_name='kv_store'
+          and column_name in ('k','key','v','value')`
+    );
+    const hasKey = cols.some(c => c.column_name === "key");
+    const hasK   = cols.some(c => c.column_name === "k");
+    const hasVal = cols.some(c => c.column_name === "value");
+    const hasV   = cols.some(c => c.column_name === "v");
+
+    if (hasKey && hasVal) {
+      const r = await client.query(
+        `select value
+           from public.kv_store
+          where key in ('ticket_price_cents','price_cents')
+          limit 1`
+      );
+      if (r.rowCount) {
+        const v = Number(r.rows[0].value);
+        if (Number.isFinite(v) && v > 0) return v | 0;
+      }
+    } else if (hasK && hasV) {
+      const r = await client.query(
+        `select v as value
+           from public.kv_store
+          where k in ('ticket_price_cents','price_cents')
+          limit 1`
+      );
+      if (r.rowCount) {
+        const v = Number(r.rows[0].value);
+        if (Number.isFinite(v) && v > 0) return v | 0;
+      }
+    }
+  } catch {}
+
+  // 3) compat com app_config antigo (coluna price_cents)
+  try {
     const r = await client.query(
       `select price_cents
          from public.app_config
      order by id desc
         limit 1`
     );
-    const ms = `${Date.now() - t0}ms`;
     if (r.rowCount) {
       const v = Number(r.rows[0].price_cents);
-      if (Number.isFinite(v) && v > 0) {
-        log("SQL getTicketPriceCents/app_config -> ok", { value: v, time: ms });
-        return v | 0;
-      }
+      if (Number.isFinite(v) && v > 0) return v | 0;
     }
-    log("SQL getTicketPriceCents/app_config -> vazio, usando fallback", { time: ms });
-  } catch (e) {
-    err("SQL getTicketPriceCents/app_config -> FAIL", {
-      time: `${Date.now() - t0}ms`,
-      msg: e?.message,
-      code: e?.code,
-    });
-  }
-  return 300; // fallback seguro
+  } catch {}
+
+  return 300; // fallback
 }
 
 /* ------------------------------------------------------- *
- * Número livre? (NÃO usa coluna inexistente)
+ * Número livre? (sem "n = $2" fora de escopo)
  * ------------------------------------------------------- */
 async function isNumberFree(client, draw_id, n) {
   const t0 = Date.now();
@@ -89,14 +132,6 @@ async function isNumberFree(client, draw_id, n) {
 /* ------------------------------------------------------- *
  * Autopay para UM sorteio aberto
  * ------------------------------------------------------- */
-/**
- * - Valida sorteio e bloqueia linha (FOR UPDATE)
- * - Busca perfis ativos com cartão salvo
- * - Cobra somente números livres
- * - Grava payments(approved), reservations(paid)
- * - Atualiza numbers(status='sold') e draws.autopay_ran_at
- * Retorna { ok, draw_id, results, price_cents }
- */
 export async function runAutopayForDraw(draw_id) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -138,35 +173,19 @@ export async function runAutopayForDraw(draw_id) {
     }
 
     // 2) Perfis elegíveis
-    const profiles = (() => {
-      const t0 = Date.now();
-      return client
-        .query(
-          `select ap.*,
-                  array(select n
-                          from public.autopay_numbers an
-                         where an.autopay_id = ap.id
-                         order by n) as numbers
-             from public.autopay_profiles ap
-            where ap.active = true
-              and ap.mp_customer_id is not null
-              and ap.mp_card_id is not null`
-        )
-        .then(r => {
-          log("SQL eligible_profiles -> ok", { rows: r.rowCount, time: `${Date.now() - t0}ms` });
-          return r.rows;
-        })
-        .catch(e => {
-          err("SQL eligible_profiles -> FAIL", {
-            time: `${Date.now() - t0}ms`,
-            msg: e?.message,
-            code: e?.code,
-          });
-          throw e;
-        });
-    })();
-    const pf = await profiles;
-    log("eligible profiles", { count: pf.length });
+    const t0Pf = Date.now();
+    const { rows: pf } = await client.query(
+      `select ap.*,
+              array(select n
+                      from public.autopay_numbers an
+                     where an.autopay_id = ap.id
+                     order by n) as numbers
+         from public.autopay_profiles ap
+        where ap.active = true
+          and ap.mp_customer_id is not null
+          and ap.mp_card_id is not null`
+    );
+    log("SQL eligible_profiles -> ok", { rows: pf.length, time: `${Date.now() - t0Pf}ms` });
 
     // 3) Preço
     const price_cents = await getTicketPriceCents(client);
@@ -251,7 +270,7 @@ export async function runAutopayForDraw(draw_id) {
       );
       const resv_id = reservation.rows[0].id;
 
-      // 7) Atualiza a tabela numbers para refletir no grid (sold)
+      // 7) Atualiza numbers (sold) para refletir no grid
       await client.query(
         `update public.numbers n
             set status = 'sold',
