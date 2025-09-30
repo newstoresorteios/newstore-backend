@@ -48,7 +48,7 @@ async function getTicketPriceCents(client) {
 
 /**
  * Verifica se o número N está livre no draw.
- * (corrigido: remove uso de "n" fora de escopo e usa apenas ANY(numbers))
+ * ⚠️ Casts explícitos para evitar conflito entre int[] x int2[].
  */
 async function isNumberFree(client, draw_id, n) {
   const q = `
@@ -58,7 +58,7 @@ async function isNumberFree(client, draw_id, n) {
         from public.payments
        where draw_id = $1
          and lower(status) in ('approved','paid','pago')
-         and $2 = any(numbers)
+         and $2::int = any( (numbers)::int[] )
        limit 1
     ),
     r as (
@@ -66,7 +66,7 @@ async function isNumberFree(client, draw_id, n) {
         from public.reservations
        where draw_id = $1
          and lower(status) in ('active','pending','paid')
-         and $2 = any(numbers)
+         and $2::int = any( (numbers)::int[] )
        limit 1
     )
     select
@@ -81,14 +81,6 @@ async function isNumberFree(client, draw_id, n) {
  * Núcleo: executa autopay para UM sorteio aberto
  * ------------------------------------------------------- */
 
-/**
- * Executa a cobrança automática para um sorteio aberto.
- * - Filtra perfis ativos com cartão salvo
- * - Cobra somente números livres
- * - Grava payments(approved) e reservations(paid)
- * - Marca draws.autopay_ran_at
- * Retorna { ok, draw_id, results, price_cents }
- */
 export async function runAutopayForDraw(draw_id) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -122,7 +114,7 @@ export async function runAutopayForDraw(draw_id) {
       return { ok: false, error: "autopay_already_ran" };
     }
 
-    // busca perfis elegíveis
+    // perfis elegíveis
     const { rows: profiles } = await client.query(
       `select ap.*, array(
          select n from public.autopay_numbers an
@@ -202,15 +194,15 @@ export async function runAutopayForDraw(draw_id) {
       // grava payment + reservation
       const pay = await client.query(
         `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
-         values ($1,$2,$3::int2[],$4,'approved', now())
+         values ($1,$2,$3,$4,'approved', now())
          returning id`,
-        [user_id, draw_id, free, amount_cents]
+        [user_id, draw_id, free, amount_cents] // <-- sem cast explícito
       );
       const resv = await client.query(
         `insert into public.reservations (id, user_id, draw_id, numbers, status, created_at, expires_at)
-         values (gen_random_uuid(), $1, $2, $3::int2[], 'paid', now(), now())
+         values (gen_random_uuid(), $1, $2, $3, 'paid', now(), now())
          returning id`,
-        [user_id, draw_id, free]
+        [user_id, draw_id, free] // <-- sem cast explícito
       );
 
       await client.query(
@@ -231,7 +223,7 @@ export async function runAutopayForDraw(draw_id) {
       results.push({ user_id, status: "ok", numbers: free, amount_cents });
     }
 
-    // marca draw como processado para evitar duplicidade
+    // marca draw como processado
     await client.query(
       `update public.draws set autopay_ran_at = now() where id=$1`,
       [draw_id]
@@ -250,15 +242,9 @@ export async function runAutopayForDraw(draw_id) {
 }
 
 /* ------------------------------------------------------- *
- * Executa autopay para TODOS sorteios abertos (em lote)
+ * Em lote / garantia
  * ------------------------------------------------------- */
 
-/**
- * Busca sorteios abertos e roda o autopay para cada um.
- * - Por padrão, processa apenas os que ainda NÃO rodaram (autopay_ran_at IS NULL).
- * - Use { force: true } para rodar mesmo se já houve execução.
- * - 'limit' previne varrer um volume muito grande de uma só vez.
- */
 export async function runAutopayForOpenDraws({ force = false, limit = 50 } = {}) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -282,7 +268,6 @@ export async function runAutopayForOpenDraws({ force = false, limit = 50 } = {})
 
     const results = [];
     for (const r of rows) {
-      // chama o núcleo por draw
       // eslint-disable-next-line no-await-in-loop
       const out = await runAutopayForDraw(r.id);
       results.push(out);
@@ -296,14 +281,6 @@ export async function runAutopayForOpenDraws({ force = false, limit = 50 } = {})
   }
 }
 
-/* ------------------------------------------------------- *
- * Dispara condicionalmente para UM sorteio (idempotente)
- * ------------------------------------------------------- */
-
-/**
- * Garante que, se o sorteio estiver ABERTO, o autopay rode agora.
- * - Se já tiver rodado (autopay_ran_at não nulo) e 'force' for falso, não roda.
- */
 export async function ensureAutopayForDraw(draw_id, { force = false } = {}) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -331,7 +308,6 @@ export async function ensureAutopayForDraw(draw_id, { force = false } = {}) {
       return { ok: true, skipped: true, reason: "already_ran" };
     }
 
-    // roda de fato
     return await runAutopayForDraw(draw_id);
   } catch (e) {
     err("ensureAutopay erro:", e?.message || e);
