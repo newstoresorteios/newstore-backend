@@ -60,36 +60,38 @@ function makeUserCouponCode(userId) {
 }
 
 // Carrega usuário do DB (tolerante a colunas ausentes)
+// Substitua toda a hydrateUserFromDB por esta versão
 async function hydrateUserFromDB(id, email) {
   await ensureUserColumns();
 
-  // 1) tentativa “completa” (pode falhar com 42703 se faltar coluna)
   try {
     let r = null;
     if (id) {
       r = await query(
-        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
-           FROM users WHERE id=$1 LIMIT 1`, [id]
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents
+           FROM users WHERE id=$1 LIMIT 1`,
+        [id]
       );
     }
     if ((!r || !r.rows.length) && email) {
       r = await query(
-        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at
-           FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]
+        `SELECT id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents
+           FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+        [email]
       );
     }
     if (!r || !r.rows.length) return null;
 
     let u = r.rows[0];
 
-    // cria o coupon_code se ainda não existir (não mexe na Tray aqui)
+    // cria o coupon_code se ainda não existir
     if (!u.coupon_code) {
       const code = makeUserCouponCode(u.id);
       const upd = await query(
         `UPDATE users
             SET coupon_code=$2, coupon_updated_at=NOW()
           WHERE id=$1
-        RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at`,
+        RETURNING id, name, email, is_admin, coupon_code, coupon_updated_at, coupon_value_cents`,
         [u.id, code]
       );
       u = upd.rows[0];
@@ -102,10 +104,11 @@ async function hydrateUserFromDB(id, email) {
       role: u.is_admin ? 'admin' : 'user',
       coupon_code: u.coupon_code || null,
       coupon_updated_at: u.coupon_updated_at || null,
+      // ▼ campo que o AccountPage lê para "Valor acumulado"
+      coupon_value_cents: Number(u.coupon_value_cents || 0),
     };
-  } catch (e) {
-    // 2) fallback minimalista: só pega colunas “seguras”
-    // evita quebrar o /login com 42703
+  } catch {
+    // fallback minimalista
     const r = await query(
       `SELECT id, name, email
          FROM users
@@ -122,9 +125,11 @@ async function hydrateUserFromDB(id, email) {
       role: 'user',
       coupon_code: null,
       coupon_updated_at: null,
+      coupon_value_cents: 0,
     };
   }
 }
+
 
 // Busca usuário por e-mail cobrindo colunas/tabelas legadas
 async function findUserByEmail(emailRaw) {
