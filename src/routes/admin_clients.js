@@ -8,14 +8,13 @@ const router = Router();
 /**
  * GET /api/admin/clients/active
  * Lista clientes com saldo ativo.
- * Regra:
- *  - soma das compras aprovadas (amount_cents) + saldo manual do usuário (coupon_*_cents);
- *  - inclui também quem não tem compra recente mas possui saldo manual > 0;
- *  - mantém compatibilidade com bancos que usam `coupon_cents` ou `coupon_value_cents`.
+ * - Soma compras aprovadas (amount_cents) + saldo manual (coupon_value_cents / coupon_cents)
+ * - Retorna os campos separados e o total combinado
+ * - Inclui quem não tem compra recente, mas possui saldo manual > 0
  */
 router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
-  async function run(usingColumn /* "coupon_cents" | "coupon_value_cents" */) {
-    const col = usingColumn === "coupon_value_cents" ? "coupon_value_cents" : "coupon_cents";
+  // executa a mesma consulta variando o nome da coluna de saldo manual
+  async function run(col /* "coupon_value_cents" | "coupon_cents" */) {
     const r = await query(
       `
       WITH pays AS (
@@ -23,17 +22,15 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
           p.user_id,
           COUNT(*) FILTER (
             WHERE lower(trim(coalesce(p.status,''))) = 'approved'
-          ) AS compras,
+          )                                       AS compras,
           COALESCE(
             SUM(p.amount_cents) FILTER (
               WHERE lower(trim(coalesce(p.status,''))) = 'approved'
             ), 0
-          )::bigint AS total_cents,
-          MAX(
-            COALESCE(p.paid_at, p.created_at)
-          ) FILTER (
+          )::bigint                               AS purchases_total_cents,
+          MAX(COALESCE(p.paid_at, p.created_at)) FILTER (
             WHERE lower(trim(coalesce(p.status,''))) = 'approved'
-          ) AS last_buy
+          )                                       AS last_buy
         FROM public.payments p
         GROUP BY p.user_id
       ),
@@ -45,58 +42,77 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
       )
       SELECT
         u.id,
-        COALESCE(NULLIF(u.name,''), u.email, '-') AS name,
+        COALESCE(NULLIF(u.name,''), u.email, '-')                               AS name,
         u.email,
         u.created_at,
-        COALESCE(pa.compras, 0)                    AS compras,
-        -- total de compras + saldo manual em centavos
-        (COALESCE(pa.total_cents,0) + COALESCE(u.${col},0))::bigint AS total_cents,
+
+        COALESCE(pa.compras, 0)                                                 AS compras,
+        COALESCE(pa.purchases_total_cents, 0)::bigint                           AS purchases_total_cents,
+        COALESCE(u.${col}, 0)::bigint                                           AS coupon_value_cents,
+        (COALESCE(pa.purchases_total_cents, 0) + COALESCE(u.${col}, 0))::bigint AS total_with_coupon_cents,
+
         pa.last_buy,
-        COALESCE(w.wins, 0)                        AS wins,
+        COALESCE(w.wins, 0)                                                     AS wins,
+
         -- validade: se não houver compra, conta 6 meses a partir de agora
-        (COALESCE(pa.last_buy, NOW()) + INTERVAL '6 months')::date AS expires_at,
+        (COALESCE(pa.last_buy, NOW()) + INTERVAL '6 months')::date              AS expires_at,
         ((COALESCE(pa.last_buy, NOW()) + INTERVAL '6 months')::date - NOW()::date) AS days_to_expire,
-        NULLIF(TRIM(u.coupon_code), '')           AS coupon_code,
-        COALESCE(u.${col}, 0)::bigint             AS coupon_balance_cents
+
+        NULLIF(TRIM(u.coupon_code), '')                                         AS coupon_code
       FROM public.users u
       LEFT JOIN pays pa ON pa.user_id = u.id
       LEFT JOIN wins w  ON w.user_id = u.id
       WHERE
-        -- compra aprovada recente OU saldo manual positivo
-        (pa.last_buy >= NOW() - INTERVAL '6 months') OR (COALESCE(u.${col},0) > 0)
-      ORDER BY expires_at ASC, total_cents DESC
+        (pa.last_buy >= NOW() - INTERVAL '6 months')
+        OR (COALESCE(u.${col}, 0) > 0)
+      ORDER BY expires_at ASC, total_with_coupon_cents DESC
       `
     );
 
-    const items = (r.rows || []).map((row) => ({
-      user_id: row.id,
-      name: row.name,
-      email: row.email,
-      created_at: row.created_at,
-      purchases_count: Number(row.compras || 0),
-      // já vem somado (compras + saldo manual):
-      total_brl: Number(((row.total_cents || 0) / 100).toFixed(2)),
-      last_buy: row.last_buy,
-      wins: Number(row.wins || 0),
-      expires_at: row.expires_at,
-      days_to_expire: Math.max(0, Number(row.days_to_expire) || 0),
-      coupon_code: row.coupon_code || null,
-      // informativo (não usado no front, mas mantido):
-      coupon_cents: Number(row.coupon_balance_cents || 0),
-    }));
+    const items = (r.rows || []).map((row) => {
+      const purchases_total_cents = Number(row.purchases_total_cents || 0);
+      const coupon_value_cents    = Number(row.coupon_value_cents || 0);
+      const total_with_coupon     = Number(row.total_with_coupon_cents || 0);
+
+      return {
+        user_id: row.id,
+        name: row.name,
+        email: row.email,
+        created_at: row.created_at,
+
+        purchases_count: Number(row.compras || 0),
+
+        // valores em centavos (crus)
+        purchases_total_cents,
+        coupon_value_cents,
+        coupons_value_cents: coupon_value_cents, // alias opcional (com "s")
+        total_with_coupon_cents: total_with_coupon,
+
+        // e já em BRL para conveniência
+        purchases_total_brl: +(purchases_total_cents / 100).toFixed(2),
+        coupon_value_brl:    +(coupon_value_cents    / 100).toFixed(2),
+        total_brl:           +(total_with_coupon     / 100).toFixed(2),
+
+        last_buy: row.last_buy,
+        wins: Number(row.wins || 0),
+        expires_at: row.expires_at,
+        days_to_expire: Math.max(0, Number(row.days_to_expire) || 0),
+
+        coupon_code: row.coupon_code || null,
+      };
+    });
 
     return items;
   }
 
   try {
-    // 1ª tentativa: bases que possuem `coupon_cents`
+    // tenta com coupon_value_cents primeiro; se a coluna não existir, cai para coupon_cents
     try {
-      const items = await run("coupon_cents");
+      const items = await run("coupon_value_cents");
       return res.json({ clients: items });
     } catch (e1) {
-      if (e1?.code !== "42703") throw e1; // coluna não existe? tenta a alternativa
-      // 2ª tentativa: bases que usam `coupon_value_cents`
-      const items = await run("coupon_value_cents");
+      if (e1?.code !== "42703") throw e1; // coluna não existe
+      const items = await run("coupon_cents");
       return res.json({ clients: items });
     }
   } catch (e) {
@@ -107,8 +123,8 @@ router.get("/active", requireAuth, requireAdmin, async (_req, res) => {
 
 /**
  * GET /api/admin/clients/:userId/coupon
- * Lê da tabela public.users (campos: coupon_code + cents se existir).
- * Responde sempre 200 com { user_id, code, cents }.
+ * Sempre responde 200 com { user_id, code, cents }.
+ * Lê `coupon_value_cents`; se não existir, usa `coupon_cents`.
  */
 router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   const userId = Number(req.params.userId);
@@ -117,13 +133,13 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
   }
 
   try {
-    // tenta `coupon_cents`
+    // tenta coupon_value_cents
     try {
       const r = await query(
         `
         SELECT
-          NULLIF(TRIM(u.coupon_code), '')     AS code,
-          COALESCE(u.coupon_cents, 0)::bigint AS cents
+          NULLIF(TRIM(u.coupon_code), '')           AS code,
+          COALESCE(u.coupon_value_cents, 0)::bigint AS cents
         FROM public.users u
         WHERE u.id = $1
         LIMIT 1
@@ -135,12 +151,12 @@ router.get("/:userId/coupon", requireAuth, requireAdmin, async (req, res) => {
       return res.json({ user_id: userId, code: code || null, cents: Number(cents || 0) });
     } catch (e1) {
       if (e1?.code !== "42703") throw e1;
-      // fallback para `coupon_value_cents`
+      // fallback: coupon_cents
       const r2 = await query(
         `
         SELECT
-          NULLIF(TRIM(u.coupon_code), '')           AS code,
-          COALESCE(u.coupon_value_cents, 0)::bigint AS cents
+          NULLIF(TRIM(u.coupon_code), '')     AS code,
+          COALESCE(u.coupon_cents, 0)::bigint AS cents
         FROM public.users u
         WHERE u.id = $1
         LIMIT 1
