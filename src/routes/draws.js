@@ -25,82 +25,80 @@ async function requireAdmin(req, res, next) {
 }
 
 /* ------------------------------------------------------------------ *
- * Utils (robustas para seus esquemas atuais)
+ * PUBLIC: /api/draws — usado pelo front para pintar “Resultado”
+ * ------------------------------------------------------------------ */
+
+// GET /api/draws  -> { draws: [...], status_by_id: { 4:'closed', 8:'closed', ... } }
+router.get("/", async (_req, res) => {
+  try {
+    const r = await query(`
+      select
+        id,
+        status,
+        coalesce(opened_at, created_at) as opened_at,
+        closed_at,
+        realized_at,
+        winner_user_id
+      from public.draws
+      order by id asc
+    `);
+    const draws = r.rows || [];
+    const status_by_id = {};
+    for (const d of draws) status_by_id[d.id] = String(d.status || "").toLowerCase();
+    res.json({ draws, status_by_id });
+  } catch (e) {
+    console.error("[draws] list error:", e?.message || e);
+    res.status(500).json({ error: "list_failed" });
+  }
+});
+
+// GET /api/draws/:id -> um sorteio específico
+router.get("/:id(\\d+)", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const r = await query(
+      `select id, status,
+              coalesce(opened_at, created_at) as opened_at,
+              closed_at, realized_at, winner_user_id
+         from public.draws
+        where id = $1
+        limit 1`,
+      [id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: "not_found" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[draws] get error:", e?.message || e);
+    res.status(500).json({ error: "get_failed" });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Utils compartilhadas (mesmas da rota de autopay)
  * ------------------------------------------------------------------ */
 async function getTicketPriceCents(client) {
-  // 1) app_config (key/value)
   try {
-    const r = await client.query(
-      `select value
-         from public.app_config
-        where key in ('ticket_price_cents','price_cents')
-        order by updated_at desc
-        limit 1`
+    const r1 = await client.query(
+      `select value from public.kv_store where key in ('ticket_price_cents','price_cents') limit 1`
     );
-    if (r.rowCount) {
-      const v = Number(r.rows[0].value);
+    if (r1.rowCount) {
+      const v = Number(r1.rows[0].value);
       if (Number.isFinite(v) && v > 0) return v | 0;
     }
   } catch {}
-
-  // 2) kv_store (detecta variantes k/key e v/value)
   try {
-    const { rows: cols } = await client.query(
-      `select column_name
-         from information_schema.columns
-        where table_schema='public'
-          and table_name='kv_store'
-          and column_name in ('k','key','v','value')`
+    const r2 = await client.query(
+      `select price_cents from public.app_config order by id desc limit 1`
     );
-    const hasKey = cols.some(c => c.column_name === "key");
-    const hasK   = cols.some(c => c.column_name === "k");
-    const hasVal = cols.some(c => c.column_name === "value");
-    const hasV   = cols.some(c => c.column_name === "v");
-
-    if (hasKey && hasVal) {
-      const r = await client.query(
-        `select value
-           from public.kv_store
-          where key in ('ticket_price_cents','price_cents')
-          limit 1`
-      );
-      if (r.rowCount) {
-        const v = Number(r.rows[0].value);
-        if (Number.isFinite(v) && v > 0) return v | 0;
-      }
-    } else if (hasK && hasV) {
-      const r = await client.query(
-        `select v as value
-           from public.kv_store
-          where k in ('ticket_price_cents','price_cents')
-          limit 1`
-      );
-      if (r.rowCount) {
-        const v = Number(r.rows[0].value);
-        if (Number.isFinite(v) && v > 0) return v | 0;
-      }
-    }
-  } catch {}
-
-  // 3) legado: app_config.price_cents (se existir)
-  try {
-    const r = await client.query(
-      `select price_cents
-         from public.app_config
-     order by id desc
-        limit 1`
-    );
-    if (r.rowCount) {
-      const v = Number(r.rows[0].price_cents);
+    if (r2.rowCount) {
+      const v = Number(r2.rows[0].price_cents);
       if (Number.isFinite(v) && v > 0) return v | 0;
     }
   } catch {}
-
-  return 300; // fallback seguro
+  return 300;
 }
 
 async function isNumberFree(client, draw_id, n) {
-  // livre se NÃO está em payments aprovados e NÃO está em reservas ativas/pagas
   const q = `
     with
     p as (
@@ -113,7 +111,10 @@ async function isNumberFree(client, draw_id, n) {
       select 1 from public.reservations
        where draw_id=$1
          and lower(status) in ('active','pending','paid')
-         and $2 = any(numbers)
+         and (
+           $2 = any(numbers)
+           or n = $2
+         )
        limit 1
     )
     select
@@ -127,7 +128,6 @@ async function isNumberFree(client, draw_id, n) {
 /**
  * Executa a cobrança automática para todos os perfis ativos
  * e grava em payments/reservations quando aprovado.
- * Também marca os números como 'sold' na tabela numbers (quando existir).
  * Retorna: { results, price_cents }
  */
 async function runAutopayForDraw(client, draw_id) {
@@ -155,7 +155,6 @@ async function runAutopayForDraw(client, draw_id) {
       continue;
     }
 
-    // filtra apenas os números ainda livres
     const free = [];
     for (const n of wants) {
       // eslint-disable-next-line no-await-in-loop
@@ -169,7 +168,6 @@ async function runAutopayForDraw(client, draw_id) {
 
     const amount_cents = free.length * price_cents;
 
-    // cobra no cartão do Mercado Pago
     let charge;
     try {
       // eslint-disable-next-line no-await-in-loop
@@ -183,15 +181,12 @@ async function runAutopayForDraw(client, draw_id) {
         metadata: { user_id, draw_id, numbers: free },
       });
     } catch (e) {
-      const msg = String(e?.message || e || "");
-      const status = /security_code/i.test(msg) ? "skipped" : "error";
-      const error = /security_code/i.test(msg) ? "cvv_required" : "charge_failed";
       await client.query(
         `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
-         values ($1,$2,$3,$4,$5,$6)`,
-        [p.id, user_id, draw_id, free, status, error]
+         values ($1,$2,$3,$4,'error',$5)`,
+        [p.id, user_id, draw_id, free, String(e?.message || e)]
       );
-      results.push({ user_id, status, error });
+      results.push({ user_id, status: "error", error: "charge_failed" });
       continue;
     }
 
@@ -205,7 +200,6 @@ async function runAutopayForDraw(client, draw_id) {
       continue;
     }
 
-    // grava payment + reservation (status 'approved'/'paid')
     const pay = await client.query(
       `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
        values ($1,$2,$3::int2[],$4,'approved', now())
@@ -218,20 +212,6 @@ async function runAutopayForDraw(client, draw_id) {
        returning id`,
       [user_id, draw_id, free]
     );
-
-    // reflete no grid: numbers.status = 'sold', vincula reservation_id
-    try {
-      await client.query(
-        `update public.numbers n
-            set status = 'sold',
-                reservation_id = $1
-          where n.draw_id = $2
-            and n.n = any($3::int2[])`,
-        [resv.rows[0].id, draw_id, free]
-      );
-    } catch (_) {
-      // se a tabela numbers não existir/estiver vazia, apenas ignora
-    }
 
     await client.query(
       `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,payment_id,reservation_id)
@@ -255,10 +235,10 @@ async function runAutopayForDraw(client, draw_id) {
 }
 
 /* ------------------------------------------------------------------ *
- * LISTAGENS
+ * LISTAGENS ADMIN
  * ------------------------------------------------------------------ */
 
-/** GET /api/admin/draws/history */
+// GET /api/admin/draws/history
 router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
   try {
     const r = await query(`
@@ -269,11 +249,10 @@ router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
         d.closed_at,
         d.realized_at,
         round(
-          extract(epoch from (coalesce(d.closed_at, now()) - coalesce(d.opened_at, d.created_at)))
-          / 86400.0
+          extract(epoch from (coalesce(d.closed_at, now()) - coalesce(d.opened_at, d.created_at))) / 86400.0
         )::int as days_open,
         coalesce(d.winner_name, '-') as winner_name
-      from public.draws d
+      from draws d
       where d.status = 'closed' or d.closed_at is not null
       order by d.id desc
     `);
@@ -284,7 +263,7 @@ router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
-/** GET /api/admin/draws/:id/participants — somente pagos (reservations) */
+// GET /api/admin/draws/:id/participants
 router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
@@ -316,7 +295,7 @@ router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-/** Alias /players — somente pagos */
+// Alias /players
 router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
@@ -352,18 +331,13 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
  * ABERTURA + AUTOPAY
  * ------------------------------------------------------------------ */
 
-/**
- * POST /api/admin/draws/new
- * Abre um novo sorteio (status 'open'), popula 0..99 na tabela numbers
- * (se existir) e roda AutoPay imediatamente.
- */
+// POST /api/admin/draws/new
 router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   const pool = await getPool();
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // cria sorteio
     const d = await client.query(
       `insert into public.draws (status, opened_at, product_name, product_link)
        values ('open', now(), $1, $2)
@@ -372,21 +346,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     );
     const draw_id = d.rows[0].id;
 
-    // popula numbers 0..99 (ignora falha se tabela não existir)
-    try {
-      const tuples = Array.from({ length: 100 }, (_, i) => `(${draw_id}, ${i}, 'available', null)`);
-      await client.query(
-        `insert into public.numbers(draw_id, n, status, reservation_id) values ${tuples.join(",")}`
-      );
-    } catch {}
-
-    // roda AutoPay
     const { results, price_cents } = await runAutopayForDraw(client, draw_id);
-
-    // marca autopay_ran_at (se coluna existir)
-    try {
-      await client.query(`update public.draws set autopay_ran_at = now() where id=$1`, [draw_id]);
-    } catch {}
 
     await client.query("COMMIT");
     console.log("[admin/draws] novo draw id =", draw_id);
@@ -400,10 +360,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-/**
- * POST /api/admin/draws/:id/open
- * Garante que o sorteio esteja 'open' (ou reabre) e roda AutoPay.
- */
+// POST /api/admin/draws/:id/open
 router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
   const pool = await getPool();
   const client = await pool.connect();
@@ -419,16 +376,13 @@ router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
       `update public.draws
           set status='open',
               opened_at = coalesce(opened_at, now()),
-              autopay_ran_at = null
+              closed_at = null,
+              realized_at = null
         where id=$1`,
       [draw_id]
     );
 
     const { results, price_cents } = await runAutopayForDraw(client, draw_id);
-
-    try {
-      await client.query(`update public.draws set autopay_ran_at = now() where id=$1`, [draw_id]);
-    } catch {}
 
     await client.query("COMMIT");
     return res.json({ ok: true, draw_id, autopay: { results, price_cents } });
