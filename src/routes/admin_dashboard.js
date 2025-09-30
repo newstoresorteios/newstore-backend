@@ -3,6 +3,7 @@ import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents, setTicketPriceCents } from "../services/config.js";
+import { runAutopayForDraw, ensureAutopayForDraw } from "../services/autopayRunner.js";
 
 const router = Router();
 
@@ -60,6 +61,7 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
 /**
  * POST /api/admin/dashboard/new
  * Fecha sorteios 'open', cria um novo e popula 0..99 'available'
+ * Em seguida, DISPARA o Autopay oficial (services/autopayRunner.js)
  */
 router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
   try {
@@ -72,7 +74,8 @@ router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
     );
 
     const ins = await query(
-      `insert into draws(status, opened_at) values('open', now())
+      `insert into draws(status, opened_at, autopay_ran_at)
+       values('open', now(), null)
        returning id`
     );
     const newId = ins.rows[0].id;
@@ -84,7 +87,14 @@ router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
        values ${tuples.join(",")}`
     );
 
-    return res.json({ draw_id: newId, sold: 0, remaining: 100 });
+    // ⚠️ Dispara o runner OFICIAL -> gera logs [autopayRunner] no Render
+    const autopay = await runAutopayForDraw(newId);
+    if (!autopay?.ok) {
+      console.warn("[admin/dashboard] autopay_run_failed", autopay);
+      return res.status(500).json({ ok: false, draw_id: newId, autopay });
+    }
+
+    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: 100, autopay });
   } catch (e) {
     console.error("[admin/dashboard] /new error:", e);
     return res.status(500).json({ error: "new_draw_failed" });
@@ -92,7 +102,6 @@ router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /**
- * Rota canônica:
  * POST /api/admin/dashboard/price
  * Body: { price_cents }
  */
@@ -107,8 +116,7 @@ router.post("/price", requireAuth, requireAdmin, async (req, res) => {
 });
 
 /**
- * Alias opcional para compatibilidade:
- * POST /api/admin/dashboard/ticket-price
+ * Alias opcional: POST /api/admin/dashboard/ticket-price
  */
 router.post("/ticket-price", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -118,6 +126,18 @@ router.post("/ticket-price", requireAuth, requireAdmin, async (req, res) => {
     console.error("[admin/dashboard] /ticket-price error:", e);
     return res.status(400).json({ error: "invalid_price" });
   }
+});
+
+/**
+ * (Opcional para testes no painel)
+ * POST /api/admin/dashboard/run-autopay/:id?force=true
+ */
+router.post("/run-autopay/:id", requireAuth, requireAdmin, async (req, res) => {
+  const drawId = Number(req.params.id);
+  if (!Number.isFinite(drawId)) return res.status(400).json({ error: "invalid_draw_id" });
+  const force = String(req.query.force || "").toLowerCase() === "true";
+  const out = await ensureAutopayForDraw(drawId, { force });
+  return res.json(out);
 });
 
 export default router;
