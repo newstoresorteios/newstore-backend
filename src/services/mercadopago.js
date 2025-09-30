@@ -93,7 +93,6 @@ async function mpFetch(
   return json;
 }
 
-// Util: normaliza valor em reais com 2 casas
 function toBRL(amount_cents) {
   const cents = Math.max(0, Math.round(Number(amount_cents || 0)));
   return Number((cents / 100).toFixed(2));
@@ -157,11 +156,9 @@ export async function mpSaveCard({ customerId, card_token }) {
  * 2) Cria o payment com esse token
  * Retorna: { status, paymentId }
  *
- * OBS: Algumas contas exigem CVV para tokenizar cartão salvo.
- *      Se não for passado em `security_code`, tentamos usar
- *      MP_DEFAULT_SECURITY_CODE/MP_SECURITY_CODE do ambiente.
- *      Se mesmo assim não houver, lançamos `SECURITY_CODE_REQUIRED`
- *      ANTES de chamar a API (para o log ficar claro).
+ * OBS:
+ *  - NÃO armazenamos CVV. Tentamos sem CVV.
+ *  - Se a conta do MP exigir CVV, retornamos erro com code 'SECURITY_CODE_REQUIRED'.
  */
 export async function mpChargeCard({
   customerId,
@@ -169,39 +166,39 @@ export async function mpChargeCard({
   amount_cents,
   description,
   metadata,
-  security_code, // opcional
+  security_code, // opcional (se o caller tiver obtido no front nesta sessão)
 }) {
-  // Tenta obter CVV de fallback via env se não vier no argumento:
-  const fallbackCVV =
-    security_code ||
-    process.env.MP_DEFAULT_SECURITY_CODE ||
-    process.env.MP_SECURITY_CODE ||
-    undefined;
-
-  if (!fallbackCVV) {
-    // Evita chamada inútil à API e deixa o log explícito
-    const err = new Error("security_code_required");
-    err.code = "SECURITY_CODE_REQUIRED";
-    throw err;
-  }
-
-  // 1) token a partir do cartão salvo (sempre enviando o CVV disponível)
+  // 1) token a partir do cartão salvo
+  //    (se security_code vier, enviamos; senão, omitimos)
   let cardTok;
   try {
-    cardTok = await mpFetch("POST", "/v1/card_tokens", {
+    const tokenBody = {
       customer_id: customerId,
       card_id: cardId,
-      security_code: String(fallbackCVV),
-    });
+    };
+    if (security_code) tokenBody.security_code = String(security_code);
+
+    cardTok = await mpFetch("POST", "/v1/card_tokens", tokenBody);
   } catch (e) {
-    throw e; // mensagem já vem enriquecida pelo mpFetch
+    // Mapeia a exigência de CVV para um erro claro e tratável a montante
+    const raw =
+      e?.response?.cause?.map((c) => `${c?.code || ""}:${c?.description || ""}`)?.join("|") ||
+      e?.message ||
+      "";
+    const text = String(raw).toLowerCase();
+    if (text.includes("security_code") || text.includes("security_code_id")) {
+      const err = new Error("mp_requires_security_code");
+      err.code = "SECURITY_CODE_REQUIRED";
+      err.original = e;
+      throw err;
+    }
+    throw e;
   }
 
-  // 2) pagamento
+  // 2) pagamento (sem currency_id explícito para não conflitar com a conta)
   const amount = toBRL(amount_cents);
   const idempotencyKey = crypto.randomUUID();
 
-  // IMPORTANTE: Não enviar currency_id aqui.
   const pay = await mpFetch(
     "POST",
     "/v1/payments",
@@ -213,7 +210,7 @@ export async function mpChargeCard({
       payer: { type: "customer", id: customerId },
       metadata: metadata || {},
       statement_descriptor: process.env.MP_STATEMENT || undefined,
-      binary_mode: true, // evita pagamentos "pendentes" quando possível
+      binary_mode: true,
     },
     { "X-Idempotency-Key": idempotencyKey }
   );

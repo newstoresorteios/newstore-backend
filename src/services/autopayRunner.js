@@ -11,11 +11,10 @@ const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ?? "");
 const err  = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ?? "");
 
 /* ------------------------------------------------------- *
- * Preço do ticket — prioriza app_config (key/value).
- * Sem referenciar colunas inexistentes (evita 42703).
+ * Preço do ticket — compatível com seus schemas
  * ------------------------------------------------------- */
 async function getTicketPriceCents(client) {
-  // 1) app_config (key/value) – seu schema atual
+  // 1) app_config (key/value) – existe no seu banco
   try {
     const r = await client.query(
       `select value
@@ -30,7 +29,7 @@ async function getTicketPriceCents(client) {
     }
   } catch {}
 
-  // 2) kv_store (detecta se é key/value ou k/v)
+  // 2) kv_store – detecta esquema (k/v vs key/value)
   try {
     const { rows: cols } = await client.query(
       `select column_name
@@ -39,10 +38,10 @@ async function getTicketPriceCents(client) {
           and table_name='kv_store'
           and column_name in ('k','key','v','value')`
     );
-    const hasKey = cols.some(c => c.column_name === "key");
-    const hasK   = cols.some(c => c.column_name === "k");
-    const hasVal = cols.some(c => c.column_name === "value");
-    const hasV   = cols.some(c => c.column_name === "v");
+    const hasKey = cols.some(c => c.column_name === 'key');
+    const hasK   = cols.some(c => c.column_name === 'k');
+    const hasVal = cols.some(c => c.column_name === 'value');
+    const hasV   = cols.some(c => c.column_name === 'v');
 
     if (hasKey && hasVal) {
       const r = await client.query(
@@ -83,11 +82,11 @@ async function getTicketPriceCents(client) {
     }
   } catch {}
 
-  return 300; // fallback
+  return 300; // fallback seguro
 }
 
 /* ------------------------------------------------------- *
- * Número livre? (sem "n = $2" fora de escopo)
+ * Número livre?
  * ------------------------------------------------------- */
 async function isNumberFree(client, draw_id, n) {
   const t0 = Date.now();
@@ -142,39 +141,34 @@ export async function runAutopayForDraw(draw_id) {
     log("TX BEGIN");
 
     // 1) Validação + lock do sorteio
-    {
-      const t0 = Date.now();
-      log("SQL lock_draw -> start", { params: [draw_id] });
-      const d = await client.query(
-        `select id, status, autopay_ran_at
-           from public.draws
-          where id=$1
-          for update`,
-        [draw_id]
-      );
-      log("SQL lock_draw -> ok", { rows: d.rowCount, time: `${Date.now() - t0}ms` });
+    const d = await client.query(
+      `select id, status, autopay_ran_at
+         from public.draws
+        where id=$1
+        for update`,
+      [draw_id]
+    );
+    log("SQL lock_draw -> ok", { rows: d.rowCount });
 
-      if (!d.rowCount) {
-        await client.query("ROLLBACK");
-        warn("draw não encontrado", draw_id);
-        return { ok: false, error: "draw_not_found" };
-      }
-      const st = String(d.rows[0].status || "").toLowerCase();
-      if (!["open", "aberto"].includes(st)) {
-        await client.query("ROLLBACK");
-        warn("draw não está open", { draw_id, status: st });
-        return { ok: false, error: "draw_not_open" };
-      }
-      if (d.rows[0].autopay_ran_at) {
-        await client.query("ROLLBACK");
-        warn("autopay já processado para draw", draw_id);
-        return { ok: false, error: "autopay_already_ran" };
-      }
+    if (!d.rowCount) {
+      await client.query("ROLLBACK");
+      warn("draw não encontrado", draw_id);
+      return { ok: false, error: "draw_not_found" };
+    }
+    const st = String(d.rows[0].status || "").toLowerCase();
+    if (!["open", "aberto"].includes(st)) {
+      await client.query("ROLLBACK");
+      warn("draw não está open", { draw_id, status: st });
+      return { ok: false, error: "draw_not_open" };
+    }
+    if (d.rows[0].autopay_ran_at) {
+      await client.query("ROLLBACK");
+      warn("autopay já processado para draw", draw_id);
+      return { ok: false, error: "autopay_already_ran" };
     }
 
     // 2) Perfis elegíveis
-    const t0Pf = Date.now();
-    const { rows: pf } = await client.query(
+    const { rows: profiles } = await client.query(
       `select ap.*,
               array(select n
                       from public.autopay_numbers an
@@ -185,7 +179,7 @@ export async function runAutopayForDraw(draw_id) {
           and ap.mp_customer_id is not null
           and ap.mp_card_id is not null`
     );
-    log("SQL eligible_profiles -> ok", { rows: pf.length, time: `${Date.now() - t0Pf}ms` });
+    log("eligible profiles", { count: profiles.length });
 
     // 3) Preço
     const price_cents = await getTicketPriceCents(client);
@@ -193,7 +187,7 @@ export async function runAutopayForDraw(draw_id) {
     const results = [];
 
     // 4) Loop usuários
-    for (const p of pf) {
+    for (const p of profiles) {
       const user_id = p.user_id;
       const wants = (p.numbers || []).map(Number).filter(n => n >= 0 && n <= 99);
       log("USER begin", { user_id, wants });
@@ -218,7 +212,7 @@ export async function runAutopayForDraw(draw_id) {
 
       const amount_cents = free.length * price_cents;
 
-      // 5) Cobrança Mercado Pago
+      // 5) Cobrança Mercado Pago (sem CVV; se exigir, marcamos SECURITY_CODE_REQUIRED)
       let charge;
       try {
         // eslint-disable-next-line no-await-in-loop
@@ -228,24 +222,35 @@ export async function runAutopayForDraw(draw_id) {
           amount_cents,
           description: `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`,
           metadata: { user_id, draw_id, numbers: free },
+          // security_code: undefined  // não armazenamos CVV
         });
         log("MP charge ->", { user_id, status: charge?.status, id: charge?.paymentId });
       } catch (e) {
+        const emsg = String(e?.message || e);
+        const requiresCVV =
+          e?.code === "SECURITY_CODE_REQUIRED" ||
+          emsg.toLowerCase().includes("security_code");
+
         await client.query(
-          `insert into public.autopay_runs
-             (autopay_id,user_id,draw_id,tried_numbers,status,error)
+          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
            values ($1,$2,$3,$4,'error',$5)`,
-          [p.id, user_id, draw_id, free, String(e?.message || e)]
+          [p.id, user_id, draw_id, free, requiresCVV ? "security_code_required" : emsg]
         );
-        err("falha ao cobrar MP", { user_id, msg: e?.message });
+
+        if (requiresCVV) {
+          warn("MP exige CVV para este cartão — perfil será ignorado", { user_id, draw_id });
+          results.push({ user_id, status: "skipped", reason: "security_code_required" });
+          continue;
+        }
+
+        err("falha ao cobrar MP", { user_id, msg: emsg });
         results.push({ user_id, status: "error", error: "charge_failed" });
         continue;
       }
 
       if (!charge || String(charge.status).toLowerCase() !== "approved") {
         await client.query(
-          `insert into public.autopay_runs
-             (autopay_id,user_id,draw_id,tried_numbers,status,error)
+          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
            values ($1,$2,$3,$4,'error','not_approved')`,
           [p.id, user_id, draw_id, free]
         );
@@ -270,7 +275,7 @@ export async function runAutopayForDraw(draw_id) {
       );
       const resv_id = reservation.rows[0].id;
 
-      // 7) Atualiza numbers (sold) para refletir no grid
+      // 7) Atualiza números vendidos
       await client.query(
         `update public.numbers n
             set status = 'sold',
@@ -280,7 +285,7 @@ export async function runAutopayForDraw(draw_id) {
         [resv_id, draw_id, free]
       );
 
-      // 8) Audita em autopay_runs
+      // 8) Audita
       await client.query(
         `insert into public.autopay_runs
            (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,payment_id,reservation_id)
@@ -320,7 +325,7 @@ export async function runAutopayForDraw(draw_id) {
 }
 
 /* ------------------------------------------------------- *
- * Em lote e idempotente
+ * Em lote
  * ------------------------------------------------------- */
 export async function runAutopayForOpenDraws({ force = false, limit = 50 } = {}) {
   const pool = await getPool();
@@ -360,6 +365,9 @@ export async function runAutopayForOpenDraws({ force = false, limit = 50 } = {})
   }
 }
 
+/* ------------------------------------------------------- *
+ * Idempotente p/ um sorteio
+ * ------------------------------------------------------- */
 export async function ensureAutopayForDraw(draw_id, { force = false } = {}) {
   const pool = await getPool();
   const client = await pool.connect();
