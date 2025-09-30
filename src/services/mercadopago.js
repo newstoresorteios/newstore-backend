@@ -43,6 +43,7 @@ async function mpFetch(
       headers: {
         Authorization: `Bearer ${getAccessToken()}`,
         "Content-Type": "application/json",
+        Accept: "application/json",
         "User-Agent": "newstore-autopay/1.0",
         ...extraHeaders,
       },
@@ -67,12 +68,15 @@ async function mpFetch(
   }
 
   if (!res.ok) {
+    const cause =
+      Array.isArray(json?.cause) && json.cause.length
+        ? `: ${json.cause.map(c => c?.description || c?.message).filter(Boolean).join(" | ")}`
+        : "";
     const msg =
       json?.message ||
       json?.error?.message ||
       json?.error ||
-      (Array.isArray(json?.cause) && json.cause[0]?.description) ||
-      `${method} ${path} falhou (${res.status})`;
+      `MercadoPago ${method} ${path} falhou (${res.status})${cause}`;
     const err = new Error(msg);
     err.status = res.status;
     err.response = json;
@@ -164,6 +168,7 @@ export async function mpChargeCard({
 
   const idempotencyKey = crypto.randomUUID();
 
+  // IMPORTANTE: NÃO enviar "currency_id" aqui; com token de cartão o MP rejeita esse campo.
   const pay = await mpFetch(
     "POST",
     "/v1/payments",
@@ -174,7 +179,6 @@ export async function mpChargeCard({
       installments: 1,
       payer: { type: "customer", id: customerId },
       metadata: metadata || {},
-      currency_id: "BRL",
       statement_descriptor: process.env.MP_STATEMENT || undefined,
       binary_mode: true, // evita pagamentos "pendentes" quando possível
     },
