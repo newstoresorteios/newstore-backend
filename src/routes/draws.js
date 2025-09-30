@@ -28,10 +28,15 @@ async function requireAdmin(req, res, next) {
  * PUBLIC: /api/draws — usado pelo front para pintar “Resultado”
  * ------------------------------------------------------------------ */
 
-// GET /api/draws  -> { draws: [...], status_by_id: { 4:'closed', 8:'closed', ... } }
-router.get("/", async (_req, res) => {
+// GET /api/draws
+// - Sem filtro: retorna todos
+// - ?status=closed -> somente fechados/sorteados
+// - ?status=open   -> somente abertos
+router.get("/", async (req, res) => {
   try {
-    const r = await query(`
+    const qStatus = String(req.query.status || "").toLowerCase().trim();
+
+    let sql = `
       select
         id,
         status,
@@ -40,8 +45,31 @@ router.get("/", async (_req, res) => {
         realized_at,
         winner_user_id
       from public.draws
-      order by id asc
-    `);
+    `;
+    const params = [];
+
+    if (qStatus === "closed" || qStatus === "fechado" || qStatus === "sorteado") {
+      // somente “realizados”
+      sql += `
+        where (
+          lower(coalesce(status,'')) in ('closed','fechado','sorteado')
+          or closed_at is not null
+          or realized_at is not null
+        )
+        order by id desc
+      `;
+    } else if (qStatus === "open" || qStatus === "aberto") {
+      // somente abertos
+      sql += `
+        where lower(coalesce(status,'')) in ('open','aberto')
+        order by id asc
+      `;
+    } else {
+      // todos
+      sql += ` order by id asc `;
+    }
+
+    const r = await query(sql, params);
     const draws = r.rows || [];
     const status_by_id = {};
     for (const d of draws) status_by_id[d.id] = String(d.status || "").toLowerCase();
@@ -284,7 +312,7 @@ router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
-        and lower(coalesce(r.status,'')) = 'paid'
+        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
@@ -316,11 +344,11 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
       left join users u on u.id = r.user_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
-        and lower(coalesce(r.status,'')) = 'paid'
+        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
-    res.json({ draw_id: DrawId, participants: r.rows || [] });
+    res.json({ draw_id: drawId, participants: r.rows || [] });
   } catch (e) {
     console.error("[admin/draws/:id/players] error", e);
     res.status(500).json({ error: "participants_failed" });
