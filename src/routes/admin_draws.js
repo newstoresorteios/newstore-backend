@@ -22,17 +22,8 @@ async function requireAdmin(req, res, next) {
 }
 
 /* ------------------------------------------------------------------ *
- * ADMIN: criar sorteio + rodar Autopay (opção B)
+ * ADMIN: criar sorteio + rodar Autopay
  * ------------------------------------------------------------------ */
-/**
- * POST /api/admin/draws/new
- * body: { product_name?, product_link? }
- *
- * - Cria um novo sorteio status=open
- * - Preenche product_name/product_link se enviados
- * - Reseta autopay_ran_at
- * - Dispara a cobrança automática (Autopay) imediatamente
- */
 router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   try {
     const product_name = String(req.body?.product_name || "").slice(0, 255) || null;
@@ -44,18 +35,13 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
        returning id, status, product_name, product_link`,
       [product_name, product_link]
     );
-
-    if (!ins.rowCount) {
-      return res.status(500).json({ error: "create_failed" });
-    }
+    if (!ins.rowCount) return res.status(500).json({ error: "create_failed" });
 
     const draw = ins.rows[0];
     console.log("[admin/draws/new] novo draw id =", draw.id);
 
-    // dispara o autopay e retorna o resultado junto
     const result = await runAutopayForDraw(draw.id);
     if (!result?.ok) {
-      // ainda assim retornamos o draw criado; frontend pode re-tentar manualmente
       return res.status(500).json({
         error: "autopay_run_failed",
         draw_id: draw.id,
@@ -63,13 +49,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
         autopay: result || null,
       });
     }
-
-    return res.json({
-      ok: true,
-      draw_id: draw.id,
-      draw,
-      autopay: result,
-    });
+    return res.json({ ok: true, draw_id: draw.id, draw, autopay: result });
   } catch (e) {
     console.error("[admin/draws/new] error", e);
     return res.status(500).json({ error: "create_failed" });
@@ -77,7 +57,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ *
- * Listagem de histórico (fechados)
+ * Histórico (fechados)
  * ------------------------------------------------------------------ */
 router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
   try {
@@ -88,10 +68,7 @@ router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
         coalesce(d.opened_at, d.created_at) as opened_at,
         d.closed_at,
         d.realized_at,
-        round(
-          extract(epoch from (coalesce(d.closed_at, now()) - coalesce(d.opened_at, d.created_at)))
-          / 86400.0
-        )::int as days_open,
+        round(extract(epoch from (coalesce(d.closed_at, now()) - coalesce(d.opened_at, d.created_at))) / 86400.0)::int as days_open,
         coalesce(d.winner_name, '-') as winner_name
       from draws d
       where d.status = 'closed' or d.closed_at is not null
@@ -105,7 +82,7 @@ router.get("/history", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /* ------------------------------------------------------------------ *
- * Participantes (apenas pagos) via reservations
+ * Participantes pagos (reservations)
  * ------------------------------------------------------------------ */
 router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -137,7 +114,7 @@ router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-/** Alias /players — apenas pagos */
+/* Alias /players */
 router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
   try {
     const drawId = Number(req.params.id);
@@ -169,7 +146,7 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ *
- * Abrir sorteio + rodar Autopay
+ * Reabrir + rodar Autopay
  * ------------------------------------------------------------------ */
 router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
   const drawId = Number(req.params.id);
@@ -193,7 +170,6 @@ router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
     return res.status(500).json({ error: "open_failed" });
   }
 
-  // dispara o autopay e retorna o resultado
   const result = await runAutopayForDraw(drawId);
   if (!result?.ok) return res.status(500).json(result);
   return res.json(result);
