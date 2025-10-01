@@ -22,7 +22,7 @@ function fmtDate(d) {
   return `${y}-${m}-${day}`;
 }
 
-// ---------- utils ----------
+// ---------- helpers de schema/tempo ----------
 
 async function ensureUserColumns() {
   try {
@@ -41,9 +41,7 @@ async function hasColumn(table, column, schema = "public") {
   const { rows } = await query(
     `SELECT 1
        FROM information_schema.columns
-      WHERE table_schema = $1
-        AND table_name   = $2
-        AND column_name  = $3
+      WHERE table_schema=$1 AND table_name=$2 AND column_name=$3
       LIMIT 1`,
     [schema, table, column]
   );
@@ -55,144 +53,116 @@ async function buildTimeExpr() {
   if (await hasColumn("payments", "paid_at")) parts.push("COALESCE(paid_at, to_timestamp(0))");
   if (await hasColumn("payments", "approved_at")) parts.push("COALESCE(approved_at, to_timestamp(0))");
   if (await hasColumn("payments", "updated_at")) parts.push("COALESCE(updated_at, to_timestamp(0))");
-  // sempre deixa created_at como fallback
+  // sempre fica com created_at de fallback
   parts.push("COALESCE(created_at, to_timestamp(0))");
   const uniq = Array.from(new Set(parts));
   return uniq.length === 1 ? uniq[0] : `GREATEST(${uniq.join(", ")})`;
-}
-
-/**
- * Delta por timestamp (quando existe paid_at/approved_at/updated_at)
- */
-async function computeServerDeltaByTime(userId, lastSync) {
-  const tExpr = await buildTimeExpr();
-  const sql = `
-    WITH recent AS (
-      SELECT COALESCE(amount_cents,0)::int AS cents,
-             ${tExpr} AS t
-        FROM payments
-       WHERE user_id = $1
-         AND lower(status) IN ('approved','paid','pago')
-         AND ( $2::timestamptz IS NULL OR ${tExpr} > $2::timestamptz )
-    )
-    SELECT COALESCE(SUM(cents),0)::int AS delta_cents,
-           NULLIF(MAX(t), to_timestamp(0)) AS max_t
-      FROM recent
-  `;
-  const { rows } = await query(sql, [userId, lastSync || null]);
-  return {
-    delta_cents: rows?.[0]?.delta_cents ?? 0,
-    max_t: rows?.[0]?.max_t || null,
-  };
-}
-
-/**
- * Delta por diferença total (fallback quando NÃO existem colunas de carimbo
- * que indiquem o momento da aprovação).
- */
-async function computeServerDeltaByDiff(userId, currentCouponCents) {
-  const { rows } = await query(
-    `SELECT COALESCE(SUM(amount_cents),0)::int AS total
-       FROM payments
-      WHERE user_id = $1
-        AND lower(status) IN ('approved','paid','pago')`,
-    [userId]
-  );
-  const total = rows?.[0]?.total ?? 0;
-  const delta = Math.max(0, total - (Number(currentCouponCents) || 0));
-  return {
-    delta_cents: delta,
-    // no fallback não temos "quando aprovou", então usamos NOW()
-    max_t: delta > 0 ? new Date().toISOString() : null,
-    total_cents: total,
-  };
-}
-
-/**
- * Escolhe a estratégia de delta:
- *  - se existir pelo menos uma entre paid_at/approved_at/updated_at → usa tempo;
- *  - senão → usa diferença total.
- */
-async function computeDeltaSmart(userId, lastSync, currentCouponCents) {
-  const hasPaid = await hasColumn("payments", "paid_at");
-  const hasApproved = await hasColumn("payments", "approved_at");
-  const hasUpdated = await hasColumn("payments", "updated_at");
-  if (hasPaid || hasApproved || hasUpdated) {
-    return computeServerDeltaByTime(userId, lastSync);
-  }
-  return computeServerDeltaByDiff(userId, currentCouponCents);
 }
 
 // ---------- rotas ----------
 
 /**
  * POST /api/coupons/sync
+ * Idempotente e à prova de corrida.
  */
 router.post("/sync", requireAuth, async (req, res) => {
   const rid = Math.random().toString(36).slice(2, 8);
+  const uid = req.user.id;
   try {
     await ensureUserColumns();
 
-    const uid = req.user.id;
-
-    // estado atual
-    const uQ = await query(
+    // estado atual mínimo (fora da transação, só para saber tray/code)
+    const curQ = await query(
       `SELECT id,
               COALESCE(coupon_value_cents,0)::int AS coupon_value_cents,
               coupon_code,
               tray_coupon_id,
               last_payment_sync_at
          FROM users
-        WHERE id = $1
+        WHERE id=$1
         LIMIT 1`,
       [uid]
     );
-    if (!uQ.rows.length) return res.status(404).json({ error: "user_not_found" });
-    const cur = uQ.rows[0];
+    if (!curQ.rows.length) return res.status(404).json({ error: "user_not_found" });
+    let cur = curQ.rows[0];
 
-    // calcula delta de forma inteligente (tempo ou diferença)
-    const { delta_cents, max_t, total_cents } =
-      await computeDeltaSmart(uid, cur.last_payment_sync_at, cur.coupon_value_cents);
+    const code = (cur.coupon_code && String(cur.coupon_code).trim()) || codeForUser(uid);
+    let trayId = cur.tray_coupon_id || null;
 
-    console.log(
-      `[coupons.sync#${rid}] user=${uid} lastSync=${cur.last_payment_sync_at || null} ` +
-      `coupon=${cur.coupon_value_cents} delta=${delta_cents} ` +
-      (total_cents != null ? `total=${total_cents} ` : "") +
-      `maxT=${max_t || null}`
+    const tExpr = await buildTimeExpr();
+
+    // === Transação com lock para evitar duplicidade de incremento ===
+    await query("BEGIN");
+
+    // CTE: pega last_sync com FOR UPDATE, computa delta “recent” usando esse last_sync,
+    // aplica update apenas se delta > 0 e devolve delta/new_sync/final_cents.
+    const sql = `
+      WITH me AS (
+        SELECT id, COALESCE(last_payment_sync_at, to_timestamp(0)) AS last_sync
+          FROM users
+         WHERE id = $1
+         FOR UPDATE
+      ),
+      recent AS (
+        SELECT COALESCE(SUM(p.amount_cents),0)::int AS delta,
+               NULLIF(MAX(${tExpr}), to_timestamp(0)) AS max_t
+          FROM payments p, me
+         WHERE p.user_id = $1
+           AND lower(p.status) IN ('approved','paid','pago')
+           AND (${tExpr}) > me.last_sync
+      ),
+      upd AS (
+        UPDATE users u
+           SET coupon_value_cents   = u.coupon_value_cents + r.delta,
+               last_payment_sync_at = COALESCE(r.max_t, u.last_payment_sync_at),
+               coupon_code          = COALESCE(u.coupon_code, $2),
+               coupon_updated_at    = NOW()
+          FROM recent r
+         WHERE u.id = $1
+           AND r.delta > 0
+        RETURNING u.coupon_value_cents AS final_cents,
+                  r.delta AS delta_cents,
+                  COALESCE(r.max_t, u.last_payment_sync_at) AS new_sync
+      )
+      SELECT
+        COALESCE((SELECT delta_cents FROM upd), 0) AS delta_cents,
+        (SELECT new_sync FROM upd) AS new_sync,
+        (SELECT coupon_value_cents FROM users WHERE id=$1) AS final_cents;
+    `;
+    const { rows } = await query(sql, [uid, code]);
+    await query("COMMIT");
+
+    const delta = rows?.[0]?.delta_cents || 0;
+    let finalCents = rows?.[0]?.final_cents ?? cur.coupon_value_cents;
+    const newSync = rows?.[0]?.new_sync || cur.last_payment_sync_at;
+
+    console.log(`[coupons.sync#${rid}] user=${uid} lastSync=${cur.last_payment_sync_at || null} delta=${delta} newSync=${newSync} coupon_after=${finalCents}`);
+
+    // Fallback adicional: se por ausência de colunas de tempo algum aprovado ficou “antes” do last_sync,
+    // garante que nunca fique para trás comparando com o total aprovado.
+    const totalQ = await query(
+      `SELECT COALESCE(SUM(amount_cents),0)::int AS total
+         FROM payments
+        WHERE user_id=$1 AND lower(status) IN ('approved','paid','pago')`,
+      [uid]
     );
-
-    let newCents = cur.coupon_value_cents;
-    let trayId   = cur.tray_coupon_id || null;
-    let code     = (cur.coupon_code && String(cur.coupon_code).trim()) || codeForUser(uid);
-
-    if (delta_cents > 0 && max_t) {
-      const upd = await query(
+    const totalApproved = totalQ.rows?.[0]?.total || 0;
+    if (totalApproved > finalCents) {
+      await query(
         `UPDATE users
-            SET coupon_value_cents   = COALESCE(coupon_value_cents,0) + $3,
-                coupon_updated_at    = NOW(),
-                last_payment_sync_at = $4,
-                coupon_code          = COALESCE(coupon_code, $2)
-          WHERE id = $1
-        RETURNING COALESCE(coupon_value_cents,0)::int AS coupon_value_cents,
-                  tray_coupon_id,
-                  coupon_code,
-                  last_payment_sync_at`,
-        [uid, code, delta_cents, max_t]
+            SET coupon_value_cents = $2,
+                coupon_updated_at  = NOW(),
+                coupon_code        = COALESCE(coupon_code, $3),
+                last_payment_sync_at = COALESCE($4, last_payment_sync_at)
+          WHERE id=$1`,
+        [uid, totalApproved, code, newSync]
       );
-      newCents = upd.rows[0].coupon_value_cents;
-      trayId   = upd.rows[0].tray_coupon_id || null;
-      code     = upd.rows[0].coupon_code || code;
-      console.log(`[coupons.sync#${rid}] increment applied: +${delta_cents} => ${newCents}`);
-    } else {
-      // se não há delta mas não existe código, garante o code
-      if (!cur.coupon_code) {
-        await query(`UPDATE users SET coupon_code=$2 WHERE id=$1`, [uid, code]);
-      }
-      console.log(`[coupons.sync#${rid}] no increment`);
+      finalCents = totalApproved;
+      console.log(`[coupons.sync#${rid}] corrected up to total=${totalApproved}`);
     }
 
-    // Recria cupom na Tray somente quando valor mudou OU não existir ainda
-    const mustRecreateTray = !trayId || newCents !== cur.coupon_value_cents;
+    // Recria cupom na Tray apenas se mudou o valor ou não existe ainda
+    const mustRecreateTray = !trayId || finalCents !== cur.coupon_value_cents;
     if (mustRecreateTray) {
       if (trayId) {
         try {
@@ -203,38 +173,43 @@ router.post("/sync", requireAuth, async (req, res) => {
         }
       }
       const startsAt = fmtDate(new Date());
-      const endsAt   = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
-      console.log(`[coupons.sync#${rid}] creating Tray coupon`, {
-        code, value: newCents / 100, startsAt, endsAt
-      });
-      const created = await trayCreateCoupon({
-        code,
-        value: newCents / 100,
-        startsAt,
-        endsAt,
-        description: `Crédito do cliente ${uid} - New Store`,
-      });
-      trayId = String(created.id);
-      await query(
-        `UPDATE users
-            SET tray_coupon_id = $2,
-                coupon_updated_at = NOW()
-          WHERE id=$1`,
-        [uid, trayId]
-      );
+      const endsAt = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
+      console.log(`[coupons.sync#${rid}] creating Tray coupon`, { code, value: finalCents / 100, startsAt, endsAt });
+      try {
+        const created = await trayCreateCoupon({
+          code,
+          value: finalCents / 100,
+          startsAt,
+          endsAt,
+          description: `Crédito do cliente ${uid} - New Store`,
+        });
+        trayId = String(created.id);
+        await query(
+          `UPDATE users
+              SET tray_coupon_id = $2,
+                  coupon_updated_at = NOW()
+            WHERE id = $1`,
+          [uid, trayId]
+        );
+      } catch (e) {
+        // ok: mantemos valor no banco mesmo que a Tray falhe
+        console.warn(`[coupons.sync#${rid}] tray create warn:`, e?.message || e);
+      }
     }
 
     return res.json({
       ok: true,
       code,
-      value: newCents / 100,
-      cents: newCents,
+      value: finalCents / 100,
+      cents: finalCents,
       id: trayId,
       synced: mustRecreateTray,
-      last_payment_sync_at: cur.last_payment_sync_at || null,
+      last_payment_sync_at: newSync || null,
     });
   } catch (e) {
-    console.error(`[coupons.sync] error:`, e?.message || e);
+    try { await query("ROLLBACK"); } catch {}
+    console.error(`[coupons.sync#${rid}] error:`, e?.message || e);
+    // Valor já pode ter sido ajustado dentro da transação; mantém UI funcional.
     return res.status(200).json({ ok: false, error: "sync_failed" });
   }
 });
