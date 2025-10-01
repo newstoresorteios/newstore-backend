@@ -11,8 +11,7 @@ function codeForUser(userId) {
   const id = Number(userId || 0);
   const base = `NSU-${String(id).padStart(4, "0")}`;
   const salt = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const tail =
-    salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
+  const tail = salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
   return `${base}-${tail}`;
 }
 
@@ -23,99 +22,191 @@ function fmtDate(d) {
   return `${y}-${m}-${day}`;
 }
 
+// ---------- utils ----------
+
+async function ensureUserColumns() {
+  try {
+    await query(`
+      ALTER TABLE IF EXISTS users
+        ADD COLUMN IF NOT EXISTS coupon_code text,
+        ADD COLUMN IF NOT EXISTS tray_coupon_id text,
+        ADD COLUMN IF NOT EXISTS coupon_value_cents int4 DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS coupon_updated_at timestamptz,
+        ADD COLUMN IF NOT EXISTS last_payment_sync_at timestamptz
+    `);
+  } catch {}
+}
+
+async function hasColumn(table, column, schema = "public") {
+  const { rows } = await query(
+    `SELECT 1
+       FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name   = $2
+        AND column_name  = $3
+      LIMIT 1`,
+    [schema, table, column]
+  );
+  return !!rows.length;
+}
+
+async function buildTimeExpr() {
+  const parts = [];
+  if (await hasColumn("payments", "paid_at")) parts.push("COALESCE(paid_at, to_timestamp(0))");
+  if (await hasColumn("payments", "approved_at")) parts.push("COALESCE(approved_at, to_timestamp(0))");
+  if (await hasColumn("payments", "updated_at")) parts.push("COALESCE(updated_at, to_timestamp(0))");
+  // sempre deixa created_at como fallback
+  parts.push("COALESCE(created_at, to_timestamp(0))");
+  const uniq = Array.from(new Set(parts));
+  return uniq.length === 1 ? uniq[0] : `GREATEST(${uniq.join(", ")})`;
+}
+
+/**
+ * Delta por timestamp (quando existe paid_at/approved_at/updated_at)
+ */
+async function computeServerDeltaByTime(userId, lastSync) {
+  const tExpr = await buildTimeExpr();
+  const sql = `
+    WITH recent AS (
+      SELECT COALESCE(amount_cents,0)::int AS cents,
+             ${tExpr} AS t
+        FROM payments
+       WHERE user_id = $1
+         AND lower(status) IN ('approved','paid','pago')
+         AND ( $2::timestamptz IS NULL OR ${tExpr} > $2::timestamptz )
+    )
+    SELECT COALESCE(SUM(cents),0)::int AS delta_cents,
+           NULLIF(MAX(t), to_timestamp(0)) AS max_t
+      FROM recent
+  `;
+  const { rows } = await query(sql, [userId, lastSync || null]);
+  return {
+    delta_cents: rows?.[0]?.delta_cents ?? 0,
+    max_t: rows?.[0]?.max_t || null,
+  };
+}
+
+/**
+ * Delta por diferença total (fallback quando NÃO existem colunas de carimbo
+ * que indiquem o momento da aprovação).
+ */
+async function computeServerDeltaByDiff(userId, currentCouponCents) {
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(amount_cents),0)::int AS total
+       FROM payments
+      WHERE user_id = $1
+        AND lower(status) IN ('approved','paid','pago')`,
+    [userId]
+  );
+  const total = rows?.[0]?.total ?? 0;
+  const delta = Math.max(0, total - (Number(currentCouponCents) || 0));
+  return {
+    delta_cents: delta,
+    // no fallback não temos "quando aprovou", então usamos NOW()
+    max_t: delta > 0 ? new Date().toISOString() : null,
+    total_cents: total,
+  };
+}
+
+/**
+ * Escolhe a estratégia de delta:
+ *  - se existir pelo menos uma entre paid_at/approved_at/updated_at → usa tempo;
+ *  - senão → usa diferença total.
+ */
+async function computeDeltaSmart(userId, lastSync, currentCouponCents) {
+  const hasPaid = await hasColumn("payments", "paid_at");
+  const hasApproved = await hasColumn("payments", "approved_at");
+  const hasUpdated = await hasColumn("payments", "updated_at");
+  if (hasPaid || hasApproved || hasUpdated) {
+    return computeServerDeltaByTime(userId, lastSync);
+  }
+  return computeServerDeltaByDiff(userId, currentCouponCents);
+}
+
+// ---------- rotas ----------
+
 /**
  * POST /api/coupons/sync
- * Fluxo novo: recebe um delta (add_cents) e SOMA ao valor atual do usuário.
- * Não recalcula mais a partir de payments para evitar sobrescrita.
  */
 router.post("/sync", requireAuth, async (req, res) => {
-  const rid = Math.random().toString(36).slice(2, 8); // id para logs
-
+  const rid = Math.random().toString(36).slice(2, 8);
   try {
+    await ensureUserColumns();
+
     const uid = req.user.id;
 
-    // aceita add_cents / addCents e carimbo de sincronização do front
-    const addRaw =
-      req.body?.add_cents ??
-      req.body?.addCents ??
-      0;
-
-    // inteiro não-negativo
-    const addCents = Number.isFinite(Number(addRaw)) ? Math.max(0, parseInt(addRaw, 10)) : 0;
-
-    const lastSyncAtRaw =
-      req.body?.last_payment_sync_at ??
-      req.body?.lastPaymentSyncAt ??
-      null;
-
-    const lastSyncAt = lastSyncAtRaw && !Number.isNaN(Date.parse(lastSyncAtRaw))
-      ? new Date(lastSyncAtRaw)
-      : new Date();
-
-    console.log(`[coupons.sync#${rid}] start user=${uid} add_cents=${addCents}`);
-
-    // 1) estado atual do usuário
-    const u = await query(
-      `select id, email, coupon_code, tray_coupon_id,
-              coalesce(coupon_value_cents,0)::int as coupon_value_cents
-         from users
-        where id = $1
-        limit 1`,
+    // estado atual
+    const uQ = await query(
+      `SELECT id,
+              COALESCE(coupon_value_cents,0)::int AS coupon_value_cents,
+              coupon_code,
+              tray_coupon_id,
+              last_payment_sync_at
+         FROM users
+        WHERE id = $1
+        LIMIT 1`,
       [uid]
     );
-    if (!u.rows.length) {
-      console.error(`[coupons.sync#${rid}] user_not_found`);
-      return res.status(404).json({ error: "user_not_found" });
-    }
-    let cur = u.rows[0];
+    if (!uQ.rows.length) return res.status(404).json({ error: "user_not_found" });
+    const cur = uQ.rows[0];
 
-    // 2) soma o delta (se houver)
+    // calcula delta de forma inteligente (tempo ou diferença)
+    const { delta_cents, max_t, total_cents } =
+      await computeDeltaSmart(uid, cur.last_payment_sync_at, cur.coupon_value_cents);
+
+    console.log(
+      `[coupons.sync#${rid}] user=${uid} lastSync=${cur.last_payment_sync_at || null} ` +
+      `coupon=${cur.coupon_value_cents} delta=${delta_cents} ` +
+      (total_cents != null ? `total=${total_cents} ` : "") +
+      `maxT=${max_t || null}`
+    );
+
     let newCents = cur.coupon_value_cents;
-    if (addCents > 0) {
+    let trayId   = cur.tray_coupon_id || null;
+    let code     = (cur.coupon_code && String(cur.coupon_code).trim()) || codeForUser(uid);
+
+    if (delta_cents > 0 && max_t) {
       const upd = await query(
-        `update users
-            set coupon_value_cents = coalesce(coupon_value_cents,0) + $2,
-                coupon_updated_at   = $3
-          where id = $1
-        returning coalesce(coupon_value_cents,0)::int as coupon_value_cents,
+        `UPDATE users
+            SET coupon_value_cents   = COALESCE(coupon_value_cents,0) + $3,
+                coupon_updated_at    = NOW(),
+                last_payment_sync_at = $4,
+                coupon_code          = COALESCE(coupon_code, $2)
+          WHERE id = $1
+        RETURNING COALESCE(coupon_value_cents,0)::int AS coupon_value_cents,
+                  tray_coupon_id,
                   coupon_code,
-                  tray_coupon_id`,
-        [uid, addCents, lastSyncAt]
+                  last_payment_sync_at`,
+        [uid, code, delta_cents, max_t]
       );
-      cur = upd.rows[0];
-      newCents = cur.coupon_value_cents;
-      console.log(`[coupons.sync#${rid}] incrementado: +${addCents} => ${newCents}`);
+      newCents = upd.rows[0].coupon_value_cents;
+      trayId   = upd.rows[0].tray_coupon_id || null;
+      code     = upd.rows[0].coupon_code || code;
+      console.log(`[coupons.sync#${rid}] increment applied: +${delta_cents} => ${newCents}`);
     } else {
-      console.log(`[coupons.sync#${rid}] nenhum incremento; mantendo ${newCents}`);
+      // se não há delta mas não existe código, garante o code
+      if (!cur.coupon_code) {
+        await query(`UPDATE users SET coupon_code=$2 WHERE id=$1`, [uid, code]);
+      }
+      console.log(`[coupons.sync#${rid}] no increment`);
     }
 
-    // 3) garante código determinístico (se não houver)
-    const code = (cur.coupon_code && String(cur.coupon_code).trim()) || codeForUser(uid);
-
-    // 4) decide se precisa (re)criar na Tray:
-    //    - não existe na Tray ainda
-    //    - ou o valor mudou (addCents > 0)
-    let trayId = cur.tray_coupon_id || null;
-    const mustRecreateTray = !trayId || addCents > 0;
-
+    // Recria cupom na Tray somente quando valor mudou OU não existir ainda
+    const mustRecreateTray = !trayId || newCents !== cur.coupon_value_cents;
     if (mustRecreateTray) {
-      // apaga anterior (se houver)
       if (trayId) {
         try {
-          console.log(`[coupons.sync#${rid}] deletando cupom antigo id=${trayId}`);
+          console.log(`[coupons.sync#${rid}] deleting old Tray coupon id=${trayId}`);
           await trayDeleteCoupon(trayId);
         } catch (e) {
           console.warn(`[coupons.sync#${rid}] delete warn:`, e?.message || e);
         }
       }
-
-      // cria novo cupom com o total atual
       const startsAt = fmtDate(new Date());
-      const endsAt = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
-      console.log(`[coupons.sync#${rid}] criando cupom na Tray`, {
+      const endsAt   = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
+      console.log(`[coupons.sync#${rid}] creating Tray coupon`, {
         code, value: newCents / 100, startsAt, endsAt
       });
-
       const created = await trayCreateCoupon({
         code,
         value: newCents / 100,
@@ -123,24 +214,14 @@ router.post("/sync", requireAuth, async (req, res) => {
         endsAt,
         description: `Crédito do cliente ${uid} - New Store`,
       });
-
       trayId = String(created.id);
-
-      // persiste cupom/ID/valor/código e carimbo
       await query(
-        `update users
-            set coupon_code = $2,
-                tray_coupon_id = $3,
-                coupon_value_cents = $4,
-                coupon_updated_at = $5
-          where id = $1`,
-        [uid, code, trayId, newCents, lastSyncAt]
+        `UPDATE users
+            SET tray_coupon_id = $2,
+                coupon_updated_at = NOW()
+          WHERE id=$1`,
+        [uid, trayId]
       );
-
-      console.log(`[coupons.sync#${rid}] persistido no users (Tray id=${trayId})`);
-    } else if (!cur.coupon_code) {
-      // sem recriar Tray, mas assegura que o código esteja salvo
-      await query(`update users set coupon_code=$2 where id=$1`, [uid, code]);
     }
 
     return res.json({
@@ -150,10 +231,10 @@ router.post("/sync", requireAuth, async (req, res) => {
       cents: newCents,
       id: trayId,
       synced: mustRecreateTray,
+      last_payment_sync_at: cur.last_payment_sync_at || null,
     });
   } catch (e) {
-    console.error(`[coupons.sync#${rid}] error:`, e?.message || e);
-    // mantém a UI funcionando
+    console.error(`[coupons.sync] error:`, e?.message || e);
     return res.status(200).json({ ok: false, error: "sync_failed" });
   }
 });
@@ -163,14 +244,17 @@ router.post("/sync", requireAuth, async (req, res) => {
  */
 router.get("/mine", requireAuth, async (req, res) => {
   try {
+    await ensureUserColumns();
     const uid = req.user.id;
     const r = await query(
-      `select coupon_code,
+      `SELECT coupon_code,
               tray_coupon_id,
-              coalesce(coupon_value_cents,0)::int as cents
-         from users
-        where id = $1
-        limit 1`,
+              COALESCE(coupon_value_cents,0)::int AS cents,
+              coupon_updated_at,
+              last_payment_sync_at
+         FROM users
+        WHERE id = $1
+        LIMIT 1`,
       [uid]
     );
     if (!r.rows.length) return res.status(404).json({ error: "user_not_found" });
@@ -181,6 +265,8 @@ router.get("/mine", requireAuth, async (req, res) => {
       id: row.tray_coupon_id || null,
       value: (row.cents || 0) / 100,
       cents: row.cents || 0,
+      coupon_updated_at: row.coupon_updated_at || null,
+      last_payment_sync_at: row.last_payment_sync_at || null,
     });
   } catch (e) {
     return res.status(500).json({ error: "read_failed" });
