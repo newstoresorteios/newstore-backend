@@ -25,25 +25,36 @@ function fmtDate(d) {
 
 /**
  * POST /api/coupons/sync
+ * Fluxo novo: recebe um delta (add_cents) e SOMA ao valor atual do usuário.
+ * Não recalcula mais a partir de payments para evitar sobrescrita.
  */
 router.post("/sync", requireAuth, async (req, res) => {
-  const rid = Math.random().toString(36).slice(2, 8); // id para amarrar os logs
+  const rid = Math.random().toString(36).slice(2, 8); // id para logs
+
   try {
     const uid = req.user.id;
-    console.log(`[coupons.sync#${rid}] start user=${uid}`);
 
-    // 1) saldo em centavos (pagos)
-    const ap = await query(
-      `select coalesce(sum(amount_cents),0)::int as cents
-         from payments
-        where user_id = $1
-          and lower(status) in ('approved','paid','pago')`,
-      [uid]
-    );
-    const cents = ap.rows?.[0]?.cents ?? 0;
-    console.log(`[coupons.sync#${rid}] saldo cents=`, cents);
+    // aceita add_cents / addCents e carimbo de sincronização do front
+    const addRaw =
+      req.body?.add_cents ??
+      req.body?.addCents ??
+      0;
 
-    // 2) dados atuais do usuário
+    // inteiro não-negativo
+    const addCents = Number.isFinite(Number(addRaw)) ? Math.max(0, parseInt(addRaw, 10)) : 0;
+
+    const lastSyncAtRaw =
+      req.body?.last_payment_sync_at ??
+      req.body?.lastPaymentSyncAt ??
+      null;
+
+    const lastSyncAt = lastSyncAtRaw && !Number.isNaN(Date.parse(lastSyncAtRaw))
+      ? new Date(lastSyncAtRaw)
+      : new Date();
+
+    console.log(`[coupons.sync#${rid}] start user=${uid} add_cents=${addCents}`);
+
+    // 1) estado atual do usuário
     const u = await query(
       `select id, email, coupon_code, tray_coupon_id,
               coalesce(coupon_value_cents,0)::int as coupon_value_cents
@@ -56,82 +67,93 @@ router.post("/sync", requireAuth, async (req, res) => {
       console.error(`[coupons.sync#${rid}] user_not_found`);
       return res.status(404).json({ error: "user_not_found" });
     }
-    const cur = u.rows[0];
-    console.log(`[coupons.sync#${rid}] estado_atual`, {
-      coupon_code: cur.coupon_code,
-      tray_coupon_id: cur.tray_coupon_id,
-      coupon_value_cents: cur.coupon_value_cents,
-    });
+    let cur = u.rows[0];
 
-    // 3) grava SEMPRE o novo valor no banco
-    if (cur.coupon_value_cents !== cents) {
-      await query(
-        `update users set coupon_value_cents=$2 where id=$1`,
-        [uid, cents]
+    // 2) soma o delta (se houver)
+    let newCents = cur.coupon_value_cents;
+    if (addCents > 0) {
+      const upd = await query(
+        `update users
+            set coupon_value_cents = coalesce(coupon_value_cents,0) + $2,
+                coupon_updated_at   = $3
+          where id = $1
+        returning coalesce(coupon_value_cents,0)::int as coupon_value_cents,
+                  coupon_code,
+                  tray_coupon_id`,
+        [uid, addCents, lastSyncAt]
       );
-      console.log(`[coupons.sync#${rid}] coupon_value_cents atualizado para`, cents);
+      cur = upd.rows[0];
+      newCents = cur.coupon_value_cents;
+      console.log(`[coupons.sync#${rid}] incrementado: +${addCents} => ${newCents}`);
+    } else {
+      console.log(`[coupons.sync#${rid}] nenhum incremento; mantendo ${newCents}`);
     }
 
-    // 4) se valor não mudou e já existe cupom na Tray -> só retorna
-    if (cur.coupon_value_cents === cents && cur.coupon_code && cur.tray_coupon_id) {
-      console.log(`[coupons.sync#${rid}] nada a sincronizar; devolvendo estado atual`);
-      return res.json({
-        ok: true,
-        code: cur.coupon_code,
-        value: cents / 100,
-        cents,
-        id: cur.tray_coupon_id,
-        synced: false,
-      });
-    }
-
-    // 5) apaga cupom anterior na Tray (se existir)
-    if (cur.tray_coupon_id) {
-      console.log(`[coupons.sync#${rid}] deletando cupom antigo id=${cur.tray_coupon_id}`);
-      try { await trayDeleteCoupon(cur.tray_coupon_id); }
-      catch (e) { console.warn(`[coupons.sync#${rid}] delete warn:`, e?.message || e); }
-    }
-
-    // 6) cria cupom novo na Tray com o novo valor
+    // 3) garante código determinístico (se não houver)
     const code = (cur.coupon_code && String(cur.coupon_code).trim()) || codeForUser(uid);
-    const startsAt = fmtDate(new Date());
-    const endsAt = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
-    console.log(`[coupons.sync#${rid}] criando cupom na Tray`, {
-      code, value: cents / 100, startsAt, endsAt
-    });
 
-    const created = await trayCreateCoupon({
-      code,
-      value: (cents / 100),
-      startsAt,
-      endsAt,
-      description: `Crédito do cliente ${uid} - New Store`,
-    });
-    console.log(`[coupons.sync#${rid}] criado na Tray id=${created.id}`);
+    // 4) decide se precisa (re)criar na Tray:
+    //    - não existe na Tray ainda
+    //    - ou o valor mudou (addCents > 0)
+    let trayId = cur.tray_coupon_id || null;
+    const mustRecreateTray = !trayId || addCents > 0;
 
-    // 7) persiste cupom/ID/valor no users
-    const upd = await query(
-      `update users
-          set coupon_code = $2,
-              tray_coupon_id = $3,
-              coupon_value_cents = $4,
-              coupon_updated_at = now()
-        where id = $1`,
-      [uid, code, String(created.id), cents]
-    );
-    console.log(`[coupons.sync#${rid}] persistido no users rowCount=${upd.rowCount}`);
+    if (mustRecreateTray) {
+      // apaga anterior (se houver)
+      if (trayId) {
+        try {
+          console.log(`[coupons.sync#${rid}] deletando cupom antigo id=${trayId}`);
+          await trayDeleteCoupon(trayId);
+        } catch (e) {
+          console.warn(`[coupons.sync#${rid}] delete warn:`, e?.message || e);
+        }
+      }
+
+      // cria novo cupom com o total atual
+      const startsAt = fmtDate(new Date());
+      const endsAt = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
+      console.log(`[coupons.sync#${rid}] criando cupom na Tray`, {
+        code, value: newCents / 100, startsAt, endsAt
+      });
+
+      const created = await trayCreateCoupon({
+        code,
+        value: newCents / 100,
+        startsAt,
+        endsAt,
+        description: `Crédito do cliente ${uid} - New Store`,
+      });
+
+      trayId = String(created.id);
+
+      // persiste cupom/ID/valor/código e carimbo
+      await query(
+        `update users
+            set coupon_code = $2,
+                tray_coupon_id = $3,
+                coupon_value_cents = $4,
+                coupon_updated_at = $5
+          where id = $1`,
+        [uid, code, trayId, newCents, lastSyncAt]
+      );
+
+      console.log(`[coupons.sync#${rid}] persistido no users (Tray id=${trayId})`);
+    } else if (!cur.coupon_code) {
+      // sem recriar Tray, mas assegura que o código esteja salvo
+      await query(`update users set coupon_code=$2 where id=$1`, [uid, code]);
+    }
 
     return res.json({
       ok: true,
       code,
-      value: cents / 100,
-      cents,
-      id: String(created.id),
-      synced: true,
+      value: newCents / 100,
+      cents: newCents,
+      id: trayId,
+      synced: mustRecreateTray,
     });
   } catch (e) {
     console.error(`[coupons.sync#${rid}] error:`, e?.message || e);
-    // Mantém a UI funcionando; o valor já foi gravado no passo 3
+    // mantém a UI funcionando
     return res.status(200).json({ ok: false, error: "sync_failed" });
   }
 });
