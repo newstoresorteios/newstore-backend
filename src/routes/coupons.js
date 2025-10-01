@@ -139,6 +139,21 @@ router.post("/sync", requireAuth, async (req, res) => {
     let finalCents = rows?.[0]?.final_cents ?? cur.coupon_value_cents;
     const newSync = rows?.[0]?.new_sync || cur.last_payment_sync_at;
 
+    // 🔧 garante coupon_code mesmo com delta=0 (sem alterar lógica de valores)
+    if (!cur.coupon_code) {
+      try {
+        await query(
+          `UPDATE users
+              SET coupon_code = $2,
+                  coupon_updated_at = COALESCE(coupon_updated_at, NOW())
+            WHERE id = $1
+              AND coupon_code IS NULL`,
+          [uid, code]
+        );
+        cur.coupon_code = code;
+      } catch {}
+    }
+
     console.log(
       `[coupons.sync#${rid}] user=${uid} lastSync=${cur.last_payment_sync_at || null} delta=${delta} newSync=${newSync} coupon_after=${finalCents}`
     );
