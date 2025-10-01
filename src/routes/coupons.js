@@ -48,12 +48,15 @@ async function hasColumn(table, column, schema = "public") {
   return !!rows.length;
 }
 
+/**
+ * Constrói a expressão de tempo usada para calcular o delta.
+ * IMPORTANTE: não usar updated_at para evitar “ressuscitar” pagamentos antigos.
+ */
 async function buildTimeExpr() {
   const parts = [];
-  if (await hasColumn("payments", "paid_at")) parts.push("COALESCE(paid_at, to_timestamp(0))");
+  if (await hasColumn("payments", "paid_at"))     parts.push("COALESCE(paid_at, to_timestamp(0))");
   if (await hasColumn("payments", "approved_at")) parts.push("COALESCE(approved_at, to_timestamp(0))");
-  if (await hasColumn("payments", "updated_at")) parts.push("COALESCE(updated_at, to_timestamp(0))");
-  // sempre fica com created_at de fallback
+  // fallback estável
   parts.push("COALESCE(created_at, to_timestamp(0))");
   const uniq = Array.from(new Set(parts));
   return uniq.length === 1 ? uniq[0] : `GREATEST(${uniq.join(", ")})`;
@@ -89,13 +92,13 @@ router.post("/sync", requireAuth, async (req, res) => {
     const code = (cur.coupon_code && String(cur.coupon_code).trim()) || codeForUser(uid);
     let trayId = cur.tray_coupon_id || null;
 
+    const hadSyncBefore = !!cur.last_payment_sync_at; // ← usado para limitar o fallback
     const tExpr = await buildTimeExpr();
 
     // === Transação com lock para evitar duplicidade de incremento ===
     await query("BEGIN");
 
-    // CTE: pega last_sync com FOR UPDATE, computa delta “recent” usando esse last_sync,
-    // aplica update apenas se delta > 0 e devolve delta/new_sync/final_cents.
+    // delta desde o último sync (sem updated_at)
     const sql = `
       WITH me AS (
         SELECT id, COALESCE(last_payment_sync_at, to_timestamp(0)) AS last_sync
@@ -136,29 +139,32 @@ router.post("/sync", requireAuth, async (req, res) => {
     let finalCents = rows?.[0]?.final_cents ?? cur.coupon_value_cents;
     const newSync = rows?.[0]?.new_sync || cur.last_payment_sync_at;
 
-    console.log(`[coupons.sync#${rid}] user=${uid} lastSync=${cur.last_payment_sync_at || null} delta=${delta} newSync=${newSync} coupon_after=${finalCents}`);
-
-    // Fallback adicional: se por ausência de colunas de tempo algum aprovado ficou “antes” do last_sync,
-    // garante que nunca fique para trás comparando com o total aprovado.
-    const totalQ = await query(
-      `SELECT COALESCE(SUM(amount_cents),0)::int AS total
-         FROM payments
-        WHERE user_id=$1 AND lower(status) IN ('approved','paid','pago')`,
-      [uid]
+    console.log(
+      `[coupons.sync#${rid}] user=${uid} lastSync=${cur.last_payment_sync_at || null} delta=${delta} newSync=${newSync} coupon_after=${finalCents}`
     );
-    const totalApproved = totalQ.rows?.[0]?.total || 0;
-    if (totalApproved > finalCents) {
-      await query(
-        `UPDATE users
-            SET coupon_value_cents = $2,
-                coupon_updated_at  = NOW(),
-                coupon_code        = COALESCE(coupon_code, $3),
-                last_payment_sync_at = COALESCE($4, last_payment_sync_at)
-          WHERE id=$1`,
-        [uid, totalApproved, code, newSync]
+
+    // --- Fallback controlado: só na PRIMEIRA sincronização (sem last_payment_sync_at)
+    if (!hadSyncBefore) {
+      const totalQ = await query(
+        `SELECT COALESCE(SUM(amount_cents),0)::int AS total
+           FROM payments
+          WHERE user_id=$1 AND lower(status) IN ('approved','paid','pago')`,
+        [uid]
       );
-      finalCents = totalApproved;
-      console.log(`[coupons.sync#${rid}] corrected up to total=${totalApproved}`);
+      const totalApproved = totalQ.rows?.[0]?.total || 0;
+      if (totalApproved > finalCents) {
+        await query(
+          `UPDATE users
+              SET coupon_value_cents = $2,
+                  coupon_updated_at  = NOW(),
+                  coupon_code        = COALESCE(coupon_code, $3),
+                  last_payment_sync_at = COALESCE($4, last_payment_sync_at)
+            WHERE id=$1`,
+          [uid, totalApproved, code, newSync]
+        );
+        finalCents = totalApproved;
+        console.log(`[coupons.sync#${rid}] first-sync correction up to total=${totalApproved}`);
+      }
     }
 
     // Recria cupom na Tray apenas se mudou o valor ou não existe ainda
