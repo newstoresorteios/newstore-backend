@@ -1,3 +1,4 @@
+// backend/src/routes/auth.js
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -60,7 +61,6 @@ function makeUserCouponCode(userId) {
 }
 
 // Carrega usuário do DB (tolerante a colunas ausentes)
-// Substitua toda a hydrateUserFromDB por esta versão
 async function hydrateUserFromDB(id, email) {
   await ensureUserColumns();
 
@@ -104,7 +104,6 @@ async function hydrateUserFromDB(id, email) {
       role: u.is_admin ? 'admin' : 'user',
       coupon_code: u.coupon_code || null,
       coupon_updated_at: u.coupon_updated_at || null,
-      // ▼ campo que o AccountPage lê para "Valor acumulado"
       coupon_value_cents: Number(u.coupon_value_cents || 0),
     };
   } catch {
@@ -129,7 +128,6 @@ async function hydrateUserFromDB(id, email) {
     };
   }
 }
-
 
 // Busca usuário por e-mail cobrindo colunas/tabelas legadas
 async function findUserByEmail(emailRaw) {
@@ -158,6 +156,68 @@ async function findUserByEmail(emailRaw) {
     }
   }
   return null;
+}
+
+// ======= envio de e-mail robusto (Brevo) =======
+async function sendResetMailBrevo(to, newPassword) {
+  const HOST = process.env.SMTP_HOST || 'smtp-relay.brevo.com';
+  const USER = process.env.SMTP_USER || '';
+  const PASS = process.env.SMTP_PASS || '';
+  const FROM = process.env.SMTP_FROM || USER || 'contato@newstorerj.com.br';
+
+  const attempts = [
+    { port: Number(process.env.SMTP_PORT || 587), secure: false, label: '587 STARTTLS' },
+    { port: 465, secure: true, label: '465 TLS' },
+    { port: 2525, secure: false, label: '2525 STARTTLS' },
+  ];
+
+  const baseMail = {
+    from: FROM,
+    to,
+    subject: 'Reset de senha - New Store Sorteios',
+    text:
+      `Sua senha foi resetada.\n\n` +
+      `Nova Senha: ${newPassword}\n\n` +
+      `Se você não solicitou, ignore este e-mail.`,
+  };
+
+  let lastErr = null;
+
+  for (const opt of attempts) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host: HOST,
+        port: opt.port,
+        secure: opt.secure, // true = TLS direto (465), false = STARTTLS (587/2525)
+        auth: USER ? { user: USER, pass: PASS } : undefined,
+        // timeouts para evitar travar em ETIMEDOUT
+        connectionTimeout: 10_000,
+        greetingTimeout: 10_000,
+        socketTimeout: 20_000,
+        tls: {
+          minVersion: 'TLSv1.2',
+          // importante em alguns providers/hosts (SNI)
+          servername: HOST,
+          // se sua instância tiver CA antiga, liberar (pode manter true se seu ambiente ok)
+          rejectUnauthorized: false,
+        },
+      });
+
+      // opcional: aquece conexão
+      await transporter.verify().catch(() => { /* ok se falhar, alguns servidores não respondem */ });
+
+      await transporter.sendMail(baseMail);
+      console.log(`[reset-password] e-mail enviado via Brevo (${opt.label})`);
+      return true;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[reset-password] tentativa falhou (${opt.label}):`, e?.code || e?.message || e);
+      // tenta próxima porta
+    }
+  }
+
+  // se chegou aqui, todas falharam
+  throw lastErr || new Error('smtp_unavailable');
 }
 
 // ===================== ROTAS =====================
@@ -285,26 +345,13 @@ router.post('/reset-password', async (req, res) => {
       console.warn('[reset-password] hashing/update skipped:', e.message);
     }
 
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: String(process.env.SMTP_SECURE || 'false') === 'true',
-      auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
-    });
-
-    const mail = {
-      from: 'contato@newstorerj.com.br',
-      to: email,
-      subject: 'Reset de senha - New Store Sorteios',
-      text: `Sua senha foi resetada.\n\nNova Senha: ${newPassword}\n\nSe você não solicitou, ignore este e-mail.`,
-    };
-
+    // Envio de e-mail com múltiplos fallbacks de porta/TLS
     let delivered = false;
-    if (!process.env.SMTP_HOST && !process.env.SMTP_USER) {
-      console.log('[reset-password] DEV EMAIL ->', mail);
-    } else {
-      await transporter.sendMail(mail);
-      delivered = true;
+    try {
+      delivered = await sendResetMailBrevo(email, newPassword);
+    } catch (e) {
+      console.error('[reset-password] smtp error:', e?.code || e?.message || e);
+      delivered = false;
     }
 
     return res.json({ ok: true, delivered, updated });
