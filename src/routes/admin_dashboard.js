@@ -178,7 +178,6 @@ router.post("/ticket-price", requireAuth, requireAdmin, async (req, res) => {
 // === NOVO: compradores do sorteio aberto (apenas payments aprovados)
 router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
   try {
-    // sorteio aberto mais recente
     const d = await query(
       `SELECT id
          FROM draws
@@ -197,7 +196,7 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
       });
     }
 
-    // Pagamentos aprovados do draw aberto (não contar duas vezes o valor do mesmo payment ao "unnest")
+    // Agregado por comprador
     const sql = `
       WITH p_ok AS (
         SELECT p.user_id, p.numbers, p.amount_cents::int AS amount_cents, p.paid_at
@@ -223,22 +222,20 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
           FROM p_ok
          GROUP BY user_id
       ),
-      taken AS (
-        SELECT DISTINCT n FROM unn
-      )
+      taken AS ( SELECT DISTINCT n FROM unn )
       SELECT
         (SELECT COUNT(*)::int FROM taken) AS sold_approved,
         json_agg(
           json_build_object(
             'user_id', pu.user_id,
-            'name',    COALESCE(us.name, us.full_name, us.username, us.email),
+            'name',    COALESCE(us.name, us.email),      -- << apenas colunas existentes
             'email',   us.email,
             'numbers', pu.numbers,
             'count',   pu.count,
             'total_cents', COALESCE(t.total_cents,0),
             'last_paid_at', t.last_paid_at
           )
-          ORDER BY lower(COALESCE(us.name, us.email))
+          ORDER BY lower(COALESCE(us.name, us.email, ''))
         ) FILTER (WHERE pu.user_id IS NOT NULL) AS buyers_json
       FROM per_user pu
       LEFT JOIN totals t ON t.user_id = pu.user_id
@@ -248,7 +245,7 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
     const sold = Number(agg.rows[0]?.sold_approved || 0);
     const buyers = agg.rows[0]?.buyers_json || [];
 
-    // Mapa por número -> comprador
+    // Mapa número -> comprador
     const nums = await query(
       `
       WITH p_ok AS (
@@ -260,7 +257,7 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
       unn AS ( SELECT user_id, unnest(numbers)::int AS n FROM p_ok )
       SELECT u.n,
              us.id   AS user_id,
-             COALESCE(us.name, us.full_name, us.username, us.email) AS name,
+             COALESCE(us.name, us.email) AS name,  -- << apenas colunas existentes
              us.email
         FROM unn u
         LEFT JOIN users us ON us.id = u.user_id
