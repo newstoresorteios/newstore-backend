@@ -13,50 +13,92 @@ function log(...a) {
 
 /**
  * GET /api/admin/dashboard/summary
- * -> { draw_id, sold, remaining, price_cents }
+ * -> { draw_id, sold, remaining, price_cents, sold_by_payments, sold_by_numbers, available_by_numbers }
+ *
+ * Agora:
+ * - "sold" = quantidade de números vendidos APENAS por payments aprovados (approved/paid/pago)
+ * - "remaining" = 100 - sold
+ * Mantive também contagens da tabela numbers como campos auxiliares (debug).
  */
 router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
   try {
-    log("GET /summary");
+    console.log("[admin/dashboard] GET /summary");
 
+    // sorteio aberto mais recente
     const d = await query(
-      `select id, opened_at
-         from draws
-        where status = 'open'
-        order by id desc
-        limit 1`
+      `SELECT id, opened_at
+         FROM draws
+        WHERE status = 'open'
+        ORDER BY id DESC
+        LIMIT 1`
     );
     const current = d.rows[0] || null;
 
-    let sold = 0;
-    let remaining = 0;
-
-    if (current?.id != null) {
-      const r = await query(
-        `select
-           sum(case when status = 'sold' then 1 else 0 end)::int as sold,
-           sum(case when status = 'available' then 1 else 0 end)::int as available
-         from numbers
-        where draw_id = $1`,
-        [current.id]
-      );
-      sold = r.rows[0]?.sold ?? 0;
-      remaining = r.rows[0]?.available ?? 0;
-    }
-
     const price_cents = await getTicketPriceCents();
 
+    if (!current?.id) {
+      return res.json({
+        draw_id: null,
+        sold: 0,
+        remaining: 0,
+        price_cents,
+        sold_by_payments: 0,
+        sold_by_numbers: 0,
+        available_by_numbers: 0,
+      });
+    }
+
+    // 1) vendidos por payments aprovados (distinct em payments.numbers)
+    // 2) métricas da tabela numbers (mantidas para diagnóstico)
+    const agg = await query(
+      `
+      WITH approved AS (
+        SELECT DISTINCT t.n
+          FROM payments p
+          CROSS JOIN LATERAL unnest(p.numbers) AS t(n)
+         WHERE p.draw_id = $1
+           AND lower(p.status) IN ('approved','paid','pago')
+      ),
+      nums AS (
+        SELECT
+          SUM(CASE WHEN status = 'sold'      THEN 1 ELSE 0 END)::int AS sold_numbers,
+          SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END)::int AS available_numbers
+          FROM numbers
+         WHERE draw_id = $1
+      )
+      SELECT
+        (SELECT COUNT(*)::int FROM approved)        AS sold_by_payments,
+        (SELECT sold_numbers       FROM nums)       AS sold_by_numbers,
+        (SELECT available_numbers  FROM nums)       AS available_by_numbers
+      `,
+      [current.id]
+    );
+
+    const row = agg.rows[0] || {};
+    const sold_by_payments   = Number(row.sold_by_payments || 0);
+    const sold_by_numbers    = Number(row.sold_by_numbers  || 0);
+    const available_numbers  = Number(row.available_by_numbers || 0);
+
+    // contador exibido: somente aprovados
+    const sold = sold_by_payments;
+    const remaining = Math.max(0, 100 - sold);
+
     return res.json({
-      draw_id: current?.id ?? null,
+      draw_id: current.id,
       sold,
       remaining,
       price_cents,
+      // campos extras para conferência/depuração (não usados pelo front)
+      sold_by_payments,
+      sold_by_numbers,
+      available_by_numbers,
     });
   } catch (e) {
     console.error("[admin/dashboard] /summary error:", e);
     return res.status(500).json({ error: "summary_failed" });
   }
 });
+
 
 /**
  * POST /api/admin/dashboard/new
