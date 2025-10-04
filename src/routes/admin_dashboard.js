@@ -175,4 +175,112 @@ router.post("/ticket-price", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// === NOVO: compradores do sorteio aberto (apenas payments aprovados)
+router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    // sorteio aberto mais recente
+    const d = await query(
+      `SELECT id
+         FROM draws
+        WHERE status = 'open'
+        ORDER BY id DESC
+        LIMIT 1`
+    );
+    const cur = d.rows[0];
+    if (!cur?.id) {
+      return res.json({
+        draw_id: null,
+        sold: 0,
+        remaining: 100,
+        buyers: [],
+        numbers: [],
+      });
+    }
+
+    // Pagamentos aprovados do draw aberto (não contar duas vezes o valor do mesmo payment ao "unnest")
+    const sql = `
+      WITH p_ok AS (
+        SELECT p.user_id, p.numbers, p.amount_cents::int AS amount_cents, p.paid_at
+          FROM payments p
+         WHERE p.draw_id = $1
+           AND lower(p.status) IN ('approved','paid','pago')
+      ),
+      unn AS (
+        SELECT user_id, unnest(numbers)::int AS n
+          FROM p_ok
+      ),
+      per_user AS (
+        SELECT u.user_id,
+               array_agg(DISTINCT u.n ORDER BY u.n) AS numbers,
+               COUNT(DISTINCT u.n)::int            AS count
+          FROM unn u
+         GROUP BY u.user_id
+      ),
+      totals AS (
+        SELECT user_id,
+               COALESCE(SUM(amount_cents),0)::int AS total_cents,
+               MAX(paid_at)                       AS last_paid_at
+          FROM p_ok
+         GROUP BY user_id
+      ),
+      taken AS (
+        SELECT DISTINCT n FROM unn
+      )
+      SELECT
+        (SELECT COUNT(*)::int FROM taken) AS sold_approved,
+        json_agg(
+          json_build_object(
+            'user_id', pu.user_id,
+            'name',    COALESCE(us.name, us.full_name, us.username, us.email),
+            'email',   us.email,
+            'numbers', pu.numbers,
+            'count',   pu.count,
+            'total_cents', COALESCE(t.total_cents,0),
+            'last_paid_at', t.last_paid_at
+          )
+          ORDER BY lower(COALESCE(us.name, us.email))
+        ) FILTER (WHERE pu.user_id IS NOT NULL) AS buyers_json
+      FROM per_user pu
+      LEFT JOIN totals t ON t.user_id = pu.user_id
+      LEFT JOIN users  us ON us.id     = pu.user_id
+    `;
+    const agg = await query(sql, [cur.id]);
+    const sold = Number(agg.rows[0]?.sold_approved || 0);
+    const buyers = agg.rows[0]?.buyers_json || [];
+
+    // Mapa por número -> comprador
+    const nums = await query(
+      `
+      WITH p_ok AS (
+        SELECT p.user_id, p.numbers
+          FROM payments p
+         WHERE p.draw_id = $1
+           AND lower(p.status) IN ('approved','paid','pago')
+      ),
+      unn AS ( SELECT user_id, unnest(numbers)::int AS n FROM p_ok )
+      SELECT u.n,
+             us.id   AS user_id,
+             COALESCE(us.name, us.full_name, us.username, us.email) AS name,
+             us.email
+        FROM unn u
+        LEFT JOIN users us ON us.id = u.user_id
+       ORDER BY u.n
+      `,
+      [cur.id]
+    );
+
+    return res.json({
+      draw_id: cur.id,
+      sold,
+      remaining: Math.max(0, 100 - sold),
+      buyers,
+      numbers: nums.rows || [],
+    });
+  } catch (e) {
+    console.error("[admin/dashboard] /open-buyers error:", e);
+    return res.status(500).json({ error: "open_buyers_failed" });
+  }
+});
+
+
 export default router;
