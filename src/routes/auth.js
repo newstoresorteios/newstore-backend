@@ -163,7 +163,7 @@ async function sendResetMailBrevo(to, newPassword) {
   const HOST = process.env.SMTP_HOST || 'smtp-relay.brevo.com';
   const USER = process.env.SMTP_USER || '';
   const PASS = process.env.SMTP_PASS || '';
-  const FROM = process.env.SMTP_FROM || USER || 'contato@newstorerj.com.br';
+  const FROM = process.env.SMTP_FROM || USER || 'newrecreio@gmail.com';
 
   const attempts = [
     { port: Number(process.env.SMTP_PORT || 587), secure: false, label: '587 STARTTLS' },
