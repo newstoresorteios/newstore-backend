@@ -334,4 +334,103 @@ router.get('/me', requireAuth, async (req, res) => {
   }
 });
 
+/* ============================================================================
+   NOVOS ENDPOINTS — adicionados sem alterar os existentes
+   ========================================================================== */
+
+/**
+ * POST /api/payments/reconcile
+ * Body: { since?: number }  // minutos a varrer (default 1440 = 24h)
+ * Varre pagamentos não aprovados recentes, consulta o MP e assenta se aprovado.
+ */
+router.post('/reconcile', requireAuth, async (req, res) => {
+  try {
+    const minutes = Math.max(5, Number(req.body?.since ?? req.body?.minutes ?? 1440));
+    const { rows } = await query(
+      `SELECT id
+         FROM payments
+        WHERE lower(status) NOT IN ('approved','paid','pago')
+          AND COALESCE(created_at, now()) >= NOW() - ($1::int || ' minutes')::interval`,
+      [minutes]
+    );
+
+    let scanned = rows.length, updated = 0, approved = 0, failed = 0;
+
+    for (const { id } of rows) {
+      try {
+        const resp = await mpPayment.get({ id: String(id) });
+        const body = resp?.body || resp;
+        const st = String(body?.status || '').toLowerCase();
+
+        await query(
+          `UPDATE payments
+              SET status = $2,
+                  paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
+            WHERE id = $1`,
+          [id, st]
+        );
+        updated++;
+
+        if (st === 'approved') {
+          const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+          if (pr.rows.length) {
+            const { draw_id, numbers } = pr.rows[0];
+            await settleApprovedPayment(id, draw_id, numbers);
+            await finalizeDrawIfComplete(draw_id);
+            approved++;
+          }
+        }
+      } catch (e) {
+        failed++;
+        console.warn('[reconcile] error for id', id, e?.message || e);
+      }
+    }
+
+    return res.json({ scanned, updated, approved, failed });
+  } catch (e) {
+    console.error('[reconcile] fatal error:', e);
+    return res.status(500).json({ error: 'reconcile_failed' });
+  }
+});
+
+/**
+ * POST /api/payments/webhook/replay
+ * Body: { id: string }  // paymentId
+ * Reexecuta a lógica do webhook para um pagamento específico.
+ */
+router.post('/webhook/replay', requireAuth, async (req, res) => {
+  try {
+    const paymentId = req.body?.id || req.body?.paymentId;
+    if (!paymentId) return res.status(400).json({ error: 'missing_id' });
+
+    const resp = await mpPayment.get({ id: String(paymentId) });
+    const body = resp?.body || resp;
+
+    const id = String(body?.id || paymentId);
+    const status = String(body?.status || '').toLowerCase();
+
+    await query(
+      `UPDATE payments
+          SET status = $2,
+              paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
+        WHERE id = $1`,
+      [id, status]
+    );
+
+    if (status === 'approved') {
+      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+      if (pr.rows.length) {
+        const { draw_id, numbers } = pr.rows[0];
+        await settleApprovedPayment(id, draw_id, numbers);
+        await finalizeDrawIfComplete(draw_id);
+      }
+    }
+
+    return res.json({ id, status });
+  } catch (e) {
+    console.error('[webhook/replay] error:', e);
+    return res.status(500).json({ error: 'replay_failed' });
+  }
+});
+
 export default router;
