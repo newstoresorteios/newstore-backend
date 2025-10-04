@@ -159,21 +159,32 @@ async function findUserByEmail(emailRaw) {
 }
 
 // ======= envio de e-mail robusto (Brevo) =======
+// ======= envio de e-mail robusto (Brevo) =======
 async function sendResetMailBrevo(to, newPassword) {
   const HOST = process.env.SMTP_HOST || 'smtp-relay.brevo.com';
-  const USER = process.env.SMTP_USER || '';
-  const PASS = process.env.SMTP_PASS || '';
-  const FROM = process.env.SMTP_FROM || USER || 'newrecreio@gmail.com';
+  const USER = process.env.SMTP_USER || '';          // sua credencial SMTP do Brevo
+  const PASS = process.env.SMTP_PASS || '';          // sua senha/SMTP key do Brevo
+
+  // REMETENTE: precisa ser um sender/domínio VALIDADO no Brevo
+  const FROM_EMAIL = process.env.SMTP_FROM || 'contato@newstorerj.com.br';
+  const FROM_NAME  = process.env.SMTP_FROM_NAME || 'New Store Sorteios';
+  const REPLY_TO   = process.env.SMTP_REPLY_TO || FROM_EMAIL;
+
+  // Evita usar USER como "from" (causa rejeição 9712be001@smtp-brevo.com)
+  if (/smtp-brevo\.com$/i.test(FROM_EMAIL)) {
+    throw new Error('invalid_from_sender_not_verified');
+  }
 
   const attempts = [
     { port: Number(process.env.SMTP_PORT || 587), secure: false, label: '587 STARTTLS' },
-    { port: 465, secure: true, label: '465 TLS' },
+    { port: 465, secure: true,  label: '465 TLS' },
     { port: 2525, secure: false, label: '2525 STARTTLS' },
   ];
 
   const baseMail = {
-    from: FROM,
+    from: { name: FROM_NAME, address: FROM_EMAIL },
     to,
+    replyTo: REPLY_TO,
     subject: 'Reset de senha - New Store Sorteios',
     text:
       `Sua senha foi resetada.\n\n` +
@@ -188,25 +199,24 @@ async function sendResetMailBrevo(to, newPassword) {
       const transporter = nodemailer.createTransport({
         host: HOST,
         port: opt.port,
-        secure: opt.secure, // true = TLS direto (465), false = STARTTLS (587/2525)
+        secure: opt.secure,               // 465 = TLS direto; 587/2525 = STARTTLS
         auth: USER ? { user: USER, pass: PASS } : undefined,
-        // timeouts para evitar travar em ETIMEDOUT
         connectionTimeout: 10_000,
         greetingTimeout: 10_000,
         socketTimeout: 20_000,
         tls: {
           minVersion: 'TLSv1.2',
-          // importante em alguns providers/hosts (SNI)
           servername: HOST,
-          // se sua instância tiver CA antiga, liberar (pode manter true se seu ambiente ok)
-          rejectUnauthorized: false,
+          rejectUnauthorized: false,      // Render free às vezes tem cadeias CA antigas
         },
       });
 
-      // opcional: aquece conexão
-      await transporter.verify().catch(() => { /* ok se falhar, alguns servidores não respondem */ });
+      // Log simples para depurar qual porta deu certo
+      console.log(`[reset-password] tentando SMTP ${HOST}:${opt.port} (${opt.label}) from=${FROM_NAME} <${FROM_EMAIL}>`);
 
+      await transporter.verify().catch(() => {});
       await transporter.sendMail(baseMail);
+
       console.log(`[reset-password] e-mail enviado via Brevo (${opt.label})`);
       return true;
     } catch (e) {
@@ -216,9 +226,9 @@ async function sendResetMailBrevo(to, newPassword) {
     }
   }
 
-  // se chegou aqui, todas falharam
   throw lastErr || new Error('smtp_unavailable');
 }
+
 
 // ===================== ROTAS =====================
 
