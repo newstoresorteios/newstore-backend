@@ -75,9 +75,9 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
     );
 
     const row = agg.rows[0] || {};
-    const sold_by_payments   = Number(row.sold_by_payments || 0);
-    const sold_by_numbers    = Number(row.sold_by_numbers  || 0);
-    const available_numbers  = Number(row.available_by_numbers || 0);
+    const sold_by_payments     = Number(row.sold_by_payments || 0);
+    const sold_by_numbers      = Number(row.sold_by_numbers  || 0);
+    const available_by_numbers = Number(row.available_by_numbers || 0);
 
     // contador exibido: somente aprovados
     const sold = sold_by_payments;
