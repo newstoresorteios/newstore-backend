@@ -40,6 +40,8 @@ import meDraws from "./routes/me_draws.js";
 
 import autopayRunnerRoute from "./routes/autopay_runner.js";
 
+import { autoReconcile } from './middleware/autoReconcile.js';
+
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
 import { ensureAppConfig } from "./services/config.js";
@@ -81,6 +83,8 @@ app.use(cookieParser());
 app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
+
+app.use(autoReconcile);
 
 // ── Rotas públicas/gerais ───────────────────────────────────
 app.use("/api/auth", authRoutes);

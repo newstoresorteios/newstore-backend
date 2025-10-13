@@ -122,6 +122,75 @@ async function settleApprovedPayment(id, drawId, numbers) {
   );
 }
 
+/**
+ * Varre pagamentos não aprovados nos últimos N minutos, reconcilia e assenta.
+ * Reutilizada pelo endpoint /reconcile e pelo middleware autoReconcile.
+ */
+async function _reconcilePendingPaymentsCore(minutes) {
+  const lookbackMin = Math.max(5, Number(minutes || 1440)); // default 24h
+  const { rows } = await query(
+    `SELECT id
+       FROM payments
+      WHERE lower(status) NOT IN ('approved','paid','pago')
+        AND COALESCE(created_at, now()) >= NOW() - ($1::int || ' minutes')::interval`,
+    [lookbackMin]
+  );
+
+  let scanned = rows.length, updated = 0, approved = 0, failed = 0;
+
+  for (const { id } of rows) {
+    try {
+      const resp = await mpPayment.get({ id: String(id) });
+      const body = resp?.body || resp;
+      const st = String(body?.status || '').toLowerCase();
+
+      await query(
+        `UPDATE payments
+            SET status = $2,
+                paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
+          WHERE id = $1`,
+        [id, st]
+      );
+      updated++;
+
+      if (st === 'approved') {
+        const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+        if (pr.rows.length) {
+          const { draw_id, numbers } = pr.rows[0];
+          await settleApprovedPayment(id, draw_id, numbers);
+          await finalizeDrawIfComplete(draw_id);
+          approved++;
+        }
+      }
+    } catch (e) {
+      failed++;
+      console.warn('[reconcile] error for id', id, e?.message || e);
+    }
+  }
+
+  return { scanned, updated, approved, failed, minutes: lookbackMin };
+}
+
+/**
+ * Exportado para uso pelo middleware autoReconcile (app.use(autoReconcile))
+ * Roda em background; qualquer erro é tratado aqui para não quebrar o servidor.
+ */
+export async function kickReconcilePendingPayments(minutes) {
+  try {
+    const lookback =
+      minutes ??
+      Number(process.env.RECONCILE_LOOKBACK_MIN || process.env.RECONCILE_MINUTES || 1440);
+    const res = await _reconcilePendingPaymentsCore(lookback);
+    if (res?.approved) {
+      console.log('[autoReconcile] aprovados:', res.approved, '— janela (min):', res.minutes);
+    }
+    return res;
+  } catch (e) {
+    console.warn('[autoReconcile] fatal:', e?.message || e);
+    return { scanned: 0, updated: 0, approved: 0, failed: 1, error: String(e?.message || e) };
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Rotas
 // -----------------------------------------------------------------------------
@@ -346,47 +415,8 @@ router.get('/me', requireAuth, async (req, res) => {
 router.post('/reconcile', requireAuth, async (req, res) => {
   try {
     const minutes = Math.max(5, Number(req.body?.since ?? req.body?.minutes ?? 1440));
-    const { rows } = await query(
-      `SELECT id
-         FROM payments
-        WHERE lower(status) NOT IN ('approved','paid','pago')
-          AND COALESCE(created_at, now()) >= NOW() - ($1::int || ' minutes')::interval`,
-      [minutes]
-    );
-
-    let scanned = rows.length, updated = 0, approved = 0, failed = 0;
-
-    for (const { id } of rows) {
-      try {
-        const resp = await mpPayment.get({ id: String(id) });
-        const body = resp?.body || resp;
-        const st = String(body?.status || '').toLowerCase();
-
-        await query(
-          `UPDATE payments
-              SET status = $2,
-                  paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
-            WHERE id = $1`,
-          [id, st]
-        );
-        updated++;
-
-        if (st === 'approved') {
-          const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
-          if (pr.rows.length) {
-            const { draw_id, numbers } = pr.rows[0];
-            await settleApprovedPayment(id, draw_id, numbers);
-            await finalizeDrawIfComplete(draw_id);
-            approved++;
-          }
-        }
-      } catch (e) {
-        failed++;
-        console.warn('[reconcile] error for id', id, e?.message || e);
-      }
-    }
-
-    return res.json({ scanned, updated, approved, failed });
+    const result = await _reconcilePendingPaymentsCore(minutes);
+    return res.json(result);
   } catch (e) {
     console.error('[reconcile] fatal error:', e);
     return res.status(500).json({ error: 'reconcile_failed' });
