@@ -158,7 +158,7 @@ async function _reconcilePendingPaymentsCore(minutes) {
         if (pr.rows.length) {
           const { draw_id, numbers } = pr.rows[0];
           await settleApprovedPayment(id, draw_id, numbers);
-          await finalizeDrawIfComplete(draw_id);
+          //await finalizeDrawIfComplete(draw_id);
           approved++;
         }
       }
@@ -323,7 +323,7 @@ router.get('/:id/status', requireAuth, async (req, res) => {
         const { draw_id, numbers } = pr.rows[0];
 
         await settleApprovedPayment(id, draw_id, numbers);
-        await finalizeDrawIfComplete(draw_id);
+        //await finalizeDrawIfComplete(draw_id);
       }
     }
 
@@ -366,7 +366,7 @@ router.post('/webhook', async (req, res) => {
         const { draw_id, numbers } = pr.rows[0];
 
         await settleApprovedPayment(id, draw_id, numbers);
-        await finalizeDrawIfComplete(draw_id);
+        //await finalizeDrawIfComplete(draw_id);
       }
     }
 
@@ -452,7 +452,7 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
       if (pr.rows.length) {
         const { draw_id, numbers } = pr.rows[0];
         await settleApprovedPayment(id, draw_id, numbers);
-        await finalizeDrawIfComplete(draw_id);
+        //await finalizeDrawIfComplete(draw_id);
       }
     }
 
