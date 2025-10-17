@@ -40,6 +40,8 @@ import meDraws from "./routes/me_draws.js";
 
 import autopayRunnerRoute from "./routes/autopay_runner.js";
 
+import adminAnalyticsRouter from "./routes/analytics.js";
+
 import { autoReconcile } from './middleware/autoReconcile.js';
 
 import { query, getPool } from "./db.js";
@@ -109,6 +111,8 @@ app.use("/api/admin/dashboard", adminDashboardRouter);
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza
 app.use("/api/admin/config", adminConfigRouter);
+
+app.use("/api/admin/analytics", adminAnalyticsRouter);
 
 // ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);
