@@ -4,25 +4,12 @@
 //   app.use("/api/admin/analytics", adminAnalyticsRouter);
 
 import express from "express";
-import pg from "pg";
-const { Pool } = pg;
+import { query as q } from "../db.js"; // ✅ usa o pool já configurado (SSL, etc)
 
 const router = express.Router();
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSL === "true" ? { rejectUnauthorized: false } : false,
-});
-
-async function q(sql, params = []) {
-  const cli = await pool.connect();
-  try {
-    const { rows } = await cli.query(sql, params);
-    return rows;
-  } finally {
-    cli.release();
-  }
-}
+// opcional: rota de ping
+router.get("/ping", (_req, res) => res.json({ ok: true }));
 
 /* ============================================================================
  * 1) DRAW SUMMARY (por sorteio) — GMV, fill-rate, ticket, funil, horários, heatmap
@@ -36,7 +23,7 @@ router.get("/summary/:drawId", async (req, res) => {
       `SELECT id, status, opened_at, closed_at, realized_at, product_name
        FROM draws WHERE id=$1`,
       [drawId]
-    ))?.[0];
+    ))?.rows?.[0];
     if (!draw) return res.status(404).json({ error: "Sorteio não encontrado" });
 
     const sold = (await q(
@@ -45,7 +32,7 @@ router.get("/summary/:drawId", async (req, res) => {
               SUM((status='available')::int) AS available
        FROM numbers WHERE draw_id=$1`,
       [drawId]
-    ))?.[0] || { sold: 0, reserved: 0, available: 0 };
+    ))?.rows?.[0] || { sold: 0, reserved: 0, available: 0 };
 
     const paid = (await q(
       `SELECT COALESCE(SUM(amount_cents),0) AS gmv_cents,
@@ -54,30 +41,30 @@ router.get("/summary/:drawId", async (req, res) => {
               MAX(paid_at) AS last_paid_at
        FROM payments WHERE draw_id=$1 AND status='paid'`,
       [drawId]
-    ))?.[0] || { gmv_cents: 0, avg_ticket_cents: 0, paid_orders: 0, last_paid_at: null };
+    ))?.rows?.[0] || { gmv_cents: 0, avg_ticket_cents: 0, paid_orders: 0, last_paid_at: null };
 
     const expiredRes = (await q(
       `SELECT COUNT(*) AS expired_reservations
          FROM reservations WHERE draw_id=$1 AND status='expired'`,
       [drawId]
-    ))?.[0] || { expired_reservations: 0 };
+    ))?.rows?.[0] || { expired_reservations: 0 };
 
     const expiredPays = (await q(
       `SELECT COUNT(*) AS expired_payments
          FROM payments WHERE draw_id=$1 AND status='expired'`,
       [drawId]
-    ))?.[0] || { expired_payments: 0 };
+    ))?.rows?.[0] || { expired_payments: 0 };
 
-    const hourDist = await q(
+    const hourDist = (await q(
       `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*) AS paid
          FROM payments
         WHERE status='paid' AND paid_at IS NOT NULL AND draw_id=$1
         GROUP BY 1 ORDER BY 1`,
       [drawId]
-    );
+    ))?.rows ?? [];
 
-    const numHeat = await q(
+    const numHeat = (await q(
       `SELECT n.n::int AS n, COUNT(*)::int AS sold_count
          FROM numbers n
          JOIN reservations r ON r.id=n.reservation_id AND r.status='captured'
@@ -86,13 +73,11 @@ router.get("/summary/:drawId", async (req, res) => {
         GROUP BY n.n
         ORDER BY n.n`,
       [drawId]
-    );
+    ))?.rows ?? [];
 
-    // Fill-rate
     const soldCount = Number(sold?.sold || 0);
     const fill_rate = soldCount ? Number((soldCount / 100).toFixed(2)) : 0;
 
-    // Velocidade: até fechar (sempre disponível)
     let velocity_to_close_minutes = null;
     if (draw.opened_at && draw.closed_at) {
       velocity_to_close_minutes = Math.round(
@@ -100,7 +85,6 @@ router.get("/summary/:drawId", async (req, res) => {
       );
     }
 
-    // Velocidade: até 100% vendido (aproximação = último paid_at, se sold==100)
     let velocity_to_fill_minutes = null;
     if (soldCount === 100 && draw.opened_at && paid.last_paid_at) {
       velocity_to_fill_minutes = Math.round(
@@ -137,11 +121,11 @@ router.get("/summary/:drawId", async (req, res) => {
 });
 
 /* ============================================================================
- * 1b) DRAW LIST SUMMARY (todos os sorteios) — conforme SQL recomendado
+ * 1b) DRAW LIST SUMMARY (todos os sorteios)
  * ============================================================================ */
 router.get("/draws-summary", async (_req, res) => {
   try {
-    const rows = await q(
+    const { rows } = await q(
       `WITH sold_counts AS (
          SELECT draw_id, SUM((status='sold')::int) AS sold
          FROM numbers GROUP BY draw_id
@@ -174,13 +158,13 @@ router.get("/draws-summary", async (_req, res) => {
 });
 
 /* ============================================================================
- * 2) FUNIL — snapshot + VAZAMENTOS por dia (reservas/pagamentos expirados)
+ * 2) FUNIL + VAZAMENTOS
  * ============================================================================ */
 router.get("/funnel/:drawId", async (req, res) => {
   const drawId = Number(req.params.drawId);
   if (!Number.isFinite(drawId)) return res.status(400).json({ error: "drawId inválido" });
   try {
-    const snap = (await q(
+    const { rows } = await q(
       `SELECT
          SUM((status='available')::int) AS available,
          SUM((status='reserved')::int)  AS reserved,
@@ -188,8 +172,8 @@ router.get("/funnel/:drawId", async (req, res) => {
        FROM numbers
       WHERE draw_id=$1`,
       [drawId]
-    ))?.[0] || { available: 0, reserved: 0, sold: 0 };
-    res.json(snap);
+    );
+    res.json(rows?.[0] || { available: 0, reserved: 0, sold: 0 });
   } catch (e) {
     console.error("[analytics/funnel]", e);
     res.status(500).json({ error: "Falha ao obter funil" });
@@ -212,7 +196,7 @@ router.get("/leaks/daily", async (req, res) => {
       paramsP.push(drawId);
     }
 
-    const expired_reservations = await q(
+    const { rows: expired_reservations } = await q(
       `SELECT date_trunc('day', expires_at) AS day, COUNT(*)::int AS expired_reservations
          FROM reservations
        ${filterR}
@@ -220,7 +204,7 @@ router.get("/leaks/daily", async (req, res) => {
       paramsR
     );
 
-    const expired_payments = await q(
+    const { rows: expired_payments } = await q(
       `SELECT date_trunc('day', created_at) AS day, COUNT(*)::int AS expired_payments
          FROM payments
        ${filterP}
@@ -236,12 +220,12 @@ router.get("/leaks/daily", async (req, res) => {
 });
 
 /* ============================================================================
- * 3) RFM — com segmentação sugerida
+ * 3) RFM
  * ============================================================================ */
 router.get("/rfm", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   try {
-    const rows = await q(
+    const { rows } = await q(
       `WITH paid AS (
          SELECT user_id, SUM(amount_cents) AS m, COUNT(*) AS f, MAX(paid_at) AS last_paid
            FROM payments WHERE status='paid' GROUP BY user_id
@@ -257,7 +241,6 @@ router.get("/rfm", async (req, res) => {
       [limit]
     );
 
-    // classificar segmento
     const seg = (r, f) => {
       const rec = Number(r);
       const fr = Number(f);
@@ -269,12 +252,7 @@ router.get("/rfm", async (req, res) => {
       return "Regulares";
     };
 
-    const enriched = rows.map((x) => ({
-      ...x,
-      segment: seg(x.recency_days, x.freq),
-    }));
-
-    res.json(enriched);
+    res.json(rows.map(x => ({ ...x, segment: seg(x.recency_days, x.freq) })));
   } catch (e) {
     console.error("[analytics/rfm]", e);
     res.status(500).json({ error: "Falha ao obter RFM" });
@@ -282,11 +260,11 @@ router.get("/rfm", async (req, res) => {
 });
 
 /* ============================================================================
- * 4) COHORTS — matriz simples (coorte do 1º pagamento)
+ * 4) COHORTS
  * ============================================================================ */
 router.get("/cohorts", async (_req, res) => {
   try {
-    const rows = await q(
+    const { rows } = await q(
       `WITH first_paid AS (
          SELECT user_id, MIN(paid_at) AS first_paid_at
            FROM payments
@@ -315,13 +293,13 @@ router.get("/cohorts", async (_req, res) => {
 });
 
 /* ============================================================================
- * 5) NÚMEROS — vendidos por número & preferidos por cliente
+ * 5) NÚMEROS
  * ============================================================================ */
 router.get("/numbers/soldcount/:drawId", async (req, res) => {
   const drawId = Number(req.params.drawId);
   if (!Number.isFinite(drawId)) return res.status(400).json({ error: "drawId inválido" });
   try {
-    const rows = await q(
+    const { rows } = await q(
       `SELECT n.n::int AS n, COUNT(*)::int AS sold_count
          FROM numbers n
          JOIN reservations r ON r.id=n.reservation_id AND r.status='captured'
@@ -340,7 +318,7 @@ router.get("/numbers/soldcount/:drawId", async (req, res) => {
 
 router.get("/numbers/favorites-by-user", async (_req, res) => {
   try {
-    const rows = await q(
+    const { rows } = await q(
       `SELECT u.id AS user_id, u.name, x.n::int, COUNT(*)::int AS times_bought
          FROM payments p
          JOIN users u ON u.id=p.user_id
@@ -357,11 +335,11 @@ router.get("/numbers/favorites-by-user", async (_req, res) => {
 });
 
 /* ============================================================================
- * 6) CUPONS — eficácia
+ * 6) CUPONS
  * ============================================================================ */
 router.get("/coupons/efficacy", async (_req, res) => {
   try {
-    const rows = await q(
+    const { rows } = await q(
       `WITH enriched AS (
          SELECT p.*, u.coupon_code, u.coupon_value_cents, u.coupon_updated_at
            FROM payments p
@@ -385,11 +363,11 @@ router.get("/coupons/efficacy", async (_req, res) => {
 });
 
 /* ============================================================================
- * 7) AUTOPAY — runs/ok/GMV + avg missed (preferidos indisponíveis)
+ * 7) AUTOPAY
  * ============================================================================ */
 router.get("/autopay/stats", async (_req, res) => {
   try {
-    const daily = await q(
+    const { rows: daily } = await q(
       `SELECT date_trunc('day', created_at) AS day,
               COUNT(*)::int AS runs,
               SUM((status='ok')::int)::int AS ok_runs,
@@ -399,13 +377,13 @@ router.get("/autopay/stats", async (_req, res) => {
         ORDER BY 1 DESC`
     );
 
-    const missed = (await q(
+    const { rows } = await q(
       `SELECT AVG( (COALESCE(array_length(tried_numbers,1),0)
                    - COALESCE(array_length(bought_numbers,1),0)) ) AS avg_missed
          FROM autopay_runs`
-    ))?.[0] || { avg_missed: null };
-
-    res.json({ daily, avg_missed: missed.avg_missed !== null ? Number(missed.avg_missed) : null });
+    );
+    const avg = rows?.[0]?.avg_missed;
+    res.json({ daily, avg_missed: avg !== null ? Number(avg) : null });
   } catch (e) {
     console.error("[analytics/autopay/stats]", e);
     res.status(500).json({ error: "Falha ao obter autopay/stats" });
@@ -413,7 +391,7 @@ router.get("/autopay/stats", async (_req, res) => {
 });
 
 /* ============================================================================
- * 8) TEMPO & JANELAS — pagos por hora (BR) e latência até pagar
+ * 8) TEMPO & JANELAS
  * ============================================================================ */
 router.get("/payments/hourly", async (req, res) => {
   const drawId = req.query.drawId ? Number(req.query.drawId) : null;
@@ -424,7 +402,7 @@ router.get("/payments/hourly", async (req, res) => {
       filter += ` AND draw_id=$1`;
       params.push(drawId);
     }
-    const rows = await q(
+    const { rows } = await q(
       `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*)::int AS paid
          FROM payments
@@ -460,10 +438,9 @@ router.get("/payments/latency", async (req, res) => {
        SELECT AVG(EXTRACT(EPOCH FROM (paid_at - reserved_at))/60.0) AS avg_minutes_to_pay
          FROM link`,
       params
-    ))?.[0] || { avg_minutes_to_pay: null };
+    ))?.rows?.[0] || { avg_minutes_to_pay: null };
 
-    // Série semanal (opcional para gráfico)
-    const series = await q(
+    const series = (await q(
       `WITH link AS (
          SELECT p.id AS payment_id, p.paid_at, r.created_at AS reserved_at
            FROM payments p
@@ -476,7 +453,7 @@ router.get("/payments/latency", async (req, res) => {
         GROUP BY 1
         ORDER BY 1`,
       params
-    );
+    ))?.rows ?? [];
 
     res.json({
       avg_minutes_to_pay: avg.avg_minutes_to_pay !== null ? Number(avg.avg_minutes_to_pay) : null,
@@ -489,11 +466,11 @@ router.get("/payments/latency", async (req, res) => {
 });
 
 /* ============================================================================
- * SUPORTE — lista de sorteios para dropdown
+ * SUPORTE — lista de sorteios
  * ============================================================================ */
 router.get("/draws", async (_req, res) => {
   try {
-    const rows = await q(
+    const { rows } = await q(
       `SELECT id, product_name, status, opened_at, closed_at
          FROM draws
         ORDER BY id DESC
