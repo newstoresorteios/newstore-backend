@@ -483,4 +483,192 @@ router.get("/draws", async (_req, res) => {
   }
 });
 
+/* ============================================================================
+ * 0) KPIs GLOBAIS / OVERVIEW
+ * ============================================================================ */
+
+/** KPIs principais + séries auxiliares (para o Overview) */
+router.get("/kpis/overview", async (_req, res) => {
+  try {
+    // Totais pagos
+    const totals = (await q(
+      `WITH paid AS (
+         SELECT user_id, amount_cents
+         FROM payments
+         WHERE status='paid'
+       )
+       SELECT
+         COALESCE(SUM(amount_cents),0)::bigint                 AS total_gmv_cents,
+         COUNT(*)::int                                         AS total_orders,
+         COUNT(DISTINCT user_id)::int                          AS unique_buyers,
+         COALESCE(AVG(amount_cents),0)::bigint                 AS avg_ticket_cents
+       FROM paid`
+    ))?.[0] || {};
+
+    // Média de pedidos por cliente
+    const avgOrdersPerBuyer = (await q(
+      `WITH agg AS (
+         SELECT user_id, COUNT(*) AS f
+         FROM payments
+         WHERE status='paid'
+         GROUP BY user_id
+       )
+       SELECT COALESCE(AVG(f),0)::float AS avg_orders_per_buyer
+       FROM agg`
+    ))?.[0]?.avg_orders_per_buyer ?? 0;
+
+    // Últimos 30 dias: GMV & pedidos/dia
+    const daily30 = await q(
+      `SELECT date_trunc('day', paid_at) AS day,
+              SUM(amount_cents)::bigint  AS gmv_cents,
+              COUNT(*)::int              AS orders
+         FROM payments
+        WHERE status='paid' AND paid_at >= now() - interval '30 days'
+        GROUP BY 1 ORDER BY 1`
+    );
+
+    // Distribuição por hora (BR)
+    const hourly = await q(
+      `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
+              COUNT(*)::int AS paid
+         FROM payments
+        WHERE status='paid' AND paid_at IS NOT NULL
+        GROUP BY 1 ORDER BY 1`
+    );
+
+    // Top compradores (GMV)
+    const topBuyers = await q(
+      `SELECT u.id, u.name, u.email,
+              SUM(p.amount_cents)::bigint AS gmv_cents,
+              COUNT(*)::int               AS orders
+         FROM payments p
+         JOIN users u ON u.id=p.user_id
+        WHERE p.status='paid'
+        GROUP BY u.id, u.name, u.email
+        ORDER BY gmv_cents DESC
+        LIMIT 20`
+    );
+
+    // Top sorteios por GMV (usa pagamentos)
+    const topDraws = await q(
+      `SELECT d.id, d.product_name, d.status,
+              COALESCE(SUM(p.amount_cents),0)::bigint AS gmv_cents,
+              COUNT(p.*)::int                         AS paid_orders
+         FROM draws d
+         LEFT JOIN payments p ON p.draw_id=d.id AND p.status='paid'
+        GROUP BY d.id, d.product_name, d.status
+        ORDER BY gmv_cents DESC
+        LIMIT 20`
+    );
+
+    // Quantis do ticket
+    const quantiles = (await q(
+      `SELECT
+         percentile_disc(0.25) WITHIN GROUP (ORDER BY amount_cents)::bigint AS p25,
+         percentile_disc(0.50) WITHIN GROUP (ORDER BY amount_cents)::bigint AS p50,
+         percentile_disc(0.75) WITHIN GROUP (ORDER BY amount_cents)::bigint AS p75,
+         percentile_disc(0.90) WITHIN GROUP (ORDER BY amount_cents)::bigint AS p90
+       FROM payments
+       WHERE status='paid'`
+    ))?.[0] || { p25: 0, p50: 0, p75: 0, p90: 0 };
+
+    res.json({
+      totals: {
+        total_gmv_cents: Number(totals.total_gmv_cents || 0),
+        total_orders: Number(totals.total_orders || 0),
+        unique_buyers: Number(totals.unique_buyers || 0),
+        avg_ticket_cents: Number(totals.avg_ticket_cents || 0),
+        avg_orders_per_buyer: Number(avgOrdersPerBuyer || 0)
+      },
+      daily30,
+      hourly,
+      topBuyers,
+      topDraws,
+      quantiles
+    });
+  } catch (e) {
+    console.error("[analytics/kpis/overview]", e);
+    res.status(500).json({ error: "Falha ao obter KPIs do overview" });
+  }
+});
+
+/** Série diária genérica (últimos N dias) */
+router.get("/sales/daily", async (req, res) => {
+  const days = Math.min(Number(req.query.days) || 90, 365);
+  try {
+    const rows = await q(
+      `SELECT date_trunc('day', paid_at) AS day,
+              SUM(amount_cents)::bigint  AS gmv_cents,
+              COUNT(*)::int              AS orders
+         FROM payments
+        WHERE status='paid' AND paid_at >= now() - ($1 || ' days')::interval
+        GROUP BY 1 ORDER BY 1`,
+      [days]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[analytics/sales/daily]", e);
+    res.status(500).json({ error: "Falha ao obter série diária" });
+  }
+});
+
+/** Top compradores (paginável) */
+router.get("/buyers/top", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 500);
+  try {
+    const rows = await q(
+      `SELECT u.id, u.name, u.email, u.phone,
+              SUM(p.amount_cents)::bigint AS gmv_cents,
+              COUNT(*)::int               AS orders
+         FROM payments p
+         JOIN users u ON u.id=p.user_id
+        WHERE p.status='paid'
+        GROUP BY u.id, u.name, u.email, u.phone
+        ORDER BY gmv_cents DESC
+        LIMIT $1`,
+      [limit]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[analytics/buyers/top]", e);
+    res.status(500).json({ error: "Falha ao obter top compradores" });
+  }
+});
+
+/** Leaderboard de sorteios (usa sua CTE existente para fill-rate + GMV) */
+router.get("/draws/leaderboard", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 30, 200);
+  try {
+    const rows = await q(
+      `WITH sold_counts AS (
+         SELECT draw_id, SUM((status='sold')::int) AS sold
+         FROM numbers GROUP BY draw_id
+       ),
+       paid_gmv AS (
+         SELECT draw_id,
+                SUM(amount_cents) AS gmv_cents,
+                AVG(amount_cents) AS avg_ticket_cents,
+                COUNT(*)          AS paid_orders
+         FROM payments WHERE status='paid' GROUP BY draw_id
+       )
+       SELECT d.id, d.product_name, d.status,
+              COALESCE(sc.sold,0) AS sold,
+              COALESCE(pg.gmv_cents,0) AS gmv_cents,
+              COALESCE(pg.paid_orders,0) AS paid_orders,
+              ROUND(COALESCE(sc.sold,0)/100.0,2) AS fill_rate
+       FROM draws d
+       LEFT JOIN sold_counts sc ON sc.draw_id=d.id
+       LEFT JOIN paid_gmv    pg ON pg.draw_id=d.id
+       ORDER BY gmv_cents DESC NULLS LAST, id DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[analytics/draws/leaderboard]", e);
+    res.status(500).json({ error: "Falha ao obter leaderboard de sorteios" });
+  }
+});
+
+
 export default router;
