@@ -670,5 +670,139 @@ router.get("/draws/leaderboard", async (req, res) => {
   }
 });
 
+// --- OVERVIEW GERAL (todos os sorteios) -------------------------------------
+router.get("/overview", async (req, res) => {
+  const days = Math.min(Number(req.query.days) || 30, 365);
+
+  try {
+    // Totais por status
+    const totals = await q(
+      `WITH paid AS (
+         SELECT user_id, amount_cents
+           FROM payments
+          WHERE status='paid'
+       )
+       SELECT
+         -- paid
+         COALESCE(SUM(CASE WHEN status='paid' THEN amount_cents END),0)         AS gmv_paid_cents,
+         COUNT(*) FILTER (WHERE status='paid')                                  AS orders_paid,
+         COALESCE(AVG(amount_cents) FILTER (WHERE status='paid'),0)             AS avg_ticket_paid_cents,
+         COUNT(DISTINCT user_id) FILTER (WHERE status='paid')                   AS unique_buyers_paid,
+         -- intenção
+         COALESCE(SUM(CASE WHEN status IN ('pending','processing')
+                           THEN amount_cents END),0)                            AS gmv_intent_cents,
+         COUNT(*) FILTER (WHERE status IN ('pending','processing'))             AS orders_intent,
+         COALESCE(SUM(CASE WHEN status='expired' THEN amount_cents END),0)      AS gmv_expired_cents,
+         COUNT(*) FILTER (WHERE status='expired')                               AS orders_expired,
+         COALESCE(SUM(CASE WHEN status='cancelled' THEN amount_cents END),0)    AS gmv_cancelled_cents,
+         COUNT(*) FILTER (WHERE status='cancelled')                             AS orders_cancelled
+       FROM payments`
+    );
+
+    // média pedidos/cliente (paid)
+    const avgOrdersPerBuyer = (await q(
+      `WITH agg AS (
+         SELECT user_id, COUNT(*) AS c
+           FROM payments
+          WHERE status='paid'
+          GROUP BY user_id
+       ) SELECT COALESCE(AVG(c),0) AS avg_orders FROM agg`
+    ))?.[0]?.avg_orders || 0;
+
+    // quantis de ticket (paid)
+    const quant = (await q(
+      `SELECT
+         PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount_cents) AS p25,
+         PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY amount_cents) AS p50,
+         PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY amount_cents) AS p75,
+         PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY amount_cents) AS p90
+       FROM payments
+       WHERE status='paid'`
+    ))?.[0] || { p25: 0, p50: 0, p75: 0, p90: 0 };
+
+    // séries últimas N days (paid/intent/expired)
+    const series = await q(
+      `WITH base AS (
+         SELECT date_trunc('day', created_at) AS day, status, amount_cents
+           FROM payments
+          WHERE created_at >= now() - ($1 || ' days')::interval
+       )
+       SELECT day,
+              SUM(amount_cents) FILTER (WHERE status='paid')                      AS gmv_paid_cents,
+              SUM(amount_cents) FILTER (WHERE status IN ('pending','processing')) AS gmv_intent_cents,
+              SUM(amount_cents) FILTER (WHERE status='expired')                   AS gmv_expired_cents,
+              COUNT(*)        FILTER (WHERE status='paid')                        AS orders_paid,
+              COUNT(*)        FILTER (WHERE status IN ('pending','processing'))   AS orders_intent,
+              COUNT(*)        FILTER (WHERE status='expired')                     AS orders_expired
+         FROM base
+        GROUP BY 1
+        ORDER BY 1`,
+      [days]
+    );
+
+    // pagos por hora (últimos 90 dias)
+    const hourly = await q(
+      `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
+              COUNT(*) AS paid
+         FROM payments
+        WHERE status='paid'
+          AND paid_at >= now() - interval '90 days'
+          AND paid_at IS NOT NULL
+        GROUP BY 1 ORDER BY 1`
+    );
+
+    // top compradores (paid)
+    const topBuyers = await q(
+      `SELECT u.id AS user_id, u.name, u.email,
+              COUNT(*) AS orders, SUM(p.amount_cents) AS gmv_cents,
+              AVG(p.amount_cents) AS avg_ticket_cents
+         FROM payments p
+         JOIN users u ON u.id=p.user_id
+        WHERE p.status='paid'
+        GROUP BY u.id, u.name, u.email
+        ORDER BY gmv_cents DESC NULLS LAST
+        LIMIT 20`
+    );
+
+    res.json({
+      totals: {
+        gmv_paid_cents: Number(totals[0].gmv_paid_cents || 0),
+        orders_paid: Number(totals[0].orders_paid || 0),
+        avg_ticket_paid_cents: Number(totals[0].avg_ticket_paid_cents || 0),
+        unique_buyers_paid: Number(totals[0].unique_buyers_paid || 0),
+        avg_orders_per_buyer: Number(avgOrdersPerBuyer || 0),
+        p25_ticket_cents: Number(quant.p25 || 0),
+        p50_ticket_cents: Number(quant.p50 || 0),
+        p75_ticket_cents: Number(quant.p75 || 0),
+        p90_ticket_cents: Number(quant.p90 || 0),
+        // intenção/expirados/cancelados
+        gmv_intent_cents: Number(totals[0].gmv_intent_cents || 0),
+        orders_intent: Number(totals[0].orders_intent || 0),
+        gmv_expired_cents: Number(totals[0].gmv_expired_cents || 0),
+        orders_expired: Number(totals[0].orders_expired || 0),
+        gmv_cancelled_cents: Number(totals[0].gmv_cancelled_cents || 0),
+        orders_cancelled: Number(totals[0].orders_cancelled || 0),
+      },
+      series,
+      hourly,
+      topBuyers
+    });
+  } catch (e) {
+    console.error("[analytics/overview]", e);
+    res.status(500).json({ error: "Falha ao obter overview" });
+  }
+});
+
+// alias simples se seu front já chama /stats
+router.get("/stats", async (req, res) => {
+  try {
+    const o = await (await fetch(req.protocol + "://" + req.get("host") + `/api/admin/analytics/overview${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`)).json();
+    res.json(o);
+  } catch (e) {
+    console.error("[analytics/stats alias]", e);
+    res.status(500).json({ error: "Falha ao obter stats" });
+  }
+});
+
 
 export default router;
