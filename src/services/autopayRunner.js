@@ -1,6 +1,7 @@
 // backend/src/services/autopayRunner.js
 import { getPool } from "../db.js";
-import { mpChargeCard } from "./mercadopago.js";
+// MP desabilitado para autopay (mantido apenas para compatibilidade de imports, não usado)
+// import { mpChargeCard } from "./mercadopago.js";
 import { createBill, chargeBill, refundCharge, getBill } from "./vindi.js";
 
 /* ------------------------------------------------------- *
@@ -168,9 +169,13 @@ export async function runAutopayForDraw(draw_id) {
       return { ok: false, error: "autopay_already_ran" };
     }
 
-    // 2) Perfis elegíveis (Vindi primeiro, depois MP como fallback)
-    const { rows: profiles } = await client.query(
-      `select ap.*,
+    // 2) Perfis elegíveis (apenas Vindi - MP desabilitado para autopay)
+    // Feature flag para permitir MP (default: false - MP desabilitado)
+    const mpEnabled = process.env.AUTOPAY_ENABLE_MP === "true";
+    
+    // Query dinâmica baseada na feature flag
+    let querySQL = `
+      select ap.*,
               array(select n
                       from public.autopay_numbers an
                      where an.autopay_id = ap.id
@@ -179,11 +184,16 @@ export async function runAutopayForDraw(draw_id) {
         where ap.active = true
           and (
             (ap.vindi_customer_id is not null and ap.vindi_payment_profile_id is not null)
-            or
-            (ap.mp_customer_id is not null and ap.mp_card_id is not null)
-          )`
-    );
-    log("eligible profiles", { count: profiles.length });
+    `;
+    
+    if (mpEnabled) {
+      querySQL += ` or (ap.mp_customer_id is not null and ap.mp_card_id is not null)`;
+    }
+    
+    querySQL += `)`;
+    
+    const { rows: profiles } = await client.query(querySQL);
+    log("eligible profiles", { count: profiles.length, mpEnabled });
 
     // 3) Preço
     const price_cents = await getTicketPriceCents(client);
@@ -216,92 +226,86 @@ export async function runAutopayForDraw(draw_id) {
 
       const amount_cents = free.length * price_cents;
 
-      // 5) Determina provider (Vindi primeiro, MP como fallback)
+      // 5) Determina provider (Vindi-first, MP desabilitado por padrão)
       const useVindi = !!(p.vindi_customer_id && p.vindi_payment_profile_id);
-      const useMP = !useVindi && !!(p.mp_customer_id && p.mp_card_id);
+      const hasMP = !!(p.mp_customer_id && p.mp_card_id);
 
-      if (!useVindi && !useMP) {
-        results.push({ user_id, status: "skipped", reason: "no_payment_method" });
+      // Se não tem Vindi configurado, marca como skipped
+      if (!useVindi) {
+        let skipReason = "needs_vindi_setup";
+        let skipError = "needs_vindi_setup";
+        
+        // Se tem MP mas MP está desabilitado, marca especificamente
+        if (hasMP && !mpEnabled) {
+          skipReason = "mp_disabled_for_autopay";
+          skipError = "mp_disabled_for_autopay";
+          warn("SKIP perfil com MP - MP desabilitado para autopay", { user_id, draw_id });
+        } else {
+          warn("SKIP missing vindi_payment_profile_id", { user_id, draw_id });
+        }
+
+        // Registra skip no autopay_runs
+        await client.query(
+          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error,provider)
+           values ($1,$2,$3,$4,'skipped',$5,'none')`,
+          [p.id, user_id, draw_id, free, skipError]
+        );
+
+        results.push({ user_id, status: "skipped", reason: skipReason });
         continue;
       }
 
+      // 6) Cobrança Vindi (único provider suportado)
       let charge;
-      let provider = "unknown";
+      let provider = "vindi";
       let billId = null;
       let chargeId = null;
-      let paymentId = null;
 
       try {
-        if (useVindi) {
-          // 5a) Cobrança Vindi
-          provider = "vindi";
-          const description = `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`;
-          
+        const description = `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`;
+        
+        // eslint-disable-next-line no-await-in-loop
+        const bill = await createBill({
+          customerId: p.vindi_customer_id,
+          amount: amount_cents,
+          description,
+          metadata: { user_id, draw_id, numbers: free },
+          paymentProfileId: p.vindi_payment_profile_id,
+        });
+
+        billId = bill.billId;
+        chargeId = bill.chargeId;
+
+        // Se não foi cobrado automaticamente, cobra agora
+        if (!chargeId || bill.status !== "paid") {
           // eslint-disable-next-line no-await-in-loop
-          const bill = await createBill({
-            customerId: p.vindi_customer_id,
-            amount: amount_cents,
-            description,
-            metadata: { user_id, draw_id, numbers: free },
-            paymentProfileId: p.vindi_payment_profile_id,
-          });
-
-          billId = bill.billId;
-          chargeId = bill.chargeId;
-
-          // Se não foi cobrado automaticamente, cobra agora
-          if (!chargeId || bill.status !== "paid") {
-            // eslint-disable-next-line no-await-in-loop
-            const chargeResult = await chargeBill(billId);
-            chargeId = chargeResult.chargeId;
-          }
-
-          // Verifica status da bill
-          // eslint-disable-next-line no-await-in-loop
-          const billInfo = await getBill(billId);
-          const billStatus = billInfo?.status?.toLowerCase();
-
-          if (billStatus === "paid") {
-            charge = { status: "approved", paymentId: chargeId || billId };
-          } else {
-            throw new Error(`Bill não paga: status=${billStatus}`);
-          }
-
-          log("Vindi charge ->", { user_id, billId, chargeId, status: billStatus });
-        } else if (useMP) {
-          // 5b) Cobrança Mercado Pago (fallback)
-          provider = "mercadopago";
-          // eslint-disable-next-line no-await-in-loop
-          charge = await mpChargeCard({
-            customerId: p.mp_customer_id,
-            cardId: p.mp_card_id,
-            amount_cents,
-            description: `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`,
-            metadata: { user_id, draw_id, numbers: free },
-          });
-          paymentId = charge.paymentId;
-          log("MP charge ->", { user_id, status: charge?.status, id: paymentId });
+          const chargeResult = await chargeBill(billId);
+          chargeId = chargeResult.chargeId;
         }
+
+        // Verifica status da bill
+        // eslint-disable-next-line no-await-in-loop
+        const billInfo = await getBill(billId);
+        const billStatus = billInfo?.status?.toLowerCase();
+
+        if (billStatus === "paid") {
+          charge = { status: "approved", paymentId: chargeId || billId };
+        } else {
+          throw new Error(`Bill não paga: status=${billStatus}`);
+        }
+
+        log("Vindi charge ->", { user_id, billId, chargeId, status: billStatus });
       } catch (e) {
         const emsg = String(e?.message || e);
-        const requiresCVV =
-          e?.code === "SECURITY_CODE_REQUIRED" ||
-          emsg.toLowerCase().includes("security_code");
 
         await client.query(
           `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error,provider)
            values ($1,$2,$3,$4,'error',$5,$6)`,
-          [p.id, user_id, draw_id, free, requiresCVV ? "security_code_required" : emsg, provider]
+          [p.id, user_id, draw_id, free, emsg, provider]
         );
 
-        if (requiresCVV) {
-          warn("MP exige CVV para este cartão — perfil será ignorado", { user_id, draw_id });
-          results.push({ user_id, status: "skipped", reason: "security_code_required" });
-          continue;
-        }
-
         // Se foi Vindi e falhou, tenta refund se já cobrou
-        if (useVindi && billId && chargeId) {
+        if (billId && chargeId) {
           try {
             // eslint-disable-next-line no-await-in-loop
             await refundCharge(chargeId, true);
@@ -311,7 +315,7 @@ export async function runAutopayForDraw(draw_id) {
           }
         }
 
-        err("falha ao cobrar", { user_id, provider, msg: emsg });
+        err("falha ao cobrar Vindi", { user_id, provider, msg: emsg });
         results.push({ user_id, status: "error", error: "charge_failed", provider });
         continue;
       }
@@ -327,12 +331,12 @@ export async function runAutopayForDraw(draw_id) {
         continue;
       }
 
-      // 6) Grava payment + reservation (com provider)
+      // 7) Grava payment + reservation (com provider)
       const pay = await client.query(
         `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at, provider, vindi_bill_id, vindi_charge_id)
          values ($1,$2,$3::int2[],$4,'approved', now(), $5, $6, $7)
          returning id`,
-        [user_id, draw_id, free, amount_cents, provider, billId, chargeId || paymentId]
+        [user_id, draw_id, free, amount_cents, provider, billId, chargeId]
       );
       const reservation = await client.query(
         `insert into public.reservations
@@ -343,7 +347,7 @@ export async function runAutopayForDraw(draw_id) {
       );
       const resv_id = reservation.rows[0].id;
 
-      // 7) Atualiza números vendidos
+      // 8) Atualiza números vendidos
       await client.query(
         `update public.numbers n
             set status = 'sold',
@@ -353,7 +357,7 @@ export async function runAutopayForDraw(draw_id) {
         [resv_id, draw_id, free]
       );
 
-      // 8) Audita
+      // 9) Audita
       await client.query(
         `insert into public.autopay_runs
            (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,payment_id,reservation_id,provider)
@@ -372,7 +376,7 @@ export async function runAutopayForDraw(draw_id) {
       results.push({ user_id, status: "ok", numbers: free, amount_cents });
     }
 
-    // 9) Marca draw como processado
+    // 10) Marca draw como processado
     await client.query(
       `update public.draws set autopay_ran_at = now() where id=$1`,
       [draw_id]
