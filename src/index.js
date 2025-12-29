@@ -11,6 +11,7 @@ import authRoutes from "./routes/auth.js";
 import numbersRoutes from "./routes/numbers.js";
 import reservationsRoutes from "./routes/reservations.js";
 import paymentsRoutes from "./routes/payments.js";
+import paymentsVindiRoutes from "./routes/payments_vindi.js";
 import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
@@ -35,6 +36,7 @@ import couponsRouter from "./routes/coupons.js";
 import adminUsersRouter from "./routes/adminUsers.js";
 
 import autopayRouter from "./routes/autopay.js";
+import autopayVindiRouter from "./routes/autopay_vindi.js";
 
 import meDraws from "./routes/me_draws.js";
 
@@ -95,6 +97,7 @@ app.use("/api/reservations", reservationsRoutes);
 
 // Pagamentos
 app.use("/api/payments", paymentsRoutes);
+app.use("/api/payments", paymentsVindiRoutes);
 app.use("/api/orders", paymentsRoutes); // aliases
 app.use("/api/participations", paymentsRoutes); // aliases
 
@@ -126,6 +129,7 @@ app.use("/api/coupons", couponsRouter);
 app.use("/api/admin/users", adminUsersRouter);
 
 app.use("/api", autopayRouter);
+app.use("/api/autopay", autopayVindiRouter);
 
 app.use("/api/me/draws", meDraws);
 

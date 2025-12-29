@@ -1,6 +1,7 @@
 // backend/src/services/autopayRunner.js
 import { getPool } from "../db.js";
 import { mpChargeCard } from "./mercadopago.js";
+import { createBill, chargeBill, refundCharge, getBill } from "./vindi.js";
 
 /* ------------------------------------------------------- *
  * Logging enxuto com contexto
@@ -167,7 +168,7 @@ export async function runAutopayForDraw(draw_id) {
       return { ok: false, error: "autopay_already_ran" };
     }
 
-    // 2) Perfis elegíveis
+    // 2) Perfis elegíveis (Vindi primeiro, depois MP como fallback)
     const { rows: profiles } = await client.query(
       `select ap.*,
               array(select n
@@ -176,8 +177,11 @@ export async function runAutopayForDraw(draw_id) {
                      order by n) as numbers
          from public.autopay_profiles ap
         where ap.active = true
-          and ap.mp_customer_id is not null
-          and ap.mp_card_id is not null`
+          and (
+            (ap.vindi_customer_id is not null and ap.vindi_payment_profile_id is not null)
+            or
+            (ap.mp_customer_id is not null and ap.mp_card_id is not null)
+          )`
     );
     log("eligible profiles", { count: profiles.length });
 
@@ -212,19 +216,72 @@ export async function runAutopayForDraw(draw_id) {
 
       const amount_cents = free.length * price_cents;
 
-      // 5) Cobrança Mercado Pago (sem CVV; se exigir, marcamos SECURITY_CODE_REQUIRED)
+      // 5) Determina provider (Vindi primeiro, MP como fallback)
+      const useVindi = !!(p.vindi_customer_id && p.vindi_payment_profile_id);
+      const useMP = !useVindi && !!(p.mp_customer_id && p.mp_card_id);
+
+      if (!useVindi && !useMP) {
+        results.push({ user_id, status: "skipped", reason: "no_payment_method" });
+        continue;
+      }
+
       let charge;
+      let provider = "unknown";
+      let billId = null;
+      let chargeId = null;
+      let paymentId = null;
+
       try {
-        // eslint-disable-next-line no-await-in-loop
-        charge = await mpChargeCard({
-          customerId: p.mp_customer_id,
-          cardId: p.mp_card_id,
-          amount_cents,
-          description: `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`,
-          metadata: { user_id, draw_id, numbers: free },
-          // security_code: undefined  // não armazenamos CVV
-        });
-        log("MP charge ->", { user_id, status: charge?.status, id: charge?.paymentId });
+        if (useVindi) {
+          // 5a) Cobrança Vindi
+          provider = "vindi";
+          const description = `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`;
+          
+          // eslint-disable-next-line no-await-in-loop
+          const bill = await createBill({
+            customerId: p.vindi_customer_id,
+            amount: amount_cents,
+            description,
+            metadata: { user_id, draw_id, numbers: free },
+            paymentProfileId: p.vindi_payment_profile_id,
+          });
+
+          billId = bill.billId;
+          chargeId = bill.chargeId;
+
+          // Se não foi cobrado automaticamente, cobra agora
+          if (!chargeId || bill.status !== "paid") {
+            // eslint-disable-next-line no-await-in-loop
+            const chargeResult = await chargeBill(billId);
+            chargeId = chargeResult.chargeId;
+          }
+
+          // Verifica status da bill
+          // eslint-disable-next-line no-await-in-loop
+          const billInfo = await getBill(billId);
+          const billStatus = billInfo?.status?.toLowerCase();
+
+          if (billStatus === "paid") {
+            charge = { status: "approved", paymentId: chargeId || billId };
+          } else {
+            throw new Error(`Bill não paga: status=${billStatus}`);
+          }
+
+          log("Vindi charge ->", { user_id, billId, chargeId, status: billStatus });
+        } else if (useMP) {
+          // 5b) Cobrança Mercado Pago (fallback)
+          provider = "mercadopago";
+          // eslint-disable-next-line no-await-in-loop
+          charge = await mpChargeCard({
+            customerId: p.mp_customer_id,
+            cardId: p.mp_card_id,
+            amount_cents,
+            description: `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`,
+            metadata: { user_id, draw_id, numbers: free },
+          });
+          paymentId = charge.paymentId;
+          log("MP charge ->", { user_id, status: charge?.status, id: paymentId });
+        }
       } catch (e) {
         const emsg = String(e?.message || e);
         const requiresCVV =
@@ -232,9 +289,9 @@ export async function runAutopayForDraw(draw_id) {
           emsg.toLowerCase().includes("security_code");
 
         await client.query(
-          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
-           values ($1,$2,$3,$4,'error',$5)`,
-          [p.id, user_id, draw_id, free, requiresCVV ? "security_code_required" : emsg]
+          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error,provider)
+           values ($1,$2,$3,$4,'error',$5,$6)`,
+          [p.id, user_id, draw_id, free, requiresCVV ? "security_code_required" : emsg, provider]
         );
 
         if (requiresCVV) {
@@ -243,28 +300,39 @@ export async function runAutopayForDraw(draw_id) {
           continue;
         }
 
-        err("falha ao cobrar MP", { user_id, msg: emsg });
-        results.push({ user_id, status: "error", error: "charge_failed" });
+        // Se foi Vindi e falhou, tenta refund se já cobrou
+        if (useVindi && billId && chargeId) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await refundCharge(chargeId, true);
+            warn("Vindi: refund executado após falha", { user_id, billId, chargeId });
+          } catch (refundErr) {
+            err("Vindi: falha ao fazer refund", { user_id, billId, chargeId, msg: refundErr?.message });
+          }
+        }
+
+        err("falha ao cobrar", { user_id, provider, msg: emsg });
+        results.push({ user_id, status: "error", error: "charge_failed", provider });
         continue;
       }
 
       if (!charge || String(charge.status).toLowerCase() !== "approved") {
         await client.query(
-          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
-           values ($1,$2,$3,$4,'error','not_approved')`,
-          [p.id, user_id, draw_id, free]
+          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error,provider)
+           values ($1,$2,$3,$4,'error','not_approved',$5)`,
+          [p.id, user_id, draw_id, free, provider]
         );
-        warn("pagamento não aprovado", { user_id, draw_id });
-        results.push({ user_id, status: "error", error: "not_approved" });
+        warn("pagamento não aprovado", { user_id, draw_id, provider });
+        results.push({ user_id, status: "error", error: "not_approved", provider });
         continue;
       }
 
-      // 6) Grava payment + reservation
+      // 6) Grava payment + reservation (com provider)
       const pay = await client.query(
-        `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
-         values ($1,$2,$3::int2[],$4,'approved', now())
+        `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at, provider, vindi_bill_id, vindi_charge_id)
+         values ($1,$2,$3::int2[],$4,'approved', now(), $5, $6, $7)
          returning id`,
-        [user_id, draw_id, free, amount_cents]
+        [user_id, draw_id, free, amount_cents, provider, billId, chargeId || paymentId]
       );
       const reservation = await client.query(
         `insert into public.reservations
@@ -288,9 +356,9 @@ export async function runAutopayForDraw(draw_id) {
       // 8) Audita
       await client.query(
         `insert into public.autopay_runs
-           (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,payment_id,reservation_id)
-         values ($1,$2,$3,$4,$5,$6,'ok',$7,$8)`,
-        [p.id, user_id, draw_id, free, free, amount_cents, pay.rows[0].id, resv_id]
+           (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,payment_id,reservation_id,provider)
+         values ($1,$2,$3,$4,$5,$6,'ok',$7,$8,$9)`,
+        [p.id, user_id, draw_id, free, free, amount_cents, pay.rows[0].id, resv_id, provider]
       );
 
       log("gravado payment/reservation", {
