@@ -10,18 +10,25 @@ const router = express.Router();
  * POST /api/payments/vindi/webhook
  * Recebe webhooks da Vindi e atualiza status de pagamentos
  */
-router.post("/vindi/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+router.post("/vindi/webhook", express.json(), async (req, res) => {
   const pool = await getPool();
   const client = await pool.connect();
 
   try {
-    // Parse do payload (pode vir como string ou objeto)
+    // Parse do payload com fallback robusto para Buffer/string
     let payload;
     try {
-      if (typeof req.body === "string") {
+      if (Buffer.isBuffer(req.body)) {
+        // Se vier como Buffer, converte para string e parseia
+        payload = JSON.parse(req.body.toString("utf8"));
+      } else if (typeof req.body === "string") {
+        // Se vier como string, parseia
         payload = JSON.parse(req.body);
-      } else {
+      } else if (typeof req.body === "object" && req.body !== null) {
+        // Se já for objeto, usa diretamente
         payload = req.body;
+      } else {
+        throw new Error("Payload inválido: tipo não suportado");
       }
     } catch (e) {
       console.error("[vindi/webhook] erro ao parsear payload:", e?.message);

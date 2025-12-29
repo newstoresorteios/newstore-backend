@@ -20,12 +20,13 @@ BEGIN
       ALTER TABLE public.autopay_profiles ADD COLUMN vindi_payment_profile_id text;
     END IF;
 
-    IF NOT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'autopay_profiles' AND column_name = 'vindi_last_four') THEN
-      ALTER TABLE public.autopay_profiles ADD COLUMN vindi_last_four text;
+    IF NOT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'autopay_profiles' AND column_name = 'vindi_last4') THEN
+      ALTER TABLE public.autopay_profiles ADD COLUMN vindi_last4 text;
     END IF;
 
-    IF NOT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'autopay_profiles' AND column_name = 'vindi_status') THEN
-      ALTER TABLE public.autopay_profiles ADD COLUMN vindi_status text;
+    -- vindi_brand (se não existir, adiciona)
+    IF NOT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'autopay_profiles' AND column_name = 'vindi_brand') THEN
+      ALTER TABLE public.autopay_profiles ADD COLUMN vindi_brand text;
     END IF;
 
     IF NOT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'autopay_profiles' AND column_name = 'vindi_failed_reason') THEN
@@ -108,8 +109,8 @@ END $$;
 
 COMMENT ON COLUMN public.autopay_profiles.vindi_customer_id IS 'ID do customer na Vindi';
 COMMENT ON COLUMN public.autopay_profiles.vindi_payment_profile_id IS 'ID do payment_profile (cartão) na Vindi';
-COMMENT ON COLUMN public.autopay_profiles.vindi_last_four IS 'Últimos 4 dígitos do cartão (Vindi)';
-COMMENT ON COLUMN public.autopay_profiles.vindi_status IS 'Status do perfil na Vindi';
+COMMENT ON COLUMN public.autopay_profiles.vindi_last4 IS 'Últimos 4 dígitos do cartão (Vindi)';
+COMMENT ON COLUMN public.autopay_profiles.vindi_brand IS 'Bandeira do cartão (Vindi)';
 COMMENT ON COLUMN public.payments.provider IS 'Provider do pagamento: mercadopago ou vindi';
 COMMENT ON COLUMN public.payments.vindi_bill_id IS 'ID da bill na Vindi';
 COMMENT ON COLUMN public.payments.vindi_charge_id IS 'ID do charge na Vindi';

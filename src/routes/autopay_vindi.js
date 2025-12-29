@@ -103,7 +103,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
 
     // 4) Cria payment_profile na Vindi
     let paymentProfileId = profile.vindi_payment_profile_id;
-    let lastFour = profile.vindi_last_four;
+    let lastFour = profile.vindi_last4;
 
     try {
       const paymentProfile = await createPaymentProfile({
@@ -134,8 +134,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
       `update public.autopay_profiles
           set vindi_customer_id = $2,
               vindi_payment_profile_id = $3,
-              vindi_last_four = $4,
-              vindi_status = 'active',
+              vindi_last4 = $4,
               updated_at = now()
         where id=$1
         returning *`,
@@ -205,13 +204,12 @@ router.get("/vindi/status", requireAuth, async (req, res) => {
         ? {
             customer_id: p.vindi_customer_id,
             payment_profile_id: p.vindi_payment_profile_id,
-            last_four: p.vindi_last_four,
-            status: p.vindi_status,
+            last_four: p.vindi_last4,
           }
         : null,
       card: hasVindi
         ? {
-            last4: p.vindi_last_four || null,
+            last4: p.vindi_last4 || null,
             has_card: true,
           }
         : {
@@ -263,8 +261,7 @@ router.post("/vindi/cancel", requireAuth, async (req, res) => {
       `update public.autopay_profiles
           set active=false,
               vindi_payment_profile_id=null,
-              vindi_last_four=null,
-              vindi_status=null,
+              vindi_last4=null,
               updated_at=now()
         where id=$1
         returning *`,
