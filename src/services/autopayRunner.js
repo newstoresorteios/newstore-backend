@@ -169,42 +169,39 @@ export async function runAutopayForDraw(draw_id) {
       return { ok: false, error: "autopay_already_ran" };
     }
 
-    // 2) Perfis elegíveis (apenas Vindi - MP desabilitado para autopay)
-    // Feature flag para permitir MP (default: false - MP desabilitado)
-    const mpEnabled = process.env.AUTOPAY_ENABLE_MP === "true";
+    // 2) Verifica modo Vindi (obrigatório)
+    const vindiMode = !!process.env.VINDI_API_KEY;
     
-    // Query dinâmica baseada na feature flag
-    let querySQL = `
-      select ap.*,
+    if (!vindiMode) {
+      await client.query("ROLLBACK");
+      err("VINDI_API_KEY não configurada - autopay requer Vindi", {});
+      return { ok: false, error: "vindi_not_configured" };
+    }
+
+    // 3) Perfis elegíveis (apenas Vindi configurado)
+    const { rows: profiles } = await client.query(
+      `select ap.*,
               array(select n
                       from public.autopay_numbers an
                      where an.autopay_id = ap.id
                      order by n) as numbers
          from public.autopay_profiles ap
         where ap.active = true
-          and (
-            (ap.vindi_customer_id is not null and ap.vindi_payment_profile_id is not null)
-    `;
-    
-    if (mpEnabled) {
-      querySQL += ` or (ap.mp_customer_id is not null and ap.mp_card_id is not null)`;
-    }
-    
-    querySQL += `)`;
-    
-    const { rows: profiles } = await client.query(querySQL);
-    log("eligible profiles", { count: profiles.length, mpEnabled });
+          and ap.vindi_customer_id is not null
+          and ap.vindi_payment_profile_id is not null`
+    );
+    log("eligible profiles (Vindi mode)", { count: profiles.length });
 
-    // 3) Preço
+    // 4) Preço
     const price_cents = await getTicketPriceCents(client);
 
     const results = [];
 
-    // 4) Loop usuários
+    // 5) Loop usuários
     for (const p of profiles) {
       const user_id = p.user_id;
       const wants = (p.numbers || []).map(Number).filter(n => n >= 0 && n <= 99);
-      log("USER begin", { user_id, wants });
+      log("USER begin", { user_id, wants, provider: "vindi" });
 
       if (!wants.length) {
         results.push({ user_id, status: "skipped", reason: "no_numbers" });
@@ -225,35 +222,6 @@ export async function runAutopayForDraw(draw_id) {
       }
 
       const amount_cents = free.length * price_cents;
-
-      // 5) Determina provider (Vindi-first, MP desabilitado por padrão)
-      const useVindi = !!(p.vindi_customer_id && p.vindi_payment_profile_id);
-      const hasMP = !!(p.mp_customer_id && p.mp_card_id);
-
-      // Se não tem Vindi configurado, marca como skipped
-      if (!useVindi) {
-        let skipReason = "needs_vindi_setup";
-        let skipError = "needs_vindi_setup";
-        
-        // Se tem MP mas MP está desabilitado, marca especificamente
-        if (hasMP && !mpEnabled) {
-          skipReason = "mp_disabled_for_autopay";
-          skipError = "mp_disabled_for_autopay";
-          warn("SKIP perfil com MP - MP desabilitado para autopay", { user_id, draw_id });
-        } else {
-          warn("SKIP missing vindi_payment_profile_id", { user_id, draw_id });
-        }
-
-        // Registra skip no autopay_runs
-        await client.query(
-          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error,provider)
-           values ($1,$2,$3,$4,'skipped',$5,'none')`,
-          [p.id, user_id, draw_id, free, skipError]
-        );
-
-        results.push({ user_id, status: "skipped", reason: skipReason });
-        continue;
-      }
 
       // 6) Cobrança Vindi (único provider suportado)
       let charge;
@@ -331,10 +299,10 @@ export async function runAutopayForDraw(draw_id) {
         continue;
       }
 
-      // 7) Grava payment + reservation (com provider)
+      // 7) Grava payment + reservation (com provider e IDs Vindi)
       const pay = await client.query(
-        `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at, provider, vindi_bill_id, vindi_charge_id)
-         values ($1,$2,$3::int2[],$4,'approved', now(), $5, $6, $7)
+        `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at, provider, vindi_bill_id, vindi_charge_id, vindi_status)
+         values ($1,$2,$3::int2[],$4,'approved', now(), $5, $6, $7, 'paid')
          returning id`,
         [user_id, draw_id, free, amount_cents, provider, billId, chargeId]
       );
@@ -371,6 +339,8 @@ export async function runAutopayForDraw(draw_id) {
         reservation_id: resv_id,
         free,
         amount_cents,
+        billId,
+        chargeId,
       });
 
       results.push({ user_id, status: "ok", numbers: free, amount_cents });

@@ -46,15 +46,6 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
     const numbers = parseNumbers(req.body?.numbers);
     const active = req.body?.active !== undefined ? !!req.body.active : true;
 
-    // Validações
-    if (!gateway_token) {
-      return res.status(400).json({ error: "gateway_token é obrigatório" });
-    }
-
-    if (!holder_name || !doc_number) {
-      return res.status(400).json({ error: "holder_name e doc_number são obrigatórios" });
-    }
-
     // Verifica se Vindi está configurado
     if (!process.env.VINDI_API_KEY) {
       console.error("[autopay/vindi] VINDI_API_KEY não configurado");
@@ -63,21 +54,53 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1) Upsert perfil no DB
+    // 1) Busca perfil existente (se houver)
+    let existingProfile = null;
+    const existingResult = await client.query(
+      `select * from public.autopay_profiles where user_id=$1 limit 1`,
+      [user_id]
+    );
+    if (existingResult.rows.length) {
+      existingProfile = existingResult.rows[0];
+    }
+
+    // 2) Validações: gateway_token é obrigatório apenas se não tem Vindi configurado
+    const hasVindiProfile = !!(existingProfile?.vindi_payment_profile_id);
+    
+    if (!hasVindiProfile && !gateway_token) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "gateway_token_required",
+        code: "GATEWAY_TOKEN_REQUIRED",
+        message: "gateway_token é obrigatório quando não há cartão Vindi salvo",
+      });
+    }
+
+    // Se tem Vindi mas veio gateway_token, valida dados do titular
+    if (hasVindiProfile && gateway_token) {
+      if (!holder_name || !doc_number) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "holder_name e doc_number são obrigatórios ao atualizar cartão",
+        });
+      }
+    }
+
+    // 3) Upsert perfil no DB
     let profileResult = await client.query(
       `insert into public.autopay_profiles (user_id, active, holder_name, doc_number)
        values ($1,$2,$3,$4)
        on conflict (user_id) do update
          set active = excluded.active,
-             holder_name = excluded.holder_name,
-             doc_number = excluded.doc_number,
+             holder_name = COALESCE(excluded.holder_name, autopay_profiles.holder_name),
+             doc_number = COALESCE(excluded.doc_number, autopay_profiles.doc_number),
              updated_at = now()
        returning *`,
       [user_id, active, holder_name || null, doc_number || null]
     );
     const profile = profileResult.rows[0];
 
-    // 2) Atualiza números (substitui todos)
+    // 4) Atualiza números (substitui todos)
     await client.query(
       `delete from public.autopay_numbers where autopay_id=$1`,
       [profile.id]
@@ -90,8 +113,32 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
       );
     }
 
-    // 3) Integração Vindi: ensureCustomer
+    // 5) Se já tem Vindi configurado e não veio gateway_token, apenas atualiza preferências
     let vindiCustomerId = profile.vindi_customer_id;
+    let paymentProfileId = profile.vindi_payment_profile_id;
+    let lastFour = profile.vindi_last4;
+
+    if (hasVindiProfile && !gateway_token) {
+      // Apenas atualiza preferências, não recria payment_profile
+      await client.query("COMMIT");
+      
+      return res.json({
+        ok: true,
+        active,
+        numbers,
+        vindi: {
+          customer_id: vindiCustomerId,
+          payment_profile_id: paymentProfileId,
+          last_four: lastFour,
+        },
+        card: {
+          last4: lastFour || null,
+          has_card: true,
+        },
+      });
+    }
+
+    // 6) Integração Vindi: ensureCustomer (se necessário)
     if (!vindiCustomerId) {
       const customer = await ensureCustomer({
         email: req.user.email,
@@ -101,40 +148,50 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
       vindiCustomerId = customer.customerId;
     }
 
-    // 4) Cria payment_profile na Vindi
-    let paymentProfileId = profile.vindi_payment_profile_id;
-    let lastFour = profile.vindi_last4;
+    // 7) Cria/atualiza payment_profile na Vindi (apenas se veio gateway_token)
+    if (gateway_token) {
+      if (!holder_name || !doc_number) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "holder_name e doc_number são obrigatórios ao salvar cartão",
+        });
+      }
 
-    try {
-      const paymentProfile = await createPaymentProfile({
-        customerId: vindiCustomerId,
-        gatewayToken: gateway_token,
-        holderName: holder_name,
-        docNumber: doc_number,
-        phone: req.user.phone || null,
-      });
+      try {
+        const paymentProfile = await createPaymentProfile({
+          customerId: vindiCustomerId,
+          gatewayToken: gateway_token,
+          holderName: holder_name,
+          docNumber: doc_number,
+          phone: req.user.phone || null,
+        });
 
-      paymentProfileId = paymentProfile.paymentProfileId;
-      lastFour = paymentProfile.lastFour;
-    } catch (e) {
-      await client.query("ROLLBACK");
-      console.error("[autopay/vindi] createPaymentProfile falhou", {
-        user_id,
-        msg: e?.message,
-        status: e?.status,
-      });
-      return res.status(500).json({
-        error: "payment_profile_failed",
-        message: e?.message || "Falha ao salvar cartão na Vindi",
-      });
+        paymentProfileId = paymentProfile.paymentProfileId;
+        lastFour = paymentProfile.lastFour;
+      } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("[autopay/vindi] createPaymentProfile falhou", {
+          user_id,
+          msg: e?.message,
+          status: e?.status,
+        });
+        return res.status(500).json({
+          error: "payment_profile_failed",
+          message: e?.message || "Falha ao salvar cartão na Vindi",
+        });
+      }
     }
 
-    // 5) Atualiza perfil com dados Vindi
+    // 8) Atualiza perfil com dados Vindi e limpa campos MP
     const updateResult = await client.query(
       `update public.autopay_profiles
           set vindi_customer_id = $2,
               vindi_payment_profile_id = $3,
               vindi_last4 = $4,
+              mp_customer_id = NULL,
+              mp_card_id = NULL,
+              brand = NULL,
+              last4 = NULL,
               updated_at = now()
         where id=$1
         returning *`,
