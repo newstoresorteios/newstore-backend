@@ -413,6 +413,51 @@ export function parseWebhook(payload) {
   return result;
 }
 
+/**
+ * Associa gateway_token a um payment_profile existente (janela de 5 minutos)
+ * @param {object} params - { customerId, gatewayToken }
+ * @returns {Promise<{paymentProfileId: string, lastFour?: string, cardType?: string}>}
+ */
+export async function associateGatewayToken({ customerId, gatewayToken }) {
+  if (!customerId || !gatewayToken) {
+    throw new Error("customerId e gatewayToken são obrigatórios");
+  }
+
+  try {
+    // O gateway_token deve ser associado dentro de 5 minutos após a tokenização
+    // A Vindi permite associar via POST /payment_profiles com gateway_token
+    const body = {
+      customer_id: customerId,
+      gateway_token: gatewayToken,
+      payment_method_code: VINDI_DEFAULT_PAYMENT_METHOD,
+      payment_company_code: VINDI_DEFAULT_GATEWAY,
+    };
+
+    const created = await vindiRequest("POST", "/payment_profiles", body);
+    const profile = created.payment_profile;
+
+    log("gateway_token associado", {
+      paymentProfileId: profile?.id,
+      customerId,
+      lastFour: profile?.last_four,
+      cardType: profile?.card_type,
+    });
+
+    return {
+      paymentProfileId: profile?.id,
+      lastFour: profile?.last_four || null,
+      cardType: profile?.card_type || null,
+    };
+  } catch (e) {
+    err("associateGatewayToken falhou", {
+      customerId,
+      msg: e?.message,
+      status: e?.status,
+    });
+    throw e;
+  }
+}
+
 export default {
   ensureCustomer,
   createPaymentProfile,
@@ -422,5 +467,6 @@ export default {
   getBill,
   getCharge,
   parseWebhook,
+  associateGatewayToken,
 };
 

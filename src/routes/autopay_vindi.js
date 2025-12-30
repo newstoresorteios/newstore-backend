@@ -6,6 +6,7 @@ import { requireAuth } from "../middleware/auth.js";
 import {
   ensureCustomer,
   createPaymentProfile,
+  associateGatewayToken,
 } from "../services/vindi.js";
 import { tokenizeCardPublic } from "../services/vindi_public.js";
 
@@ -47,23 +48,31 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     // Extrai e valida campos obrigatórios
     const holder_name = req.body?.holder_name;
     const card_number = req.body?.card_number;
+    const card_expiration = req.body?.card_expiration; // MM/YYYY
     const card_expiration_month = req.body?.card_expiration_month;
     const card_expiration_year = req.body?.card_expiration_year;
     const card_cvv = req.body?.card_cvv;
     const payment_method_code = req.body?.payment_method_code || "credit_card";
     const document_number = req.body?.document_number;
+    const customer_id = req.body?.customer_id; // Opcional: para associar imediatamente
 
-    // Validações obrigatórias (sem logar dados sensíveis)
-    if (!holder_name || !card_number || !card_expiration_month || !card_expiration_year || !card_cvv) {
+    // Validações obrigatórias
+    if (!holder_name || !card_number || !card_cvv) {
       console.warn("[autopay/vindi/tokenize] campos obrigatórios faltando", {
         has_holder_name: !!holder_name,
         has_card_number: !!card_number,
-        has_month: !!card_expiration_month,
-        has_year: !!card_expiration_year,
         has_cvv: !!card_cvv,
       });
       return res.status(422).json({
-        error: "Campos obrigatórios: holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv",
+        error: "Campos obrigatórios: holder_name, card_number, card_cvv e (card_expiration ou card_expiration_month+card_expiration_year)",
+        status: 422,
+      });
+    }
+
+    // Valida expiration (deve ter card_expiration OU card_expiration_month+year)
+    if (!card_expiration && (!card_expiration_month || !card_expiration_year)) {
+      return res.status(422).json({
+        error: "Deve fornecer card_expiration (MM/YYYY) ou card_expiration_month + card_expiration_year",
         status: 422,
       });
     }
@@ -72,11 +81,16 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     const payload = {
       holder_name,
       card_number,
-      card_expiration_month,
-      card_expiration_year,
       card_cvv,
       payment_method_code,
     };
+
+    if (card_expiration) {
+      payload.card_expiration = card_expiration;
+    } else {
+      payload.card_expiration_month = card_expiration_month;
+      payload.card_expiration_year = card_expiration_year;
+    }
 
     if (document_number) {
       payload.document_number = document_number;
@@ -86,10 +100,33 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     try {
       const result = await tokenizeCardPublic(payload);
 
+      // Se customer_id foi fornecido, associa o gateway_token imediatamente (dentro da janela de 5 min)
+      let associatedProfile = null;
+      if (customer_id && result.gatewayToken) {
+        try {
+          associatedProfile = await associateGatewayToken({
+            customerId: customer_id,
+            gatewayToken: result.gatewayToken,
+          });
+          console.log("[autopay/vindi/tokenize] gateway_token associado ao customer", {
+            customer_id,
+            payment_profile_id: associatedProfile.paymentProfileId,
+          });
+        } catch (assocError) {
+          console.error("[autopay/vindi/tokenize] falha ao associar gateway_token", {
+            customer_id,
+            msg: assocError?.message,
+            status: assocError?.status,
+          });
+          // Não falha a requisição, apenas loga o erro
+          // O frontend pode tentar associar depois usando o gateway_token
+        }
+      }
+
       // Retorna gateway_token e payment_profile
       res.json({
         gateway_token: result.gatewayToken,
-        payment_profile: result.paymentProfile || {},
+        payment_profile: associatedProfile || result.paymentProfile || {},
       });
     } catch (e) {
       // Se Vindi retornou erro com errors[0].message, usar essa mensagem

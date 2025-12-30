@@ -17,6 +17,52 @@ const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ? JSON.st
 const err = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ? JSON.stringify(extra) : "");
 
 /**
+ * Mascara número do cartão para logs (mostra apenas últimos 4 dígitos)
+ */
+function maskCardNumber(cardNumber) {
+  if (!cardNumber) return "****";
+  const clean = String(cardNumber).replace(/\D+/g, "");
+  if (clean.length < 4) return "****";
+  return `****${clean.slice(-4)}`;
+}
+
+/**
+ * Detecta bandeira do cartão pelo número (algoritmo de Luhn + prefixos)
+ * Retorna: { brand: string, payment_company_code: string }
+ */
+function detectCardBrand(cardNumber) {
+  const clean = String(cardNumber).replace(/\D+/g, "");
+  
+  // Visa: começa com 4
+  if (clean.startsWith("4")) {
+    return { brand: "visa", payment_company_code: "pagarme" };
+  }
+  
+  // Mastercard: 51-55 ou 2221-2720
+  if (/^5[1-5]/.test(clean) || /^2[2-7]/.test(clean)) {
+    return { brand: "mastercard", payment_company_code: "pagarme" };
+  }
+  
+  // Amex: 34 ou 37
+  if (/^3[47]/.test(clean)) {
+    return { brand: "amex", payment_company_code: "pagarme" };
+  }
+  
+  // Elo: vários prefixos
+  if (/^(4011|4312|4389|4514|4573|5041|5066|5067|5090|6278|6362|6363|6500|6504|6505|6507|6509|6516|6550)/.test(clean)) {
+    return { brand: "elo", payment_company_code: "pagarme" };
+  }
+  
+  // Hipercard: 38 ou 60
+  if (/^(38|60)/.test(clean)) {
+    return { brand: "hipercard", payment_company_code: "pagarme" };
+  }
+  
+  // Default: visa/pagarme
+  return { brand: "visa", payment_company_code: "pagarme" };
+}
+
+/**
  * Constrói header de autenticação Basic Auth para Public API
  * Formato: base64("PUBLIC_KEY:")
  */
@@ -51,29 +97,42 @@ export async function tokenizeCardPublic(payload) {
   // Normalizações
   const cleanCardNumber = String(payload.card_number).replace(/\D+/g, "");
   
-  // Month: 1-12
-  let month = Number(payload.card_expiration_month);
-  if (month < 1 || month > 12) {
-    const error = new Error("card_expiration_month deve ser entre 1 e 12");
-    error.status = 422;
-    throw error;
-  }
-  const normalizedMonth = String(month).padStart(2, "0");
-
-  // Year: aceitar "YY" e converter para "20YY", ou aceitar "YYYY"
-  // A Vindi espera "YYYY" no body (não "YY")
-  let year = String(payload.card_expiration_year);
-  let normalizedYear;
-  if (year.length === 2) {
-    // "YY" -> "20YY"
-    normalizedYear = `20${year}`;
-  } else if (year.length === 4) {
-    // "YYYY" -> usar como está
-    normalizedYear = year;
+  // Detecta bandeira e payment_company_code
+  const { brand, payment_company_code } = detectCardBrand(cleanCardNumber);
+  
+  // Expiration: aceita MM/YYYY ou campos separados
+  let normalizedMonth, normalizedYear;
+  
+  if (payload.card_expiration) {
+    // Formato MM/YYYY
+    const parts = String(payload.card_expiration).split("/");
+    if (parts.length !== 2) {
+      const error = new Error("card_expiration deve estar no formato MM/YYYY");
+      error.status = 422;
+      throw error;
+    }
+    normalizedMonth = parts[0].padStart(2, "0");
+    normalizedYear = parts[1];
   } else {
-    const error = new Error("card_expiration_year deve ter 2 ou 4 dígitos");
-    error.status = 422;
-    throw error;
+    // Campos separados
+    let month = Number(payload.card_expiration_month);
+    if (month < 1 || month > 12) {
+      const error = new Error("card_expiration_month deve ser entre 1 e 12");
+      error.status = 422;
+      throw error;
+    }
+    normalizedMonth = String(month).padStart(2, "0");
+
+    let year = String(payload.card_expiration_year);
+    if (year.length === 2) {
+      normalizedYear = `20${year}`;
+    } else if (year.length === 4) {
+      normalizedYear = year;
+    } else {
+      const error = new Error("card_expiration_year deve ter 2 ou 4 dígitos");
+      error.status = 422;
+      throw error;
+    }
   }
 
   try {
@@ -81,10 +140,21 @@ export async function tokenizeCardPublic(payload) {
       holder_name: String(payload.holder_name).slice(0, 120),
       card_number: cleanCardNumber,
       card_expiration_month: normalizedMonth,
-      card_expiration_year: normalizedYear, // Vindi espera "YYYY", não "YY"
+      card_expiration_year: normalizedYear,
       card_cvv: String(payload.card_cvv).slice(0, 4),
       payment_method_code: payload.payment_method_code || "credit_card",
+      payment_company_code: payload.payment_company_code || payment_company_code,
     };
+    
+    // Log do payload mascarado
+    log("tokenizando cartão", {
+      holder_name: payload.holder_name,
+      card_number: maskCardNumber(cleanCardNumber),
+      card_expiration: `${normalizedMonth}/${normalizedYear}`,
+      brand,
+      payment_company_code: body.payment_company_code,
+      has_cvv: !!payload.card_cvv,
+    });
 
     if (payload.document_number) {
       body.document_number = String(payload.document_number).replace(/\D+/g, "").slice(0, 18);
@@ -122,6 +192,21 @@ export async function tokenizeCardPublic(payload) {
       json = text ? JSON.parse(text) : {};
     } catch {
       json = { raw: text };
+    }
+    
+    // Log da resposta (mascarada)
+    if (response.ok) {
+      log("Vindi Public API resposta", {
+        status: response.status,
+        has_gateway_token: !!json?.payment_profile?.gateway_token,
+        payment_profile_id: json?.payment_profile?.id,
+        brand: json?.payment_profile?.card_type || brand,
+      });
+    } else {
+      err("Vindi Public API erro", {
+        status: response.status,
+        errors: json?.errors?.map(e => ({ message: e.message, parameter: e.parameter })) || [],
+      });
     }
 
     if (!response.ok) {
