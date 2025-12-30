@@ -146,10 +146,11 @@ export async function tokenizeCardPublic(payload) {
       payment_company_code: payload.payment_company_code || payment_company_code,
     };
     
-    // Log do payload mascarado
-    log("tokenizando cartão", {
+    // Log do payload mascarado (antes da chamada)
+    const maskedCard = maskCardNumber(cleanCardNumber);
+    log("chamando Vindi Public API", {
       holder_name: payload.holder_name,
-      card_number: maskCardNumber(cleanCardNumber),
+      card_last4: maskedCard.slice(-4),
       card_expiration: `${normalizedMonth}/${normalizedYear}`,
       brand,
       payment_company_code: body.payment_company_code,
@@ -196,16 +197,19 @@ export async function tokenizeCardPublic(payload) {
     
     // Log da resposta (mascarada)
     if (response.ok) {
-      log("Vindi Public API resposta", {
+      log("Vindi Public API resposta OK", {
         status: response.status,
         has_gateway_token: !!json?.payment_profile?.gateway_token,
         payment_profile_id: json?.payment_profile?.id,
+        card_last4: json?.payment_profile?.last_four || null,
         brand: json?.payment_profile?.card_type || brand,
       });
     } else {
+      const errorMessages = json?.errors?.map(e => e.message).filter(Boolean) || [];
       err("Vindi Public API erro", {
         status: response.status,
-        errors: json?.errors?.map(e => ({ message: e.message, parameter: e.parameter })) || [],
+        error_count: json?.errors?.length || 0,
+        error_messages: errorMessages,
       });
     }
 
