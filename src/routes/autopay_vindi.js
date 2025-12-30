@@ -7,7 +7,7 @@ import {
   ensureCustomer,
   createPaymentProfile,
 } from "../services/vindi.js";
-import { tokenizeCard } from "../services/vindi_public.js";
+import { tokenizeCardPublic } from "../services/vindi_public.js";
 
 const router = express.Router();
 
@@ -31,73 +31,78 @@ function parseNumbers(input) {
 /**
  * POST /api/autopay/vindi/tokenize
  * Tokeniza cartão via Vindi Public API e retorna gateway_token
- * Body: { holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv, document_number? }
+ * Body: { holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv, payment_method_code?, document_number? }
  */
 router.post("/vindi/tokenize", requireAuth, async (req, res) => {
   try {
-    // Aceita snake_case ou camelCase
-    const holderName = req.body?.holder_name || req.body?.holderName;
-    const cardNumber = req.body?.card_number || req.body?.cardNumber;
-    const cardExpirationMonth = req.body?.card_expiration_month || req.body?.cardExpirationMonth;
-    const cardExpirationYear = req.body?.card_expiration_year || req.body?.cardExpirationYear;
-    const cardCvv = req.body?.card_cvv || req.body?.cardCvv;
-    const documentNumber = req.body?.document_number || req.body?.documentNumber;
-
-    // Validações (sem logar dados sensíveis)
-    if (!holderName || !cardNumber || !cardExpirationMonth || !cardExpirationYear || !cardCvv) {
-      return res.status(400).json({
-        error: "missing_required_fields",
-        code: "VINDI_TOKENIZE_FAILED",
-        message: "Campos obrigatórios: holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv",
-      });
-    }
-
     // Verifica se Vindi Public está configurado
     if (!process.env.VINDI_PUBLIC_KEY) {
       console.error("[autopay/vindi] VINDI_PUBLIC_KEY não configurado");
       return res.status(503).json({
-        error: "vindi_public_not_configured",
-        code: "VINDI_TOKENIZE_FAILED",
+        error: "VINDI_PUBLIC_KEY não configurado no servidor",
       });
+    }
+
+    // Extrai e valida campos obrigatórios
+    const holder_name = req.body?.holder_name;
+    const card_number = req.body?.card_number;
+    const card_expiration_month = req.body?.card_expiration_month;
+    const card_expiration_year = req.body?.card_expiration_year;
+    const card_cvv = req.body?.card_cvv;
+    const payment_method_code = req.body?.payment_method_code || "credit_card";
+    const document_number = req.body?.document_number;
+
+    // Validações obrigatórias (sem logar dados sensíveis)
+    if (!holder_name || !card_number || !card_expiration_month || !card_expiration_year || !card_cvv) {
+      return res.status(422).json({
+        error: "Campos obrigatórios: holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv",
+      });
+    }
+
+    // Prepara payload
+    const payload = {
+      holder_name,
+      card_number,
+      card_expiration_month,
+      card_expiration_year,
+      card_cvv,
+      payment_method_code,
+    };
+
+    if (document_number) {
+      payload.document_number = document_number;
     }
 
     // Tokeniza cartão
     try {
-      const result = await tokenizeCard({
-        holderName,
-        cardNumber,
-        cardExpirationMonth,
-        cardExpirationYear,
-        cardCvv,
-        documentNumber,
-      });
+      const result = await tokenizeCardPublic(payload);
 
+      // Retorna gateway_token e payment_profile
       res.json({
-        ok: true,
         gateway_token: result.gatewayToken,
+        payment_profile: result.paymentProfile || {},
       });
     } catch (e) {
-      const status = e?.status || 500;
-      const errorCode = status === 401 ? "UNAUTHORIZED" : status === 400 ? "INVALID_CARD_DATA" : "VINDI_TOKENIZE_FAILED";
+      // Se Vindi retornou erro com errors[0].message, usar essa mensagem
+      const errorMessage = e?.response?.errors?.[0]?.message || e?.message || "Falha ao tokenizar cartão na Vindi";
+      
+      // Status original da Vindi quando possível (401/422 etc), senão 500
+      const status = e?.status && e.status >= 400 && e.status < 600 ? e.status : 500;
       
       console.error("[autopay/vindi] tokenize falhou", {
         status: e?.status,
-        msg: e?.message,
+        msg: errorMessage,
         // NÃO logar dados do cartão
       });
 
-      return res.status(status >= 400 && status < 600 ? status : 500).json({
-        error: "tokenize_failed",
-        code: errorCode,
-        message: e?.message || "Falha ao tokenizar cartão na Vindi",
+      return res.status(status).json({
+        error: errorMessage,
       });
     }
   } catch (e) {
     console.error("[autopay/vindi] tokenize error:", e?.message || e);
     res.status(500).json({
-      error: "tokenize_failed",
-      code: "VINDI_TOKENIZE_FAILED",
-      message: e?.message || "Erro interno ao tokenizar cartão",
+      error: e?.message || "Erro interno ao tokenizar cartão",
     });
   }
 });

@@ -2,6 +2,9 @@
   "name": "newstore-backend-pix-full",
   "version": "2.0.3",
   "type": "module",
+  "engines": {
+    "node": "18.x"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",

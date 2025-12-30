@@ -31,40 +31,64 @@ function buildPublicAuthHeader() {
 
 /**
  * Tokeniza cartão via Vindi Public API
- * @param {object} params - { holderName, cardNumber, cardExpirationMonth, cardExpirationYear, cardCvv, documentNumber? }
- * @returns {Promise<{gatewayToken: string}>}
+ * @param {object} payload - { holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv, payment_method_code?, document_number? }
+ * @returns {Promise<{gatewayToken: string, paymentProfile: object}>}
  */
-export async function tokenizeCard({
-  holderName,
-  cardNumber,
-  cardExpirationMonth,
-  cardExpirationYear,
-  cardCvv,
-  documentNumber,
-}) {
+export async function tokenizeCardPublic(payload) {
   if (!VINDI_PUBLIC_KEY) {
-    throw new Error("VINDI_PUBLIC_KEY não configurado no servidor.");
+    const error = new Error("VINDI_PUBLIC_KEY não configurado no servidor.");
+    error.status = 503;
+    throw error;
   }
 
-  // Validações
-  if (!holderName || !cardNumber || !cardExpirationMonth || !cardExpirationYear || !cardCvv) {
-    throw new Error("Campos obrigatórios: holderName, cardNumber, cardExpirationMonth, cardExpirationYear, cardCvv");
+  // Validações obrigatórias
+  if (!payload?.holder_name || !payload?.card_number || !payload?.card_expiration_month || !payload?.card_expiration_year || !payload?.card_cvv) {
+    const error = new Error("Campos obrigatórios: holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv");
+    error.status = 422;
+    throw error;
   }
 
-  // Limpa número do cartão (remove espaços/hífens)
-  const cleanCardNumber = String(cardNumber).replace(/\D+/g, "");
+  // Normalizações
+  const cleanCardNumber = String(payload.card_number).replace(/\D+/g, "");
+  
+  // Month: 1-12
+  let month = Number(payload.card_expiration_month);
+  if (month < 1 || month > 12) {
+    const error = new Error("card_expiration_month deve ser entre 1 e 12");
+    error.status = 422;
+    throw error;
+  }
+  const normalizedMonth = String(month).padStart(2, "0");
+
+  // Year: aceitar "YY" e converter para "20YY", ou aceitar "YYYY"
+  let year = String(payload.card_expiration_year);
+  let normalizedYear;
+  if (year.length === 2) {
+    // "YY" -> "20YY"
+    normalizedYear = `20${year}`;
+  } else if (year.length === 4) {
+    // "YYYY" -> usar como está
+    normalizedYear = year;
+  } else {
+    const error = new Error("card_expiration_year deve ter 2 ou 4 dígitos");
+    error.status = 422;
+    throw error;
+  }
+  // Pega últimos 2 dígitos para enviar à Vindi
+  const yearLastTwo = normalizedYear.slice(-2);
 
   try {
     const body = {
-      holder_name: String(holderName).slice(0, 120),
+      holder_name: String(payload.holder_name).slice(0, 120),
       card_number: cleanCardNumber,
-      card_expiration_month: String(cardExpirationMonth).padStart(2, "0").slice(0, 2),
-      card_expiration_year: String(cardExpirationYear).slice(-2), // últimos 2 dígitos do ano
-      card_cvv: String(cardCvv).slice(0, 4),
+      card_expiration_month: normalizedMonth,
+      card_expiration_year: yearLastTwo,
+      card_cvv: String(payload.card_cvv).slice(0, 4),
+      payment_method_code: payload.payment_method_code || "credit_card",
     };
 
-    if (documentNumber) {
-      body.document_number = String(documentNumber).replace(/\D+/g, "").slice(0, 18);
+    if (payload.document_number) {
+      body.document_number = String(payload.document_number).replace(/\D+/g, "").slice(0, 18);
     }
 
     const url = `${VINDI_PUBLIC_BASE}/public/payment_profiles`;
@@ -102,6 +126,7 @@ export async function tokenizeCard({
     }
 
     if (!response.ok) {
+      // Se Vindi retornar JSON com errors[0].message, usar essa mensagem
       const errorMsg =
         json?.errors?.[0]?.message ||
         json?.error ||
@@ -109,15 +134,18 @@ export async function tokenizeCard({
         `Vindi Public API falhou (${response.status})`;
 
       const error = new Error(errorMsg);
-      error.status = response.status;
+      error.status = response.status; // Preserva status original (401/422 etc)
       error.response = json;
       throw error;
     }
 
-    const gatewayToken = json?.payment_profile?.gateway_token || json?.gateway_token;
+    const paymentProfile = json?.payment_profile || json;
+    const gatewayToken = paymentProfile?.gateway_token || json?.gateway_token;
 
     if (!gatewayToken) {
-      throw new Error("Vindi não retornou gateway_token");
+      const error = new Error("Vindi não retornou gateway_token");
+      error.status = 500;
+      throw error;
     }
 
     log("tokenização bem-sucedida", {
@@ -125,9 +153,12 @@ export async function tokenizeCard({
       // NÃO logar dados sensíveis
     });
 
-    return { gatewayToken };
+    return {
+      gatewayToken,
+      paymentProfile: paymentProfile || {},
+    };
   } catch (e) {
-    err("tokenizeCard falhou", {
+    err("tokenizeCardPublic falhou", {
       status: e?.status,
       msg: e?.message,
       // NÃO logar dados do cartão
@@ -137,6 +168,6 @@ export async function tokenizeCard({
 }
 
 export default {
-  tokenizeCard,
+  tokenizeCardPublic,
 };
 
