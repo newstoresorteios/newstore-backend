@@ -37,9 +37,10 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
   try {
     // Verifica se Vindi Public está configurado
     if (!process.env.VINDI_PUBLIC_KEY) {
-      console.error("[autopay/vindi] VINDI_PUBLIC_KEY não configurado");
+      console.error("[autopay/vindi/tokenize] VINDI_PUBLIC_KEY não configurado");
       return res.status(503).json({
         error: "VINDI_PUBLIC_KEY não configurado no servidor",
+        status: 503,
       });
     }
 
@@ -54,8 +55,16 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
 
     // Validações obrigatórias (sem logar dados sensíveis)
     if (!holder_name || !card_number || !card_expiration_month || !card_expiration_year || !card_cvv) {
+      console.warn("[autopay/vindi/tokenize] campos obrigatórios faltando", {
+        has_holder_name: !!holder_name,
+        has_card_number: !!card_number,
+        has_month: !!card_expiration_month,
+        has_year: !!card_expiration_year,
+        has_cvv: !!card_cvv,
+      });
       return res.status(422).json({
         error: "Campos obrigatórios: holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv",
+        status: 422,
       });
     }
 
@@ -89,20 +98,24 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       // Status original da Vindi quando possível (401/422 etc), senão 500
       const status = e?.status && e.status >= 400 && e.status < 600 ? e.status : 500;
       
-      console.error("[autopay/vindi] tokenize falhou", {
+      console.error("[autopay/vindi/tokenize] tokenize falhou", {
         status: e?.status,
         msg: errorMessage,
+        has_errors: !!e?.response?.errors,
+        errors_count: e?.response?.errors?.length || 0,
         // NÃO logar dados do cartão
       });
 
       return res.status(status).json({
         error: errorMessage,
+        status: status,
       });
     }
   } catch (e) {
-    console.error("[autopay/vindi] tokenize error:", e?.message || e);
+    console.error("[autopay/vindi/tokenize] erro inesperado:", e?.message || e);
     res.status(500).json({
       error: e?.message || "Erro interno ao tokenizar cartão",
+      status: 500,
     });
   }
 });

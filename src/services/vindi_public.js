@@ -61,6 +61,7 @@ export async function tokenizeCardPublic(payload) {
   const normalizedMonth = String(month).padStart(2, "0");
 
   // Year: aceitar "YY" e converter para "20YY", ou aceitar "YYYY"
+  // A Vindi espera "YYYY" no body (não "YY")
   let year = String(payload.card_expiration_year);
   let normalizedYear;
   if (year.length === 2) {
@@ -74,15 +75,13 @@ export async function tokenizeCardPublic(payload) {
     error.status = 422;
     throw error;
   }
-  // Pega últimos 2 dígitos para enviar à Vindi
-  const yearLastTwo = normalizedYear.slice(-2);
 
   try {
     const body = {
       holder_name: String(payload.holder_name).slice(0, 120),
       card_number: cleanCardNumber,
       card_expiration_month: normalizedMonth,
-      card_expiration_year: yearLastTwo,
+      card_expiration_year: normalizedYear, // Vindi espera "YYYY", não "YY"
       card_cvv: String(payload.card_cvv).slice(0, 4),
       payment_method_code: payload.payment_method_code || "credit_card",
     };
@@ -127,11 +126,24 @@ export async function tokenizeCardPublic(payload) {
 
     if (!response.ok) {
       // Se Vindi retornar JSON com errors[0].message, usar essa mensagem
-      const errorMsg =
-        json?.errors?.[0]?.message ||
-        json?.error ||
-        json?.message ||
-        `Vindi Public API falhou (${response.status})`;
+      // Prioriza mensagens mais específicas do array de erros
+      let errorMsg = null;
+      
+      if (json?.errors && Array.isArray(json.errors) && json.errors.length > 0) {
+        // Busca a primeira mensagem disponível no array de erros
+        const firstError = json.errors.find(e => e.message);
+        if (firstError) {
+          errorMsg = firstError.message;
+        } else if (json.errors[0]) {
+          // Se não tem message, tenta usar o erro como string
+          errorMsg = String(json.errors[0]);
+        }
+      }
+      
+      // Fallback para outros formatos de erro
+      if (!errorMsg) {
+        errorMsg = json?.error || json?.message || `Vindi Public API falhou (${response.status})`;
+      }
 
       const error = new Error(errorMsg);
       error.status = response.status; // Preserva status original (401/422 etc)
