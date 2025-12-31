@@ -7,6 +7,7 @@ const VINDI_PUBLIC_BASE =
   "https://app.vindi.com.br/api/v1";
 
 const VINDI_PUBLIC_KEY = process.env.VINDI_PUBLIC_KEY || "";
+const VINDI_DEFAULT_GATEWAY = process.env.VINDI_DEFAULT_GATEWAY || "pagarme";
 
 /* ------------------------------------------------------- *
  * Logging estruturado (sem segredos)
@@ -87,9 +88,14 @@ export async function tokenizeCardPublic(payload) {
     throw error;
   }
 
-  // Validações obrigatórias
-  if (!payload?.holder_name || !payload?.card_number || !payload?.card_expiration_month || !payload?.card_expiration_year || !payload?.card_cvv) {
-    const error = new Error("Campos obrigatórios: holder_name, card_number, card_expiration_month, card_expiration_year, card_cvv");
+  // Validações obrigatórias: aceita card_expiration OU (card_expiration_month + card_expiration_year)
+  const hasExpFields = payload?.card_expiration_month && payload?.card_expiration_year;
+  const hasExpCombined = !!payload?.card_expiration;
+
+  if (!payload?.holder_name || !payload?.card_number || !payload?.card_cvv || (!hasExpFields && !hasExpCombined)) {
+    const error = new Error(
+      "Campos obrigatórios: holder_name, card_number, (card_expiration_month+card_expiration_year OU card_expiration MM/YYYY), card_cvv"
+    );
     error.status = 422;
     throw error;
   }
@@ -97,8 +103,8 @@ export async function tokenizeCardPublic(payload) {
   // Normalizações
   const cleanCardNumber = String(payload.card_number).replace(/\D+/g, "");
   
-  // Detecta bandeira e payment_company_code
-  const { brand, payment_company_code } = detectCardBrand(cleanCardNumber);
+  // Detecta bandeira (apenas para log/UI, não para determinar gateway)
+  const { brand } = detectCardBrand(cleanCardNumber);
   
   // Expiration: aceita MM/YYYY ou campos separados
   let normalizedMonth, normalizedYear;
@@ -143,7 +149,7 @@ export async function tokenizeCardPublic(payload) {
       card_expiration_year: normalizedYear,
       card_cvv: String(payload.card_cvv).slice(0, 4),
       payment_method_code: payload.payment_method_code || "credit_card",
-      payment_company_code: payload.payment_company_code || payment_company_code,
+      payment_company_code: payload.payment_company_code || VINDI_DEFAULT_GATEWAY,
     };
     
     // Log do payload mascarado (antes da chamada)

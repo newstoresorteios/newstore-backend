@@ -306,24 +306,61 @@ export async function runAutopayForDraw(draw_id) {
          returning id`,
         [user_id, draw_id, free, amount_cents, provider, billId, chargeId]
       );
+      const paymentId = pay.rows[0].id;
+
       const reservation = await client.query(
         `insert into public.reservations
-           (id, user_id, draw_id, numbers, status, created_at, expires_at)
-         values (gen_random_uuid(), $1, $2, $3::int2[], 'paid', now(), now())
+           (id, user_id, draw_id, payment_id, numbers, status, created_at, expires_at)
+         values (gen_random_uuid(), $1, $2, $3, $4::int2[], 'paid', now(), now())
          returning id`,
-        [user_id, draw_id, free]
+        [user_id, draw_id, paymentId, free]
       );
       const resv_id = reservation.rows[0].id;
 
-      // 8) Atualiza números vendidos
-      await client.query(
+      // 8) Atualiza números vendidos (com verificação de status e quantidade)
+      const upd = await client.query(
         `update public.numbers n
             set status = 'sold',
                 reservation_id = $1
           where n.draw_id = $2
-            and n.n = any($3::int2[])`,
+            and n.n = any($3::int2[])
+            and status = 'available'`,
         [resv_id, draw_id, free]
       );
+
+      // Verifica se todos os números foram atualizados (proteção contra race condition)
+      if (upd.rowCount !== free.length) {
+        const missing = free.length - upd.rowCount;
+        warn("inconsistência ao atualizar numbers", {
+          user_id,
+          draw_id,
+          expected: free.length,
+          updated: upd.rowCount,
+          missing,
+          numbers: free,
+        });
+
+        // Refund se já cobrou
+        if (billId && chargeId) {
+          try {
+            await refundCharge(chargeId, true);
+            warn("Vindi: refund executado após inconsistência de numbers", { user_id, billId, chargeId });
+          } catch (refundErr) {
+            err("Vindi: falha ao fazer refund após inconsistência", { user_id, billId, chargeId, msg: refundErr?.message });
+          }
+        }
+
+        // Registra erro no autopay_runs
+        await client.query(
+          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error,provider)
+           values ($1,$2,$3,$4,'error','numbers_already_sold',$5)`,
+          [p.id, user_id, draw_id, free, provider]
+        );
+
+        err("números já vendidos/reservados por outro processo", { user_id, draw_id, missing });
+        results.push({ user_id, status: "error", error: "numbers_already_sold", provider });
+        continue;
+      }
 
       // 9) Audita
       await client.query(
