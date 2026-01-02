@@ -242,60 +242,43 @@ export async function tokenizeCardPublic(payload) {
   // Normalizações
   const cleanCardNumber = String(payload.card_number).replace(/\D+/g, "");
   
-  // Obtém lista de payment_company_codes válidos da Vindi (com cache)
-  const validBrandCodes = await getValidPaymentCompanyCodes();
+  // payment_company_code já vem normalizado do handler da rota
+  // Se não veio, tenta detectar (mas não bloqueia se não detectar)
+  const paymentMethodCode = payload.payment_method_code || "credit_card";
+  const validCodes = ["visa", "mastercard", "elo", "american_express", "diners_club", "hipercard", "hiper"];
   let brandCode = null;
   let brandCodeSource = null;
   
-  // PRIORIDADE 1: payment_company_code do frontend (se fornecido e válido)
+  // PRIORIDADE 1: payment_company_code do payload (vindo da rota)
   if (payload.payment_company_code) {
     const providedCode = String(payload.payment_company_code).trim().toLowerCase();
-    if (validBrandCodes.includes(providedCode)) {
+    if (validCodes.includes(providedCode)) {
       brandCode = providedCode;
       brandCodeSource = "frontend";
     } else {
-      warn("payment_company_code do frontend inválido, tentando detecção automática", {
+      warn("payment_company_code inválido (formato), tentando detecção", {
         provided: providedCode,
-        valid_codes: validBrandCodes,
+        valid_codes: validCodes,
       });
     }
   }
   
-  // PRIORIDADE 2: Detecção automática local (se não veio do frontend ou é inválido)
-  if (!brandCode) {
+  // PRIORIDADE 2: Detecção automática local (se não veio ou é inválido)
+  if (!brandCode && paymentMethodCode === "credit_card") {
     const detectedBrand = detectPaymentCompanyCode(cleanCardNumber);
-    if (detectedBrand?.brandCode) {
-      // Valida se o código detectado está na lista da Vindi
-      if (validBrandCodes.includes(detectedBrand.brandCode)) {
-        brandCode = detectedBrand.brandCode;
-        brandCodeSource = "detected";
-      } else {
-        // Código detectado não está disponível na conta Vindi
-        warn("bandeira detectada não disponível na conta Vindi", {
-          detected: detectedBrand.brandCode,
-          available: validBrandCodes,
-        });
-      }
+    if (detectedBrand?.brandCode && validCodes.includes(detectedBrand.brandCode)) {
+      brandCode = detectedBrand.brandCode;
+      brandCodeSource = "backend-detected";
     }
   }
   
-  // Valida se temos payment_company_code válido (obrigatório para credit_card)
-  const paymentMethodCode = payload.payment_method_code || "credit_card";
-  if (paymentMethodCode === "credit_card" && (!brandCode || !validBrandCodes.includes(brandCode))) {
-    const maskedCard = maskCardNumber(cleanCardNumber);
-    const error = new Error("Não foi possível detectar a bandeira. Informe a bandeira e tente novamente.");
-    error.status = 422;
-    error.details = [{
-      parameter: "payment_company_code",
-      message: `Bandeira não detectada ou inválida. Códigos válidos: ${validBrandCodes.join(", ")}`,
-    }];
-    err("bandeira não detectada ou inválida", {
-      card_masked: maskedCard,
-      provided_payment_company_code: payload.payment_company_code || null,
-      detected_brand: detectPaymentCompanyCode(cleanCardNumber)?.brandCode || null,
-      valid_codes: validBrandCodes,
+  // Log se não conseguiu determinar payment_company_code (mas não bloqueia - Vindi tentará detecção)
+  if (!brandCode && paymentMethodCode === "credit_card") {
+    warn("payment_company_code não determinado - Vindi tentará detecção automática", {
+      card_masked: maskCardNumber(cleanCardNumber),
+      provided: payload.payment_company_code || null,
+      detected: detectPaymentCompanyCode(cleanCardNumber)?.brandCode || null,
     });
-    throw error;
   }
   
   // Expiration: aceita MM/YYYY (sempre normalizado para 4 dígitos do ano)
@@ -333,18 +316,22 @@ export async function tokenizeCardPublic(payload) {
   }
 
   try {
-    // Constrói form data (x-www-form-urlencoded)
+    // Constrói form data (x-www-form-urlencoded) - campos exatos esperados pela Vindi
     const form = new URLSearchParams();
-    form.set("allow_as_fallback", "true");
+    
+    // allow_as_fallback sempre true
+    form.set("allow_as_fallback", payload.allow_as_fallback !== false ? "true" : "false");
+    
     form.set("holder_name", String(payload.holder_name).slice(0, 120));
     form.set("card_number", cleanCardNumber);
     form.set("card_expiration", cardExpiration); // formato MM/YYYY
     form.set("card_cvv", String(payload.card_cvv).slice(0, 4));
     form.set("payment_method_code", paymentMethodCode);
     
-    // Envia payment_company_code quando disponível
-    if (paymentMethodCode === "credit_card" && brandCode) {
-      form.set("payment_company_code", brandCode);
+    // Prioriza payment_company_code do payload (vindo da rota), senão usa brandCode detectado
+    const finalPaymentCompanyCode = payload.payment_company_code || brandCode;
+    if (paymentMethodCode === "credit_card" && finalPaymentCompanyCode) {
+      form.set("payment_company_code", finalPaymentCompanyCode);
     }
     
     // Envia payment_company_id quando disponível (prioritário)
@@ -356,22 +343,23 @@ export async function tokenizeCardPublic(payload) {
       form.set("document_number", String(payload.document_number).replace(/\D+/g, "").slice(0, 18));
     }
     
-    // Log do payload mascarado (antes da chamada) - mostra payment_company_code e payment_company_id
+    // Log do payload final que será enviado à Vindi (mascarado)
     const maskedCard = maskCardNumber(cleanCardNumber);
-    // Mascara: primeiros 6 + últimos 4
-    const cardMasked = cleanCardNumber.length >= 10 
-      ? `${cleanCardNumber.slice(0, 6)}${"*".repeat(cleanCardNumber.length - 10)}${cleanCardNumber.slice(-4)}`
+    // Mascara: primeiros 4 + últimos 4
+    const cardMasked = cleanCardNumber.length >= 8
+      ? `${cleanCardNumber.slice(0, 4)}${"*".repeat(Math.max(0, cleanCardNumber.length - 8))}${cleanCardNumber.slice(-4)}`
       : maskCardNumber(cleanCardNumber);
     
-    log("chamando Vindi Public API", {
+    log("chamando Vindi Public API - request final", {
       user_id: payload.user_id || null,
       holder_name: payload.holder_name,
       card_masked: cardMasked,
       card_expiration: cardExpiration,
       payment_method_code: paymentMethodCode,
-      payment_company_code: brandCode || payload.payment_company_code || null,
+      allow_as_fallback: form.get("allow_as_fallback"),
+      payment_company_code: finalPaymentCompanyCode || null,
       payment_company_id: payload.payment_company_id || null,
-      payment_company_code_source: brandCodeSource || (payload.payment_company_code ? "frontend" : "detected"),
+      payment_company_code_source: payload.payment_company_code ? "frontend" : (brandCode ? "backend-detected" : "none"),
       has_cvv: !!payload.card_cvv,
       has_document_number: !!payload.document_number,
     });

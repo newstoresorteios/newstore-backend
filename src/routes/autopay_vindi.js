@@ -8,7 +8,7 @@ import {
   createPaymentProfile,
   associateGatewayToken,
 } from "../services/vindi.js";
-import { tokenizeCardPublic } from "../services/vindi_public.js";
+import { tokenizeCardPublic, detectPaymentCompanyCode } from "../services/vindi_public.js";
 import { resolvePaymentCompanyId, getValidPaymentCompanyCodes } from "../services/vindi_payment_methods.js";
 
 const router = express.Router();
@@ -138,62 +138,90 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
 
     const last4 = cleanCardNumber.length >= 4 ? cleanCardNumber.slice(-4) : "****";
 
-    // Prepara payload para Vindi
+    // Prepara payload para Vindi (campos exatos esperados pela API pública)
     const payload = {
+      allow_as_fallback: true,
       holder_name: cleanHolderName.slice(0, 120),
       card_number: cleanCardNumber,
       card_expiration: normalizedCardExpiration, // Sempre MM/YYYY
       card_cvv: cleanCvv.slice(0, 4),
-      payment_method_code,
+      payment_method_code: "credit_card", // Sempre credit_card
     };
 
     if (document_number) {
       payload.document_number = String(document_number).replace(/\D+/g, "").slice(0, 18);
     }
 
-    // Normaliza e valida payment_company_code do frontend
-    let cleanPcc = null;
+    // Determina payment_company_code final: prioriza frontend, senão detecta
+    const validCodes = ["visa", "mastercard", "elo", "american_express", "diners_club", "hipercard", "hiper"];
+    let finalPaymentCompanyCode = null;
+    let paymentCompanyCodeSource = "none";
+    
+    // PRIORIDADE 1: payment_company_code do frontend
     if (payment_company_code) {
-      cleanPcc = String(payment_company_code).trim().toLowerCase();
-      payload.payment_company_code = cleanPcc;
+      const cleanPcc = String(payment_company_code).trim().toLowerCase();
+      if (validCodes.includes(cleanPcc)) {
+        finalPaymentCompanyCode = cleanPcc;
+        paymentCompanyCodeSource = "frontend";
+      } else {
+        console.warn("[autopay/vindi/tokenize] payment_company_code do frontend inválido, tentando detecção", {
+          user_id,
+          provided: cleanPcc,
+          valid_codes: validCodes,
+        });
+      }
     }
     
-    // Resolve payment_company_id a partir do payment_company_code
+    // PRIORIDADE 2: Detecção automática se não veio do frontend ou é inválido
+    if (!finalPaymentCompanyCode && payment_method_code === "credit_card") {
+      const detected = detectPaymentCompanyCode(cleanCardNumber);
+      if (detected?.brandCode && validCodes.includes(detected.brandCode)) {
+        finalPaymentCompanyCode = detected.brandCode;
+        paymentCompanyCodeSource = "backend-detected";
+      }
+    }
+    
+    // Se ainda não detectou e é Elo/Hipercard/Hiper (prefixos conhecidos), retorna erro
+    if (!finalPaymentCompanyCode && payment_method_code === "credit_card") {
+      const detected = detectPaymentCompanyCode(cleanCardNumber);
+      if (detected?.brandCode && ["elo", "hipercard", "hiper"].includes(detected.brandCode)) {
+        console.warn("[autopay/vindi/tokenize] não foi possível determinar payment_company_code para bandeira que requer detecção", {
+          user_id,
+          detected: detected.brandCode,
+        });
+        return res.status(422).json({
+          error: "Não foi possível detectar a bandeira. Informe a bandeira e tente novamente.",
+          details: [{
+            parameter: "payment_company_code",
+            message: `Bandeira detectada "${detected.brandCode}" mas não foi possível validar. Forneça payment_company_code explicitamente.`,
+          }],
+        });
+      }
+    }
+    
+    // Inclui payment_company_code no payload se disponível
+    if (finalPaymentCompanyCode) {
+      payload.payment_company_code = finalPaymentCompanyCode;
+    }
+    
+    // Tenta resolver payment_company_id (opcional, não bloqueia se falhar)
     let payment_company_id = null;
-    if (cleanPcc && payment_method_code) {
+    if (finalPaymentCompanyCode && payment_method_code === "credit_card") {
       try {
         payment_company_id = await resolvePaymentCompanyId({
           payment_method_code,
-          payment_company_code: cleanPcc,
+          payment_company_code: finalPaymentCompanyCode,
         });
-        
         if (payment_company_id) {
           payload.payment_company_id = payment_company_id;
-        } else if (cleanPcc) {
-          // payment_company_code fornecido mas não encontrado na conta
-          const validCodes = await getValidPaymentCompanyCodes(payment_method_code);
-          console.warn("[autopay/vindi/tokenize] payment_company_code não habilitado na conta", {
-            user_id,
-            provided: cleanPcc,
-            payment_method_code,
-            valid_codes: validCodes,
-          });
-          return res.status(422).json({
-            error: "payment_company_code_not_supported",
-            message: `Bandeira "${cleanPcc}" não está habilitada na conta para ${payment_method_code}`,
-            details: {
-              payment_company_code: cleanPcc,
-              payment_method_code,
-              valid_codes: validCodes,
-            },
-          });
         }
       } catch (e) {
-        console.error("[autopay/vindi/tokenize] erro ao resolver payment_company_id", {
+        // Não bloqueia - apenas loga warning
+        console.warn("[autopay/vindi/tokenize] não foi possível resolver payment_company_id (continuando sem ele)", {
           user_id,
+          payment_company_code: finalPaymentCompanyCode,
           msg: e?.message,
         });
-        // Continua sem payment_company_id (vindi_public.js tentará detectar)
       }
     }
     
@@ -208,16 +236,17 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     };
     const maskedCardLog = maskCardForLog(cleanCardNumber);
 
-    // Log da requisição (mascarado) - mostra payment_company_code e payment_company_id
+    // Log da requisição (mascarado) - mostra payment_company_code recebido e enviado
     console.log("[autopay/vindi/tokenize] iniciando tokenização", {
       user_id,
       holder_name: cleanHolderName,
       card_masked: maskedCardLog,
       card_expiration: normalizedCardExpiration,
-      payment_method_code,
-      payment_company_code: payload.payment_company_code || null,
+      payment_method_code: "credit_card",
+      payment_company_code_received: payment_company_code || null,
+      payment_company_code_sent_to_vindi: finalPaymentCompanyCode || null,
+      payment_company_code_source: paymentCompanyCodeSource,
       payment_company_id: payment_company_id || null,
-      payment_company_code_source: payload.payment_company_code ? "frontend" : "será detectado",
       has_cvv: !!cleanCvv,
       has_customer_id: !!customer_id,
     });

@@ -47,7 +47,11 @@ async function fetchPaymentMethods() {
   }
 
   if (!VINDI_API_KEY) {
-    warn("VINDI_API_KEY não configurado, não é possível obter payment_methods");
+    // Não bloqueia - apenas loga warning uma vez (com throttle)
+    if (!paymentMethodsCache._warned) {
+      warn("VINDI_API_KEY não configurado - payment_company_id não será resolvido (tokenização pública continuará normalmente)");
+      paymentMethodsCache._warned = true;
+    }
     return null;
   }
 
