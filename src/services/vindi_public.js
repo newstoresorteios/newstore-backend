@@ -139,18 +139,25 @@ export async function tokenizeCardPublic(payload) {
   const cardExpiration = `${normalizedMonth}/${normalizedYear}`;
 
   try {
-    const body = {
-      holder_name: String(payload.holder_name).slice(0, 120),
-      card_number: cleanCardNumber,
-      card_expiration: cardExpiration, // formato esperado pela Vindi Public API
-      card_cvv: String(payload.card_cvv).slice(0, 4),
-      payment_method_code: payload.payment_method_code || "credit_card",
-    };
-
     // Para Visa/Master a Vindi detecta automaticamente, mas é recomendado enviar.
     // Para Elo/Amex/Diners/Hipercard é obrigatório/fortemente recomendado.
     const pcc = payload.payment_company_code || payment_company_code;
-    if (pcc) body.payment_company_code = pcc;
+    
+    // Constrói form data (x-www-form-urlencoded)
+    const form = new URLSearchParams();
+    form.set("holder_name", String(payload.holder_name).slice(0, 120));
+    form.set("card_number", cleanCardNumber);
+    form.set("card_expiration", cardExpiration); // formato MM/YYYY esperado pela Vindi Public API
+    form.set("card_cvv", String(payload.card_cvv).slice(0, 4));
+    form.set("payment_method_code", payload.payment_method_code || "credit_card");
+    
+    if (pcc) {
+      form.set("payment_company_code", pcc);
+    }
+    
+    if (payload.document_number) {
+      form.set("document_number", String(payload.document_number).replace(/\D+/g, "").slice(0, 18));
+    }
     
     // Log do payload mascarado (antes da chamada)
     const maskedCard = maskCardNumber(cleanCardNumber);
@@ -163,10 +170,6 @@ export async function tokenizeCardPublic(payload) {
       has_cvv: !!payload.card_cvv,
     });
 
-    if (payload.document_number) {
-      body.document_number = String(payload.document_number).replace(/\D+/g, "").slice(0, 18);
-    }
-
     const url = `${VINDI_PUBLIC_BASE}/public/payment_profiles`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
@@ -177,11 +180,11 @@ export async function tokenizeCardPublic(payload) {
         method: "POST",
         headers: {
           Authorization: buildPublicAuthHeader(),
-          "Content-Type": "application/json",
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
           Accept: "application/json",
           "User-Agent": "lancaster-backend/1.0",
         },
-        body: JSON.stringify(body),
+        body: form.toString(),
         signal: controller.signal,
       });
     } catch (e) {
@@ -212,10 +215,12 @@ export async function tokenizeCardPublic(payload) {
       });
     } else {
       const errorMessages = json?.errors?.map(e => e.message).filter(Boolean) || [];
+      const errorParameters = json?.errors?.map(e => e.parameter).filter(Boolean) || [];
       err("Vindi Public API erro", {
         status: response.status,
         error_count: json?.errors?.length || 0,
         error_messages: errorMessages,
+        error_parameters: errorParameters,
       });
     }
 
@@ -223,8 +228,19 @@ export async function tokenizeCardPublic(payload) {
       // Se Vindi retornar JSON com errors[0].message, usar essa mensagem
       // Prioriza mensagens mais específicas do array de erros
       let errorMsg = null;
+      const errorsWithDetails = [];
       
       if (json?.errors && Array.isArray(json.errors) && json.errors.length > 0) {
+        // Captura todos os erros com message e parameter
+        json.errors.forEach(e => {
+          if (e.message || e.parameter) {
+            errorsWithDetails.push({
+              message: e.message || null,
+              parameter: e.parameter || null,
+            });
+          }
+        });
+        
         // Busca a primeira mensagem disponível no array de erros
         const firstError = json.errors.find(e => e.message);
         if (firstError) {
@@ -242,7 +258,10 @@ export async function tokenizeCardPublic(payload) {
 
       const error = new Error(errorMsg);
       error.status = response.status; // Preserva status original (401/422 etc)
-      error.response = json;
+      error.response = {
+        ...json,
+        errors: errorsWithDetails.length > 0 ? errorsWithDetails : json?.errors || [],
+      };
       throw error;
     }
 

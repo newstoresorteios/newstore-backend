@@ -58,42 +58,67 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     const payment_company_code = req.body?.payment_company_code || req.body?.paymentCompanyCode;
     const customer_id = req.body?.customer_id; // Opcional: para associar imediatamente
 
-    // Valida campos obrigatórios
-    const missingFields = [];
-    if (!holderName) missingFields.push("holderName");
-    if (!cardNumber) missingFields.push("cardNumber");
-    if (!cardExpiration && (!expMonth || !expYear)) {
-      if (!expMonth) missingFields.push("expMonth");
-      if (!expYear) missingFields.push("expYear");
+    // Normaliza e limpa campos
+    const cleanHolderName = holderName ? String(holderName).trim() : "";
+    const cleanCardNumber = cardNumber ? String(cardNumber).replace(/\D+/g, "") : "";
+    const cleanCvv = cvv ? String(cvv).replace(/\D+/g, "") : "";
+    
+    // Normaliza expiração
+    let normalizedExpMonth = null;
+    let normalizedExpYear = null;
+    let normalizedCardExpiration = null;
+    
+    if (cardExpiration) {
+      normalizedCardExpiration = String(cardExpiration).trim();
+    } else if (expMonth && expYear) {
+      normalizedExpMonth = String(expMonth).replace(/\D+/g, "").padStart(2, "0");
+      normalizedExpYear = String(expYear).replace(/\D+/g, "");
     }
-    if (!cvv) missingFields.push("cvv");
 
-    if (missingFields.length > 0) {
-      console.warn("[autopay/vindi/tokenize] campos obrigatórios faltando", {
+    // Validação mínima: verifica se campos obrigatórios estão vazios após normalização
+    const validationErrors = [];
+    if (!cleanHolderName) {
+      validationErrors.push({ field: "holder_name", message: "holder_name não pode ficar em branco" });
+    }
+    if (!cleanCardNumber) {
+      validationErrors.push({ field: "card_number", message: "card_number não pode ficar em branco" });
+    }
+    if (!normalizedCardExpiration && (!normalizedExpMonth || !normalizedExpYear)) {
+      if (!normalizedExpMonth) {
+        validationErrors.push({ field: "card_expiration_month", message: "card_expiration_month não pode ficar em branco" });
+      }
+      if (!normalizedExpYear) {
+        validationErrors.push({ field: "card_expiration_year", message: "card_expiration_year não pode ficar em branco" });
+      }
+    }
+    if (!cleanCvv) {
+      validationErrors.push({ field: "card_cvv", message: "card_cvv não pode ficar em branco" });
+    }
+
+    if (validationErrors.length > 0) {
+      console.warn("[autopay/vindi/tokenize] validação falhou", {
         user_id,
-        missing_fields: missingFields,
+        validation_errors: validationErrors,
       });
-      return res.status(400).json({
-        error: "missing_fields",
-        fields: missingFields,
+      return res.status(422).json({
+        error: "Campos obrigatórios não podem ficar em branco",
+        details: validationErrors,
       });
     }
 
-    // Normaliza número do cartão para logs (mascarado)
-    const cleanCardNumber = String(cardNumber).replace(/\D+/g, "");
     const last4 = cleanCardNumber.length >= 4 ? cleanCardNumber.slice(-4) : "****";
 
     // Prepara payload para Vindi
     const payload = {
-      holder_name: String(holderName).slice(0, 120),
+      holder_name: cleanHolderName.slice(0, 120),
       card_number: cleanCardNumber,
-      ...(cardExpiration
-        ? { card_expiration: String(cardExpiration) }
+      ...(normalizedCardExpiration
+        ? { card_expiration: normalizedCardExpiration }
         : {
-            card_expiration_month: String(expMonth).padStart(2, "0"),
-            card_expiration_year: String(expYear),
+            card_expiration_month: normalizedExpMonth,
+            card_expiration_year: normalizedExpYear,
           }),
-      card_cvv: String(cvv).slice(0, 4),
+      card_cvv: cleanCvv.slice(0, 4),
       payment_method_code,
     };
 
@@ -102,18 +127,20 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     }
 
     if (payment_company_code) {
-      payload.payment_company_code = String(payment_company_code);
+      payload.payment_company_code = String(payment_company_code).trim();
     }
 
     // Log da requisição (mascarado)
     console.log("[autopay/vindi/tokenize] iniciando tokenização", {
       user_id,
-      holder_name: holderName,
+      holder_name: cleanHolderName,
       card_last4: last4,
-      exp_month: expMonth,
-      exp_year: expYear,
-      has_cvv: !!cvv,
+      exp_month: normalizedExpMonth,
+      exp_year: normalizedExpYear,
+      card_expiration: normalizedCardExpiration,
+      has_cvv: !!cleanCvv,
       has_customer_id: !!customer_id,
+      payment_company_code: payment_company_code || null,
     });
 
     // Tokeniza cartão
@@ -160,10 +187,16 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     } catch (e) {
       // Extrai mensagem de erro da Vindi
       let errorMessage = "Falha ao tokenizar cartão na Vindi";
+      let errorDetails = null;
       
       if (e?.response?.errors && Array.isArray(e.response.errors) && e.response.errors.length > 0) {
         // Prioriza primeira mensagem do array de erros
         errorMessage = e.response.errors[0].message || errorMessage;
+        // Inclui details com todos os erros (message + parameter quando existir)
+        errorDetails = e.response.errors.map(err => ({
+          message: err.message || null,
+          parameter: err.parameter || null,
+        }));
       } else if (e?.message) {
         errorMessage = e.message;
       }
@@ -172,6 +205,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       const status = e?.status && e.status >= 400 && e.status < 600 ? e.status : 500;
       
       // Log do erro (sem dados sensíveis)
+      const errorParameters = e?.response?.errors?.map(err => err.parameter).filter(Boolean) || [];
       console.error("[autopay/vindi/tokenize] tokenização falhou", {
         user_id,
         card_last4: last4,
@@ -179,11 +213,18 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
         error_message: errorMessage,
         has_errors: !!e?.response?.errors,
         errors_count: e?.response?.errors?.length || 0,
+        error_parameters: errorParameters,
       });
 
-      return res.status(status).json({
+      const responseJson = {
         error: errorMessage,
-      });
+      };
+      
+      if (errorDetails && errorDetails.length > 0) {
+        responseJson.details = errorDetails;
+      }
+
+      return res.status(status).json(responseJson);
     }
   } catch (e) {
     console.error("[autopay/vindi/tokenize] erro inesperado:", {
