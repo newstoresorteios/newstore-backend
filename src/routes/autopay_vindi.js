@@ -126,21 +126,39 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       payload.document_number = String(document_number).replace(/\D+/g, "").slice(0, 18);
     }
 
+    // Repassa payment_company_code do frontend (se fornecido) para forçar bandeira
+    // Caso contrário, vindi_public.js detectará automaticamente
     if (payment_company_code) {
-      payload.payment_company_code = String(payment_company_code).trim();
+      const cleanPcc = String(payment_company_code).trim().toLowerCase();
+      const validBrandCodes = ["visa", "mastercard", "elo", "american_express", "diners_club", "hipercard"];
+      if (validBrandCodes.includes(cleanPcc)) {
+        payload.payment_company_code = cleanPcc;
+      } else {
+        console.warn("[autopay/vindi/tokenize] payment_company_code inválido, será detectado automaticamente", {
+          user_id,
+          provided: payment_company_code,
+          valid_codes: validBrandCodes,
+        });
+      }
     }
+
+    // Mascara cartão para log (ex: 6504********5236)
+    const maskCardForLog = (num) => {
+      if (!num || num.length < 4) return "****";
+      if (num.length <= 8) return `****${num.slice(-4)}`;
+      return `${num.slice(0, 4)}${"*".repeat(Math.max(0, num.length - 8))}${num.slice(-4)}`;
+    };
+    const maskedCardLog = maskCardForLog(cleanCardNumber);
 
     // Log da requisição (mascarado)
     console.log("[autopay/vindi/tokenize] iniciando tokenização", {
       user_id,
       holder_name: cleanHolderName,
-      card_last4: last4,
-      exp_month: normalizedExpMonth,
-      exp_year: normalizedExpYear,
-      card_expiration: normalizedCardExpiration,
+      card_masked: maskedCardLog,
+      card_expiration: normalizedCardExpiration || `${normalizedExpMonth}/${normalizedExpYear}`,
+      payment_company_code: payload.payment_company_code || "será detectado automaticamente",
       has_cvv: !!cleanCvv,
       has_customer_id: !!customer_id,
-      payment_company_code: payment_company_code || null,
     });
 
     // Tokeniza cartão

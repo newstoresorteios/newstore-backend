@@ -18,49 +18,65 @@ const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ? JSON.st
 const err = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ? JSON.stringify(extra) : "");
 
 /**
- * Mascara número do cartão para logs (mostra apenas últimos 4 dígitos)
+ * Mascara número do cartão para logs (ex: 6504********5236)
  */
 function maskCardNumber(cardNumber) {
   if (!cardNumber) return "****";
   const clean = String(cardNumber).replace(/\D+/g, "");
   if (clean.length < 4) return "****";
-  return `****${clean.slice(-4)}`;
+  if (clean.length <= 8) return `****${clean.slice(-4)}`;
+  // Mostra primeiros 4 e últimos 4, mascarando o meio
+  const first4 = clean.slice(0, 4);
+  const last4 = clean.slice(-4);
+  const middle = "*".repeat(Math.max(0, clean.length - 8));
+  return `${first4}${middle}${last4}`;
 }
 
 /**
- * Detecta bandeira do cartão pelo número (algoritmo de Luhn + prefixos)
- * Retorna: { brand: string, payment_company_code: string }
+ * Detecta bandeira do cartão pelo número (BIN/prefixos)
+ * Retorna: { brandCode: string } onde brandCode ∈ ["visa","mastercard","elo","american_express","diners_club","hipercard"]
  */
 function detectCardBrand(cardNumber) {
   const clean = String(cardNumber).replace(/\D+/g, "");
   
+  if (!clean || clean.length < 4) {
+    return null; // Não detectado
+  }
+  
+  // Elo: prefixos comuns (incluindo 636368, 6504, etc)
+  // Prefixos Elo: 4011, 4312, 4389, 4514, 4573, 5041, 5066, 5067, 5090, 6278, 6362, 6363, 636368, 6500, 6504, 6505, 6507, 6509, 6516, 6550
+  if (/^(4011|4312|4389|4514|4573|5041|5066|5067|5090|6278|6362|6363|636368|6500|6504|6505|6507|6509|6516|6550)/.test(clean)) {
+    return { brandCode: "elo" };
+  }
+  
   // Visa: começa com 4
   if (clean.startsWith("4")) {
-    return { brand: "visa", payment_company_code: "visa" };
+    return { brandCode: "visa" };
   }
   
   // Mastercard: 51-55 ou 2221-2720
   if (/^5[1-5]/.test(clean) || /^2[2-7]/.test(clean)) {
-    return { brand: "mastercard", payment_company_code: "mastercard" };
+    return { brandCode: "mastercard" };
   }
   
-  // Amex: 34 ou 37
+  // American Express: 34 ou 37
   if (/^3[47]/.test(clean)) {
-    return { brand: "american_express", payment_company_code: "american_express" };
+    return { brandCode: "american_express" };
   }
   
-  // Elo: vários prefixos
-  if (/^(4011|4312|4389|4514|4573|5041|5066|5067|5090|6278|6362|6363|6500|6504|6505|6507|6509|6516|6550)/.test(clean)) {
-    return { brand: "elo", payment_company_code: "elo" };
+  // Diners Club: 30, 36, 38 (mas 38 pode ser Hipercard também)
+  // Priorizamos Diners Club para 30 e 36, 38 fica para Hipercard
+  if (/^(30|36)/.test(clean)) {
+    return { brandCode: "diners_club" };
   }
   
   // Hipercard: 38 ou 60
   if (/^(38|60)/.test(clean)) {
-    return { brand: "hipercard", payment_company_code: "hipercard" };
+    return { brandCode: "hipercard" };
   }
   
-  // Default: visa
-  return { brand: "visa", payment_company_code: "visa" };
+  // Não detectado
+  return null;
 }
 
 /**
@@ -98,8 +114,23 @@ export async function tokenizeCardPublic(payload) {
   // Normalizações
   const cleanCardNumber = String(payload.card_number).replace(/\D+/g, "");
   
-  // Detecta bandeira e payment_company_code
-  const { brand, payment_company_code } = detectCardBrand(cleanCardNumber);
+  // Detecta bandeira (se não fornecida no payload)
+  const detectedBrand = detectCardBrand(cleanCardNumber);
+  const brandCode = payload.payment_company_code || (detectedBrand?.brandCode);
+  
+  // Valida se temos payment_company_code válido
+  const validBrandCodes = ["visa", "mastercard", "elo", "american_express", "diners_club", "hipercard"];
+  if (!brandCode || !validBrandCodes.includes(brandCode)) {
+    const maskedCard = maskCardNumber(cleanCardNumber);
+    const error = new Error(`Bandeira do cartão não detectada ou inválida. Forneça payment_company_code válido (${validBrandCodes.join(", ")})`);
+    error.status = 422;
+    err("bandeira não detectada", {
+      card_masked: maskedCard,
+      detected_brand: detectedBrand?.brandCode || null,
+      provided_payment_company_code: payload.payment_company_code || null,
+    });
+    throw error;
+  }
   
   // Expiration: aceita MM/YYYY ou campos separados
   let normalizedMonth, normalizedYear;
@@ -112,8 +143,18 @@ export async function tokenizeCardPublic(payload) {
       error.status = 422;
       throw error;
     }
-    normalizedMonth = parts[0].padStart(2, "0");
-    normalizedYear = parts[1];
+    normalizedMonth = parts[0].replace(/\D+/g, "").padStart(2, "0");
+    let yearPart = parts[1].replace(/\D+/g, "");
+    // Normaliza ano para 4 dígitos
+    if (yearPart.length === 2) {
+      normalizedYear = `20${yearPart}`;
+    } else if (yearPart.length === 4) {
+      normalizedYear = yearPart;
+    } else {
+      const error = new Error("card_expiration: ano deve ter 2 ou 4 dígitos (formato MM/YYYY)");
+      error.status = 422;
+      throw error;
+    }
   } else {
     // Campos separados
     let month = Number(payload.card_expiration_month);
@@ -124,7 +165,7 @@ export async function tokenizeCardPublic(payload) {
     }
     normalizedMonth = String(month).padStart(2, "0");
 
-    let year = String(payload.card_expiration_year);
+    let year = String(payload.card_expiration_year).replace(/\D+/g, "");
     if (year.length === 2) {
       normalizedYear = `20${year}`;
     } else if (year.length === 4) {
@@ -134,26 +175,34 @@ export async function tokenizeCardPublic(payload) {
       error.status = 422;
       throw error;
     }
+    
+    // Garante que o ano seja 4 dígitos
+    if (normalizedYear.length !== 4) {
+      const error = new Error("card_expiration_year deve resultar em ano com 4 dígitos");
+      error.status = 422;
+      throw error;
+    }
+    
+    // Garante que o ano seja 4 dígitos
+    if (normalizedYear.length !== 4) {
+      const error = new Error("card_expiration_year deve resultar em ano com 4 dígitos");
+      error.status = 422;
+      throw error;
+    }
   }
 
   const cardExpiration = `${normalizedMonth}/${normalizedYear}`;
 
   try {
-    // Para Visa/Master a Vindi detecta automaticamente, mas é recomendado enviar.
-    // Para Elo/Amex/Diners/Hipercard é obrigatório/fortemente recomendado.
-    const pcc = payload.payment_company_code || payment_company_code;
-    
     // Constrói form data (x-www-form-urlencoded)
     const form = new URLSearchParams();
+    form.set("allow_as_fallback", "true");
     form.set("holder_name", String(payload.holder_name).slice(0, 120));
     form.set("card_number", cleanCardNumber);
     form.set("card_expiration", cardExpiration); // formato MM/YYYY esperado pela Vindi Public API
     form.set("card_cvv", String(payload.card_cvv).slice(0, 4));
     form.set("payment_method_code", payload.payment_method_code || "credit_card");
-    
-    if (pcc) {
-      form.set("payment_company_code", pcc);
-    }
+    form.set("payment_company_code", brandCode); // Sempre envia payment_company_code válido
     
     if (payload.document_number) {
       form.set("document_number", String(payload.document_number).replace(/\D+/g, "").slice(0, 18));
@@ -163,11 +212,12 @@ export async function tokenizeCardPublic(payload) {
     const maskedCard = maskCardNumber(cleanCardNumber);
     log("chamando Vindi Public API", {
       holder_name: payload.holder_name,
-      card_last4: maskedCard.slice(-4),
+      card_masked: maskedCard,
       card_expiration: cardExpiration,
-      brand,
-      payment_company_code: pcc || null,
+      payment_company_code: brandCode,
+      payment_method_code: payload.payment_method_code || "credit_card",
       has_cvv: !!payload.card_cvv,
+      has_document_number: !!payload.document_number,
     });
 
     const url = `${VINDI_PUBLIC_BASE}/public/payment_profiles`;
@@ -211,7 +261,8 @@ export async function tokenizeCardPublic(payload) {
         has_gateway_token: !!json?.payment_profile?.gateway_token,
         payment_profile_id: json?.payment_profile?.id,
         card_last4: json?.payment_profile?.last_four || null,
-        brand: json?.payment_profile?.card_type || brand,
+        card_type: json?.payment_profile?.card_type || null,
+        payment_company_code_sent: brandCode,
       });
     } else {
       const errorMessages = json?.errors?.map(e => e.message).filter(Boolean) || [];
@@ -293,7 +344,23 @@ export async function tokenizeCardPublic(payload) {
   }
 }
 
+/**
+ * Função de validação/teste para detecção de bandeiras
+ * @param {string} cardNumber - Número do cartão (pode ter formatação)
+ * @returns {object|null} - { brandCode: string } ou null se não detectado
+ * 
+ * Exemplos:
+ * - "6363680000000000" => { brandCode: "elo" }
+ * - "6504123456789012" => { brandCode: "elo" }
+ * - "4111111111111111" => { brandCode: "visa" }
+ * - "5555555555554444" => { brandCode: "mastercard" }
+ */
+export function validateCardBrand(cardNumber) {
+  return detectCardBrand(cardNumber);
+}
+
 export default {
   tokenizeCardPublic,
+  validateCardBrand,
 };
 
