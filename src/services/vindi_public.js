@@ -298,60 +298,39 @@ export async function tokenizeCardPublic(payload) {
     throw error;
   }
   
-  // Expiration: aceita MM/YY, MM/YYYY ou campos separados
-  // A Vindi espera MM/YY (2 dígitos do ano)
-  let normalizedMonth, normalizedYear2Digits;
+  // Expiration: aceita MM/YYYY (sempre normalizado para 4 dígitos do ano)
+  // A rota já normaliza para MM/YYYY, mas garantimos aqui também
+  let cardExpiration = null;
   
   if (payload.card_expiration) {
-    // Formato MM/YY ou MM/YYYY
+    // Formato MM/YYYY (já normalizado pela rota)
     const parts = String(payload.card_expiration).split("/");
-    if (parts.length !== 2) {
-      const error = new Error("card_expiration deve estar no formato MM/YY ou MM/YYYY");
-      error.status = 422;
-      throw error;
-    }
-    normalizedMonth = parts[0].replace(/\D+/g, "").padStart(2, "0");
-    let yearPart = parts[1].replace(/\D+/g, "");
-    
-    // Normaliza para 2 dígitos do ano (YY)
-    if (yearPart.length === 2) {
-      normalizedYear2Digits = yearPart;
-    } else if (yearPart.length === 4) {
-      // Pega os últimos 2 dígitos do ano de 4 dígitos
-      normalizedYear2Digits = yearPart.slice(-2);
+    if (parts.length === 2) {
+      const month = parts[0].replace(/\D+/g, "").padStart(2, "0");
+      let yearPart = parts[1].replace(/\D+/g, "");
+      
+      // Garante que o ano seja 4 dígitos
+      if (yearPart.length === 2) {
+        // MM/YY: assume 20YY se YY <= 79, senão 19YY
+        const yy = parseInt(yearPart, 10);
+        yearPart = yy <= 79 ? `20${yearPart.padStart(2, "0")}` : `19${yearPart.padStart(2, "0")}`;
+      } else if (yearPart.length !== 4) {
+        const error = new Error("card_expiration: ano deve ter 2 ou 4 dígitos (formato MM/YY ou MM/YYYY)");
+        error.status = 422;
+        throw error;
+      }
+      
+      cardExpiration = `${month}/${yearPart}`;
     } else {
-      const error = new Error("card_expiration: ano deve ter 2 ou 4 dígitos (formato MM/YY ou MM/YYYY)");
+      const error = new Error("card_expiration deve estar no formato MM/YYYY");
       error.status = 422;
       throw error;
     }
   } else {
-    // Campos separados
-    let month = Number(payload.card_expiration_month);
-    if (month < 1 || month > 12) {
-      const error = new Error("card_expiration_month deve ser entre 1 e 12");
-      error.status = 422;
-      throw error;
-    }
-    normalizedMonth = String(month).padStart(2, "0");
-
-    let year = String(payload.card_expiration_year).replace(/\D+/g, "");
-    let fullYear;
-    if (year.length === 2) {
-      fullYear = `20${year}`;
-    } else if (year.length === 4) {
-      fullYear = year;
-    } else {
-      const error = new Error("card_expiration_year deve ter 2 ou 4 dígitos");
-      error.status = 422;
-      throw error;
-    }
-    
-    // Pega os últimos 2 dígitos do ano (YY)
-    normalizedYear2Digits = fullYear.slice(-2);
+    const error = new Error("card_expiration é obrigatório (formato MM/YYYY)");
+    error.status = 422;
+    throw error;
   }
-
-  // Formato final: MM/YY (conforme documentação Vindi)
-  const cardExpiration = `${normalizedMonth}/${normalizedYear2Digits}`;
 
   try {
     // Constrói form data (x-www-form-urlencoded)
@@ -359,28 +338,40 @@ export async function tokenizeCardPublic(payload) {
     form.set("allow_as_fallback", "true");
     form.set("holder_name", String(payload.holder_name).slice(0, 120));
     form.set("card_number", cleanCardNumber);
-    form.set("card_expiration", cardExpiration); // formato MM/YY conforme documentação Vindi
+    form.set("card_expiration", cardExpiration); // formato MM/YYYY
     form.set("card_cvv", String(payload.card_cvv).slice(0, 4));
     form.set("payment_method_code", paymentMethodCode);
-    // Sempre envia payment_company_code quando for credit_card (obrigatório para Elo/Hipercard/Hiper)
+    
+    // Envia payment_company_code quando disponível
     if (paymentMethodCode === "credit_card" && brandCode) {
       form.set("payment_company_code", brandCode);
+    }
+    
+    // Envia payment_company_id quando disponível (prioritário)
+    if (payload.payment_company_id) {
+      form.set("payment_company_id", String(payload.payment_company_id));
     }
     
     if (payload.document_number) {
       form.set("document_number", String(payload.document_number).replace(/\D+/g, "").slice(0, 18));
     }
     
-    // Log do payload mascarado (antes da chamada) - mostra payment_company_code efetivo
+    // Log do payload mascarado (antes da chamada) - mostra payment_company_code e payment_company_id
     const maskedCard = maskCardNumber(cleanCardNumber);
+    // Mascara: primeiros 6 + últimos 4
+    const cardMasked = cleanCardNumber.length >= 10 
+      ? `${cleanCardNumber.slice(0, 6)}${"*".repeat(cleanCardNumber.length - 10)}${cleanCardNumber.slice(-4)}`
+      : maskCardNumber(cleanCardNumber);
+    
     log("chamando Vindi Public API", {
       user_id: payload.user_id || null,
       holder_name: payload.holder_name,
-      card_masked: maskedCard,
+      card_masked: cardMasked,
       card_expiration: cardExpiration,
-      payment_company_code: brandCode, // Código efetivo que será enviado
       payment_method_code: paymentMethodCode,
-      payment_company_code_source: brandCodeSource || "unknown",
+      payment_company_code: brandCode || payload.payment_company_code || null,
+      payment_company_id: payload.payment_company_id || null,
+      payment_company_code_source: brandCodeSource || (payload.payment_company_code ? "frontend" : "detected"),
       has_cvv: !!payload.card_cvv,
       has_document_number: !!payload.document_number,
     });
@@ -441,20 +432,17 @@ export async function tokenizeCardPublic(payload) {
     }
 
     if (!response.ok) {
-      // Se Vindi retornar JSON com errors[0].message, usar essa mensagem
-      // Prioriza mensagens mais específicas do array de erros
+      // Captura erros completos da Vindi (especialmente 422)
       let errorMsg = null;
       const errorsWithDetails = [];
       
       if (json?.errors && Array.isArray(json.errors) && json.errors.length > 0) {
         // Captura todos os erros com message e parameter
         json.errors.forEach(e => {
-          if (e.message || e.parameter) {
-            errorsWithDetails.push({
-              message: e.message || null,
-              parameter: e.parameter || null,
-            });
-          }
+          errorsWithDetails.push({
+            message: e.message || null,
+            parameter: e.parameter || null,
+          });
         });
         
         // Busca a primeira mensagem disponível no array de erros
@@ -462,7 +450,6 @@ export async function tokenizeCardPublic(payload) {
         if (firstError) {
           errorMsg = firstError.message;
         } else if (json.errors[0]) {
-          // Se não tem message, tenta usar o erro como string
           errorMsg = String(json.errors[0]);
         }
       }
@@ -478,6 +465,10 @@ export async function tokenizeCardPublic(payload) {
         ...json,
         errors: errorsWithDetails.length > 0 ? errorsWithDetails : json?.errors || [],
       };
+      // Para 422, inclui details no erro para facilitar retorno ao frontend
+      if (response.status === 422 && errorsWithDetails.length > 0) {
+        error.details = errorsWithDetails;
+      }
       throw error;
     }
 
