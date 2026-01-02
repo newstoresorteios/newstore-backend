@@ -51,17 +51,21 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     const cardNumber = req.body?.cardNumber || req.body?.card_number;
     const expMonth = req.body?.expMonth || req.body?.card_expiration_month;
     const expYear = req.body?.expYear || req.body?.card_expiration_year;
+    const cardExpiration = req.body?.card_expiration || req.body?.cardExpiration; // MM/YYYY
     const cvv = req.body?.cvv || req.body?.card_cvv;
     const payment_method_code = req.body?.payment_method_code || "credit_card";
     const document_number = req.body?.document_number || req.body?.documentNumber;
+    const payment_company_code = req.body?.payment_company_code || req.body?.paymentCompanyCode;
     const customer_id = req.body?.customer_id; // Opcional: para associar imediatamente
 
     // Valida campos obrigatórios
     const missingFields = [];
     if (!holderName) missingFields.push("holderName");
     if (!cardNumber) missingFields.push("cardNumber");
-    if (!expMonth) missingFields.push("expMonth");
-    if (!expYear) missingFields.push("expYear");
+    if (!cardExpiration && (!expMonth || !expYear)) {
+      if (!expMonth) missingFields.push("expMonth");
+      if (!expYear) missingFields.push("expYear");
+    }
     if (!cvv) missingFields.push("cvv");
 
     if (missingFields.length > 0) {
@@ -83,14 +87,22 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     const payload = {
       holder_name: String(holderName).slice(0, 120),
       card_number: cleanCardNumber,
-      card_expiration_month: String(expMonth).padStart(2, "0"),
-      card_expiration_year: String(expYear),
+      ...(cardExpiration
+        ? { card_expiration: String(cardExpiration) }
+        : {
+            card_expiration_month: String(expMonth).padStart(2, "0"),
+            card_expiration_year: String(expYear),
+          }),
       card_cvv: String(cvv).slice(0, 4),
       payment_method_code,
     };
 
     if (document_number) {
       payload.document_number = String(document_number).replace(/\D+/g, "").slice(0, 18);
+    }
+
+    if (payment_company_code) {
+      payload.payment_company_code = String(payment_company_code);
     }
 
     // Log da requisição (mascarado)

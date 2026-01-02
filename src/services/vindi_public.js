@@ -36,31 +36,31 @@ function detectCardBrand(cardNumber) {
   
   // Visa: começa com 4
   if (clean.startsWith("4")) {
-    return { brand: "visa", payment_company_code: "pagarme" };
+    return { brand: "visa", payment_company_code: "visa" };
   }
   
   // Mastercard: 51-55 ou 2221-2720
   if (/^5[1-5]/.test(clean) || /^2[2-7]/.test(clean)) {
-    return { brand: "mastercard", payment_company_code: "pagarme" };
+    return { brand: "mastercard", payment_company_code: "mastercard" };
   }
   
   // Amex: 34 ou 37
   if (/^3[47]/.test(clean)) {
-    return { brand: "amex", payment_company_code: "pagarme" };
+    return { brand: "american_express", payment_company_code: "american_express" };
   }
   
   // Elo: vários prefixos
   if (/^(4011|4312|4389|4514|4573|5041|5066|5067|5090|6278|6362|6363|6500|6504|6505|6507|6509|6516|6550)/.test(clean)) {
-    return { brand: "elo", payment_company_code: "pagarme" };
+    return { brand: "elo", payment_company_code: "elo" };
   }
   
   // Hipercard: 38 ou 60
   if (/^(38|60)/.test(clean)) {
-    return { brand: "hipercard", payment_company_code: "pagarme" };
+    return { brand: "hipercard", payment_company_code: "hipercard" };
   }
   
-  // Default: visa/pagarme
-  return { brand: "visa", payment_company_code: "pagarme" };
+  // Default: visa
+  return { brand: "visa", payment_company_code: "visa" };
 }
 
 /**
@@ -89,13 +89,8 @@ export async function tokenizeCardPublic(payload) {
   }
 
   // Validações obrigatórias: aceita card_expiration OU (card_expiration_month + card_expiration_year)
-  const hasExpFields = payload?.card_expiration_month && payload?.card_expiration_year;
-  const hasExpCombined = !!payload?.card_expiration;
-
-  if (!payload?.holder_name || !payload?.card_number || !payload?.card_cvv || (!hasExpFields && !hasExpCombined)) {
-    const error = new Error(
-      "Campos obrigatórios: holder_name, card_number, (card_expiration_month+card_expiration_year OU card_expiration MM/YYYY), card_cvv"
-    );
+  if (!payload?.holder_name || !payload?.card_number || (!payload?.card_expiration && (!payload?.card_expiration_month || !payload?.card_expiration_year)) || !payload?.card_cvv) {
+    const error = new Error("Campos obrigatórios: holder_name, card_number, card_expiration/card_expiration_month+year, card_cvv");
     error.status = 422;
     throw error;
   }
@@ -103,8 +98,8 @@ export async function tokenizeCardPublic(payload) {
   // Normalizações
   const cleanCardNumber = String(payload.card_number).replace(/\D+/g, "");
   
-  // Detecta bandeira (apenas para log/UI, não para determinar gateway)
-  const { brand } = detectCardBrand(cleanCardNumber);
+  // Detecta bandeira e payment_company_code
+  const { brand, payment_company_code } = detectCardBrand(cleanCardNumber);
   
   // Expiration: aceita MM/YYYY ou campos separados
   let normalizedMonth, normalizedYear;
@@ -141,25 +136,30 @@ export async function tokenizeCardPublic(payload) {
     }
   }
 
+  const cardExpiration = `${normalizedMonth}/${normalizedYear}`;
+
   try {
     const body = {
       holder_name: String(payload.holder_name).slice(0, 120),
       card_number: cleanCardNumber,
-      card_expiration_month: normalizedMonth,
-      card_expiration_year: normalizedYear,
+      card_expiration: cardExpiration, // formato esperado pela Vindi Public API
       card_cvv: String(payload.card_cvv).slice(0, 4),
       payment_method_code: payload.payment_method_code || "credit_card",
-      payment_company_code: payload.payment_company_code || VINDI_DEFAULT_GATEWAY,
     };
+
+    // Para Visa/Master a Vindi detecta automaticamente, mas é recomendado enviar.
+    // Para Elo/Amex/Diners/Hipercard é obrigatório/fortemente recomendado.
+    const pcc = payload.payment_company_code || payment_company_code;
+    if (pcc) body.payment_company_code = pcc;
     
     // Log do payload mascarado (antes da chamada)
     const maskedCard = maskCardNumber(cleanCardNumber);
     log("chamando Vindi Public API", {
       holder_name: payload.holder_name,
       card_last4: maskedCard.slice(-4),
-      card_expiration: `${normalizedMonth}/${normalizedYear}`,
+      card_expiration: cardExpiration,
       brand,
-      payment_company_code: body.payment_company_code,
+      payment_company_code: pcc || null,
       has_cvv: !!payload.card_cvv,
     });
 
