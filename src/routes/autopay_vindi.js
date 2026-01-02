@@ -51,11 +51,16 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     const cardNumber = req.body?.cardNumber || req.body?.card_number;
     const expMonth = req.body?.expMonth || req.body?.card_expiration_month;
     const expYear = req.body?.expYear || req.body?.card_expiration_year;
-    const cardExpiration = req.body?.card_expiration || req.body?.cardExpiration; // MM/YYYY
+    const cardExpiration = req.body?.card_expiration || req.body?.cardExpiration; // MM/YY ou MM/YYYY
     const cvv = req.body?.cvv || req.body?.card_cvv;
     const payment_method_code = req.body?.payment_method_code || "credit_card";
     const document_number = req.body?.document_number || req.body?.documentNumber;
-    const payment_company_code = req.body?.payment_company_code || req.body?.paymentCompanyCode;
+    // Normaliza payment_company_code: aceita payment_company_code, paymentCompanyCode, brand, brandCode
+    const payment_company_code = req.body?.payment_company_code || 
+                                 req.body?.paymentCompanyCode || 
+                                 req.body?.brand || 
+                                 req.body?.brandCode || 
+                                 null;
     const customer_id = req.body?.customer_id; // Opcional: para associar imediatamente
 
     // Normaliza e limpa campos
@@ -126,21 +131,16 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       payload.document_number = String(document_number).replace(/\D+/g, "").slice(0, 18);
     }
 
-    // Repassa payment_company_code do frontend (se fornecido) para forçar bandeira
-    // Caso contrário, vindi_public.js detectará automaticamente
+    // Repassa payment_company_code do frontend (normalizado)
+    // vindi_public.js validará contra lista da Vindi e priorizará este valor
     if (payment_company_code) {
       const cleanPcc = String(payment_company_code).trim().toLowerCase();
-      const validBrandCodes = ["visa", "mastercard", "elo", "american_express", "diners_club", "hipercard"];
-      if (validBrandCodes.includes(cleanPcc)) {
-        payload.payment_company_code = cleanPcc;
-      } else {
-        console.warn("[autopay/vindi/tokenize] payment_company_code inválido, será detectado automaticamente", {
-          user_id,
-          provided: payment_company_code,
-          valid_codes: validBrandCodes,
-        });
-      }
+      payload.payment_company_code = cleanPcc;
+      // vindi_public.js fará validação final contra lista da Vindi
     }
+    
+    // Adiciona user_id para logs
+    payload.user_id = user_id;
 
     // Mascara cartão para log (ex: 6504********5236)
     const maskCardForLog = (num) => {
@@ -150,13 +150,14 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     };
     const maskedCardLog = maskCardForLog(cleanCardNumber);
 
-    // Log da requisição (mascarado)
+    // Log da requisição (mascarado) - mostra payment_company_code se fornecido
     console.log("[autopay/vindi/tokenize] iniciando tokenização", {
       user_id,
       holder_name: cleanHolderName,
       card_masked: maskedCardLog,
       card_expiration: normalizedCardExpiration || `${normalizedExpMonth}/${normalizedExpYear}`,
-      payment_company_code: payload.payment_company_code || "será detectado automaticamente",
+      payment_company_code: payload.payment_company_code || null, // null se não fornecido (será detectado)
+      payment_company_code_source: payload.payment_company_code ? "frontend" : "será detectado",
       has_cvv: !!cleanCvv,
       has_customer_id: !!customer_id,
     });
@@ -203,9 +204,9 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
         gateway_token: result.gatewayToken,
       });
     } catch (e) {
-      // Extrai mensagem de erro da Vindi
+      // Extrai mensagem de erro da Vindi ou do backend
       let errorMessage = "Falha ao tokenizar cartão na Vindi";
-      let errorDetails = null;
+      let errorDetails = e?.details || null;
       
       if (e?.response?.errors && Array.isArray(e.response.errors) && e.response.errors.length > 0) {
         // Prioriza primeira mensagem do array de erros
@@ -217,6 +218,10 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
         }));
       } else if (e?.message) {
         errorMessage = e.message;
+        // Se o erro tem details (ex: payment_company_code não detectado), inclui
+        if (e.details && Array.isArray(e.details)) {
+          errorDetails = e.details;
+        }
       }
       
       // Status original da Vindi quando possível (401/422 etc), senão 500
@@ -232,6 +237,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
         has_errors: !!e?.response?.errors,
         errors_count: e?.response?.errors?.length || 0,
         error_parameters: errorParameters,
+        has_details: !!errorDetails,
       });
 
       const responseJson = {
