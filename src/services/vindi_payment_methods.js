@@ -28,7 +28,8 @@ let paymentMethodsCache = {
  */
 function buildAuthHeader() {
   if (!VINDI_API_KEY) {
-    throw new Error("VINDI_API_KEY não configurado no servidor.");
+    // Não lança erro - retorna null e o caller trata
+    return null;
   }
   const authString = `${VINDI_API_KEY}:`;
   const encoded = Buffer.from(authString).toString("base64");
@@ -56,6 +57,12 @@ async function fetchPaymentMethods() {
   }
 
   try {
+    const authHeader = buildAuthHeader();
+    if (!authHeader) {
+      // VINDI_API_KEY não configurado - retorna null sem erro
+      return null;
+    }
+    
     const url = `${VINDI_BASE}/payment_methods`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
@@ -65,7 +72,7 @@ async function fetchPaymentMethods() {
       response = await fetch(url, {
         method: "GET",
         headers: {
-          Authorization: buildAuthHeader(),
+          Authorization: authHeader,
           Accept: "application/json",
           "User-Agent": "lancaster-backend/1.0",
         },

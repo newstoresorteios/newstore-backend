@@ -205,14 +205,17 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     }
     
     // Tenta resolver payment_company_id (opcional, não bloqueia se falhar)
+    // IMPORTANTE: Só inclui no payload se for um número válido (não null/undefined/0)
     let payment_company_id = null;
     if (finalPaymentCompanyCode && payment_method_code === "credit_card") {
       try {
-        payment_company_id = await resolvePaymentCompanyId({
+        const resolvedId = await resolvePaymentCompanyId({
           payment_method_code,
           payment_company_code: finalPaymentCompanyCode,
         });
-        if (payment_company_id) {
+        // Valida se é um número válido antes de incluir
+        if (resolvedId != null && resolvedId !== "" && !isNaN(Number(resolvedId)) && Number(resolvedId) > 0) {
+          payment_company_id = Number(resolvedId);
           payload.payment_company_id = payment_company_id;
         }
       } catch (e) {
@@ -223,6 +226,12 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
           msg: e?.message,
         });
       }
+    }
+    
+    // IMPORTANTE: Remove payment_company_id do payload se for null/undefined/0
+    // para garantir que não seja enviado para a Vindi
+    if (payload.payment_company_id == null || payload.payment_company_id === "" || payload.payment_company_id === 0) {
+      delete payload.payment_company_id;
     }
     
     // Adiciona user_id para logs
@@ -237,7 +246,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     const maskedCardLog = maskCardForLog(cleanCardNumber);
 
     // Log da requisição (mascarado) - mostra payment_company_code recebido e enviado
-    console.log("[autopay/vindi/tokenize] iniciando tokenização", {
+    const requestLog = {
       user_id,
       holder_name: cleanHolderName,
       card_masked: maskedCardLog,
@@ -246,10 +255,18 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       payment_company_code_received: payment_company_code || null,
       payment_company_code_sent_to_vindi: finalPaymentCompanyCode || null,
       payment_company_code_source: paymentCompanyCodeSource,
-      payment_company_id: payment_company_id || null,
       has_cvv: !!cleanCvv,
       has_customer_id: !!customer_id,
-    });
+    };
+    
+    // Só inclui payment_company_id no log se for válido
+    if (payment_company_id != null && payment_company_id > 0) {
+      requestLog.payment_company_id_sent = payment_company_id;
+    } else {
+      requestLog.payment_company_id_sent = null;
+    }
+    
+    console.log("[autopay/vindi/tokenize] iniciando tokenização", requestLog);
 
     // Tokeniza cartão
     try {
@@ -319,7 +336,9 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       // Log do erro (sem dados sensíveis) - inclui error_parameters e error_messages
       const errorParameters = e?.response?.errors?.map(err => err.parameter).filter(Boolean) || [];
       const errorMessages = e?.response?.errors?.map(err => err.message).filter(Boolean) || [];
-      console.error("[autopay/vindi/tokenize] tokenização falhou", {
+      const hasPaymentCompanyIdError = errorParameters.includes("payment_company_id");
+      
+      const errorLog = {
         user_id,
         card_last4: last4,
         status: e?.status || status,
@@ -329,7 +348,16 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
         error_parameters: errorParameters,
         error_messages: errorMessages,
         has_details: !!errorDetails,
-      });
+      };
+      
+      // Se o erro for sobre payment_company_id, inclui contexto
+      if (hasPaymentCompanyIdError) {
+        errorLog.payload_contains_payment_company_id = payload.payment_company_id != null;
+        errorLog.payment_company_id_value = payload.payment_company_id || null;
+        errorLog.payment_company_code_sent = finalPaymentCompanyCode || null;
+      }
+      
+      console.error("[autopay/vindi/tokenize] tokenização falhou", errorLog);
 
       const responseJson = {
         error: errorMessage,

@@ -334,9 +334,15 @@ export async function tokenizeCardPublic(payload) {
       form.set("payment_company_code", finalPaymentCompanyCode);
     }
     
-    // Envia payment_company_id quando disponível (prioritário)
-    if (payload.payment_company_id) {
-      form.set("payment_company_id", String(payload.payment_company_id));
+    // Envia payment_company_id SOMENTE se for um número válido (não null, undefined, 0, "", etc)
+    const paymentCompanyId = payload.payment_company_id;
+    const hasValidPaymentCompanyId = paymentCompanyId != null && 
+                                     paymentCompanyId !== "" && 
+                                     !isNaN(Number(paymentCompanyId)) && 
+                                     Number(paymentCompanyId) > 0;
+    
+    if (hasValidPaymentCompanyId) {
+      form.set("payment_company_id", String(paymentCompanyId));
     }
     
     if (payload.document_number) {
@@ -350,19 +356,31 @@ export async function tokenizeCardPublic(payload) {
       ? `${cleanCardNumber.slice(0, 4)}${"*".repeat(Math.max(0, cleanCardNumber.length - 8))}${cleanCardNumber.slice(-4)}`
       : maskCardNumber(cleanCardNumber);
     
-    log("chamando Vindi Public API - request final", {
+    // Log do payload final que será enviado à Vindi (mascarado)
+    const logPayload = {
       user_id: payload.user_id || null,
       holder_name: payload.holder_name,
       card_masked: cardMasked,
       card_expiration: cardExpiration,
       payment_method_code: paymentMethodCode,
       allow_as_fallback: form.get("allow_as_fallback"),
-      payment_company_code: finalPaymentCompanyCode || null,
-      payment_company_id: payload.payment_company_id || null,
+      payment_company_code_received: payload.payment_company_code || null,
+      payment_company_code_sent: finalPaymentCompanyCode || null,
       payment_company_code_source: payload.payment_company_code ? "frontend" : (brandCode ? "backend-detected" : "none"),
-      has_cvv: !!payload.card_cvv,
-      has_document_number: !!payload.document_number,
-    });
+    };
+    
+    // Só inclui payment_company_id no log se for válido
+    if (hasValidPaymentCompanyId) {
+      logPayload.payment_company_id_sent = String(paymentCompanyId);
+    } else {
+      logPayload.payment_company_id_sent = null;
+      logPayload.payment_company_id_received = payload.payment_company_id || null;
+    }
+    
+    logPayload.has_cvv = !!payload.card_cvv;
+    logPayload.has_document_number = !!payload.document_number;
+    
+    log("chamando Vindi Public API - request final", logPayload);
 
     const url = `${VINDI_PUBLIC_BASE}/public/payment_profiles`;
     const controller = new AbortController();
@@ -411,12 +429,23 @@ export async function tokenizeCardPublic(payload) {
     } else {
       const errorMessages = json?.errors?.map(e => e.message).filter(Boolean) || [];
       const errorParameters = json?.errors?.map(e => e.parameter).filter(Boolean) || [];
-      err("Vindi Public API erro", {
+      
+      // Log detalhado para 422 com payment_company_id
+      const hasPaymentCompanyIdError = errorParameters.includes("payment_company_id");
+      const errorLog = {
         status: response.status,
         error_count: json?.errors?.length || 0,
         error_messages: errorMessages,
         error_parameters: errorParameters,
-      });
+      };
+      
+      if (hasPaymentCompanyIdError) {
+        errorLog.payload_contains_payment_company_id = hasValidPaymentCompanyId;
+        errorLog.payment_company_id_value = hasValidPaymentCompanyId ? String(paymentCompanyId) : null;
+        errorLog.payment_company_code_sent = finalPaymentCompanyCode || null;
+      }
+      
+      err("Vindi Public API erro", errorLog);
     }
 
     if (!response.ok) {
@@ -427,10 +456,15 @@ export async function tokenizeCardPublic(payload) {
       if (json?.errors && Array.isArray(json.errors) && json.errors.length > 0) {
         // Captura todos os erros com message e parameter
         json.errors.forEach(e => {
-          errorsWithDetails.push({
+          const detail = {
             message: e.message || null,
             parameter: e.parameter || null,
-          });
+          };
+          // Formata mensagem para frontend: "campo: <parameter> - <message>"
+          if (detail.parameter && detail.message) {
+            detail.formatted = `campo: ${detail.parameter} - ${detail.message}`;
+          }
+          errorsWithDetails.push(detail);
         });
         
         // Busca a primeira mensagem disponível no array de erros
