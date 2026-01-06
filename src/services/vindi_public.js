@@ -2,8 +2,12 @@
 // Integração com Vindi Public API (tokenização de cartão)
 // Esta API é chamada do backend para gerar gateway_token a partir de dados do cartão
 
+// Base URL da Vindi Public API
+// Configurável via VINDI_PUBLIC_BASE_URL ou VINDI_PUBLIC_URL
+// Produção: https://app.vindi.com.br/api/v1
+// Sandbox: https://sandbox-app.vindi.com.br/api/v1
 const VINDI_PUBLIC_BASE =
-  (process.env.VINDI_PUBLIC_BASE_URL && process.env.VINDI_PUBLIC_BASE_URL.replace(/\/+$/, "")) ||
+  (process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL)?.replace(/\/+$/, "") ||
   "https://app.vindi.com.br/api/v1";
 
 const VINDI_PUBLIC_KEY = process.env.VINDI_PUBLIC_KEY || "";

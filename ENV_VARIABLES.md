@@ -18,17 +18,19 @@ Este documento lista as variáveis de ambiente necessárias para configurar o ba
 
 ## Variáveis Opcionais para Vindi
 
-### VINDI_PUBLIC_BASE_URL
+### VINDI_PUBLIC_BASE_URL ou VINDI_PUBLIC_URL
 - **Descrição**: URL base da API pública da Vindi
 - **Padrão**: `https://app.vindi.com.br/api/v1`
 - **Uso**: Para sandbox ou ambientes customizados
 - **Exemplo**: `VINDI_PUBLIC_BASE_URL=https://sandbox-app.vindi.com.br/api/v1`
+- **Nota**: Aceita tanto `VINDI_PUBLIC_BASE_URL` quanto `VINDI_PUBLIC_URL` (ambos funcionam)
 
-### VINDI_API_BASE_URL
+### VINDI_API_BASE_URL ou VINDI_API_URL
 - **Descrição**: URL base da API privada da Vindi
 - **Padrão**: `https://app.vindi.com.br/api/v1`
 - **Uso**: Para sandbox ou ambientes customizados
 - **Exemplo**: `VINDI_API_BASE_URL=https://sandbox-app.vindi.com.br/api/v1`
+- **Nota**: Aceita tanto `VINDI_API_BASE_URL` quanto `VINDI_API_URL` (ambos funcionam)
 
 ### VINDI_DEFAULT_PAYMENT_METHOD
 - **Descrição**: Método de pagamento padrão

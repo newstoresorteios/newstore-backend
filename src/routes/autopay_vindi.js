@@ -13,6 +13,89 @@ import { detectPaymentCompanyCode } from "../services/vindi_public.js";
 
 const router = express.Router();
 
+/**
+ * Mapeia erros da Vindi para códigos HTTP apropriados
+ * Evita que erros de autenticação da Vindi (401/403) sejam interpretados como erro de JWT
+ * @param {Error} error - Erro da Vindi
+ * @returns {object} - { httpStatus, code, message, providerStatus, details }
+ */
+function mapVindiError(error) {
+  const vindiStatus = error?.status;
+  const errorResponse = error?.response || {};
+  const errors = errorResponse?.errors || [];
+  
+  // Extrai mensagens de erro da Vindi (limite 300 chars)
+  const errorMessages = errors.map(e => e?.message || "").filter(Boolean);
+  const errorSummary = errorMessages.length > 0
+    ? errorMessages.join("; ").slice(0, 300)
+    : error?.message || "Erro na integração com Vindi";
+  
+  // Mapeia status da Vindi para HTTP status apropriado
+  if (vindiStatus === 401 || vindiStatus === 403) {
+    // Erro de autenticação da Vindi → 502 Bad Gateway (não 401 para não confundir com JWT)
+    return {
+      httpStatus: 502,
+      code: "VINDI_AUTH_ERROR",
+      message: "Falha de autenticação na Vindi (verifique VINDI_API_KEY/VINDI_API_BASE_URL).",
+      providerStatus: vindiStatus,
+      details: errors.length > 0 ? errors : [{ message: errorSummary }],
+    };
+  }
+  
+  if (vindiStatus === 422) {
+    // Erro de validação → manter 422
+    return {
+      httpStatus: 422,
+      code: "VINDI_VALIDATION_ERROR",
+      message: errorSummary,
+      providerStatus: vindiStatus,
+      details: errors.length > 0 ? errors : [{ message: errorSummary }],
+    };
+  }
+  
+  if (vindiStatus === 400) {
+    // Bad Request → manter 400
+    return {
+      httpStatus: 400,
+      code: "VINDI_BAD_REQUEST",
+      message: errorSummary,
+      providerStatus: vindiStatus,
+      details: errors.length > 0 ? errors : [{ message: errorSummary }],
+    };
+  }
+  
+  if (vindiStatus >= 500 && vindiStatus < 600) {
+    // Erro 5xx da Vindi → 502 Bad Gateway
+    return {
+      httpStatus: 502,
+      code: "VINDI_UPSTREAM_ERROR",
+      message: `Erro no servidor da Vindi (${vindiStatus})`,
+      providerStatus: vindiStatus,
+      details: errors.length > 0 ? errors : [{ message: errorSummary }],
+    };
+  }
+  
+  if (vindiStatus && vindiStatus >= 400 && vindiStatus < 500) {
+    // Outros 4xx → 502 (não queremos confundir com nossos erros)
+    return {
+      httpStatus: 502,
+      code: "VINDI_CLIENT_ERROR",
+      message: errorSummary,
+      providerStatus: vindiStatus,
+      details: errors.length > 0 ? errors : [{ message: errorSummary }],
+    };
+  }
+  
+  // Sem status ou erro desconhecido → 500
+  return {
+    httpStatus: 500,
+    code: "INTERNAL_ERROR",
+    message: errorSummary,
+    providerStatus: vindiStatus || null,
+    details: errors.length > 0 ? errors : [{ message: errorSummary }],
+  };
+}
+
 // Helper para parse de números (mesmo do autopay.js)
 function parseNumbers(input) {
   const arr = Array.isArray(input)
@@ -228,18 +311,22 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
         customer_id: customerId,
       });
     } catch (ensureError) {
+      const mappedError = mapVindiError(ensureError);
+      
       console.error("[autopay/vindi/tokenize] falha ao garantir customer", {
         user_id,
-        msg: ensureError?.message,
-        status: ensureError?.status,
+        code: mappedError.code,
+        provider_status: mappedError.providerStatus,
+        error_message: mappedError.message,
+        errors_count: mappedError.details?.length || 0,
       });
-      const status = ensureError?.status && ensureError.status >= 400 && ensureError.status < 600 
-        ? ensureError.status 
-        : 500;
-      return res.status(status).json({
-        error: "vindi_error",
-        status,
-        details: ensureError?.response?.errors || [{ message: ensureError?.message || "Erro ao criar customer na Vindi" }],
+      
+      return res.status(mappedError.httpStatus).json({
+        error: mappedError.code === "INTERNAL_ERROR" ? "vindi_error" : mappedError.code.toLowerCase(),
+        code: mappedError.code,
+        message: mappedError.message,
+        provider_status: mappedError.providerStatus,
+        details: mappedError.details,
       });
     }
 
@@ -277,21 +364,23 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
 
       res.status(200).json(response);
     } catch (e) {
-      // Extrai mensagem de erro da Vindi
-      const status = e?.status && e.status >= 400 && e.status < 600 ? e.status : 500;
-      const errorDetails = e?.response?.errors || [{ message: e?.message || "Erro ao criar payment_profile na Vindi" }];
+      const mappedError = mapVindiError(e);
       
       console.error("[autopay/vindi/tokenize] falha ao criar payment_profile", {
         user_id,
         customer_id: customerId,
-        status,
-        error_message: errorDetails[0]?.message,
+        code: mappedError.code,
+        provider_status: mappedError.providerStatus,
+        error_message: mappedError.message,
+        errors_count: mappedError.details?.length || 0,
       });
 
-      return res.status(status).json({
-        error: "vindi_error",
-        status,
-        details: errorDetails,
+      return res.status(mappedError.httpStatus).json({
+        error: mappedError.code === "INTERNAL_ERROR" ? "vindi_error" : mappedError.code.toLowerCase(),
+        code: mappedError.code,
+        message: mappedError.message,
+        provider_status: mappedError.providerStatus,
+        details: mappedError.details,
       });
     }
   } catch (e) {
@@ -520,12 +609,31 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
 
     // 6) Integração Vindi: ensureCustomer (se necessário)
     if (!vindiCustomerId) {
-      const customer = await ensureCustomer({
-        email: req.user.email,
-        name: holder_name || req.user?.name || "Cliente",
-        code: `user_${user_id}`,
-      });
-      vindiCustomerId = customer.customerId;
+      try {
+        const customer = await ensureCustomer({
+          email: req.user.email,
+          name: holder_name || req.user?.name || "Cliente",
+          code: `user_${user_id}`,
+        });
+        vindiCustomerId = customer.customerId;
+      } catch (ensureError) {
+        await client.query("ROLLBACK");
+        const mappedError = mapVindiError(ensureError);
+        
+        console.error("[autopay/vindi/setup] falha ao garantir customer", {
+          user_id,
+          code: mappedError.code,
+          provider_status: mappedError.providerStatus,
+        });
+        
+        return res.status(mappedError.httpStatus).json({
+          error: mappedError.code === "INTERNAL_ERROR" ? "vindi_error" : mappedError.code.toLowerCase(),
+          code: mappedError.code,
+          message: mappedError.message,
+          provider_status: mappedError.providerStatus,
+          details: mappedError.details,
+        });
+      }
     }
 
     // 7) Cria/atualiza payment_profile na Vindi (apenas se veio gateway_token)
@@ -552,25 +660,21 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
         brand = paymentProfile.cardType || paymentProfile.brand || null;
       } catch (e) {
         await client.query("ROLLBACK");
+        const mappedError = mapVindiError(e);
+        
         console.error("[autopay/vindi/setup] createPaymentProfile falhou", {
           user_id,
-          msg: e?.message,
-          status: e?.status,
+          code: mappedError.code,
+          provider_status: mappedError.providerStatus,
         });
-        // Propaga status da Vindi (401/422/etc) quando possível
-        const status = e?.status && e.status >= 400 && e.status < 600 ? e.status : 500;
-        const responseJson = {
-          error: e?.message || "Falha ao salvar cartão na Vindi",
-          code: "VINDI_PAYMENT_PROFILE_FAILED",
-        };
-        // Para 422, inclui details se disponível
-        if (status === 422 && e?.response?.errors && Array.isArray(e.response.errors)) {
-          responseJson.details = e.response.errors.map(err => ({
-            message: err.message || null,
-            parameter: err.parameter || null,
-          }));
-        }
-        return res.status(status).json(responseJson);
+        
+        return res.status(mappedError.httpStatus).json({
+          error: mappedError.code === "INTERNAL_ERROR" ? "vindi_error" : mappedError.code.toLowerCase(),
+          code: mappedError.code,
+          message: mappedError.message,
+          provider_status: mappedError.providerStatus,
+          details: mappedError.details,
+        });
       }
     }
 
