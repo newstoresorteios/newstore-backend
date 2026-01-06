@@ -41,10 +41,13 @@ function buildAuthHeader() {
  */
 async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {}) {
   if (!VINDI_API_KEY) {
-    throw new Error("VINDI_API_KEY não configurado no servidor.");
+    const error = new Error("VINDI_API_KEY não configurado no servidor.");
+    error.status = 503;
+    throw error;
   }
 
   const url = `${VINDI_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+  log(`chamando Vindi API: ${method} ${url}`);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -89,6 +92,15 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
     error.status = response.status;
     error.response = json;
     error.path = path;
+    error.url = url;
+    
+    // Log do erro (sem dados sensíveis)
+    err(`Vindi API erro: ${method} ${url}`, {
+      status: response.status,
+      error_message: errorMsg,
+      errors_count: json?.errors?.length || 0,
+    });
+    
     throw error;
   }
 

@@ -381,6 +381,7 @@ export async function tokenizeCardPublic(payload) {
     logPayload.has_document_number = !!payload.document_number;
     
     log("chamando Vindi Public API - request final", logPayload);
+    log("endpoint Vindi Public API", { url: `${VINDI_PUBLIC_BASE}/public/payment_profiles` });
 
     const url = `${VINDI_PUBLIC_BASE}/public/payment_profiles`;
     const controller = new AbortController();
@@ -419,6 +420,7 @@ export async function tokenizeCardPublic(payload) {
     // Log da resposta (mascarada)
     if (response.ok) {
       log("Vindi Public API resposta OK", {
+        endpoint: `${VINDI_PUBLIC_BASE}/public/payment_profiles`,
         status: response.status,
         has_gateway_token: !!json?.payment_profile?.gateway_token,
         payment_profile_id: json?.payment_profile?.id,
@@ -445,6 +447,7 @@ export async function tokenizeCardPublic(payload) {
         errorLog.payment_company_code_sent = finalPaymentCompanyCode || null;
       }
       
+      errorLog.endpoint = `${VINDI_PUBLIC_BASE}/public/payment_profiles`;
       err("Vindi Public API erro", errorLog);
     }
 
