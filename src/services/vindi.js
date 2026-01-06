@@ -109,10 +109,10 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
 
 /**
  * Garante/retorna um customer na Vindi (procura por email; senão cria)
- * @param {object} params - { email, name, code? }
+ * @param {object} params - { email, name, code?, cpfCnpj? }
  * @returns {Promise<{customerId: string}>}
  */
-export async function ensureCustomer({ email, name, code }) {
+export async function ensureCustomer({ email, name, code, cpfCnpj }) {
   if (!email) {
     throw new Error("email é obrigatório para ensureCustomer");
   }
@@ -133,6 +133,9 @@ export async function ensureCustomer({ email, name, code }) {
     };
     if (code) {
       createBody.code = String(code);
+    }
+    if (cpfCnpj) {
+      createBody.registry_code = String(cpfCnpj).replace(/\D+/g, "");
     }
 
     const created = await vindiRequest("POST", "/customers", createBody);
@@ -186,6 +189,74 @@ export async function createPaymentProfile({ customerId, gatewayToken, holderNam
     };
   } catch (e) {
     err("createPaymentProfile falhou", {
+      customerId,
+      msg: e?.message,
+      status: e?.status,
+    });
+    throw e;
+  }
+}
+
+/**
+ * Cria um payment_profile (cartão) na Vindi usando dados do cartão diretamente (API privada)
+ * @param {object} params - { customerId, holderName, cardNumber, cardExpiration, cardCvv, paymentCompanyCode?, docNumber?, phone? }
+ * @returns {Promise<{paymentProfileId: string, lastFour?: string, cardType?: string, paymentCompanyCode?: string}>}
+ */
+export async function createPaymentProfileWithCardData({ 
+  customerId, 
+  holderName, 
+  cardNumber, 
+  cardExpiration, 
+  cardCvv, 
+  paymentCompanyCode,
+  docNumber,
+  phone 
+}) {
+  if (!customerId || !holderName || !cardNumber || !cardExpiration || !cardCvv) {
+    throw new Error("customerId, holderName, cardNumber, cardExpiration e cardCvv são obrigatórios");
+  }
+
+  try {
+    const body = {
+      customer_id: customerId,
+      holder_name: holderName,
+      card_number: String(cardNumber).replace(/\D+/g, ""),
+      card_expiration: cardExpiration, // Formato MM/YYYY
+      card_cvv: String(cardCvv).replace(/\D+/g, ""),
+      payment_method_code: "credit_card",
+    };
+
+    if (paymentCompanyCode) {
+      body.payment_company_code = String(paymentCompanyCode).trim().toLowerCase();
+    }
+    if (docNumber) {
+      body.registry_code = String(docNumber).replace(/\D+/g, "");
+    }
+    if (phone) {
+      body.phone = String(phone).replace(/\D+/g, "");
+    }
+
+    const created = await vindiRequest("POST", "/payment_profiles", body);
+    const profile = created.payment_profile;
+
+    // Mascara cartão para log (apenas last4)
+    const last4 = profile?.last_four || (cardNumber.length >= 4 ? String(cardNumber).replace(/\D+/g, "").slice(-4) : "****");
+
+    log("payment_profile criado com dados do cartão", {
+      paymentProfileId: profile?.id,
+      customerId,
+      lastFour,
+      cardType: profile?.card_type || null,
+    });
+
+    return {
+      paymentProfileId: profile?.id,
+      lastFour: last4 || null,
+      cardType: profile?.card_type || null,
+      paymentCompanyCode: profile?.payment_company?.code || paymentCompanyCode || null,
+    };
+  } catch (e) {
+    err("createPaymentProfileWithCardData falhou", {
       customerId,
       msg: e?.message,
       status: e?.status,
@@ -473,6 +544,7 @@ export async function associateGatewayToken({ customerId, gatewayToken }) {
 export default {
   ensureCustomer,
   createPaymentProfile,
+  createPaymentProfileWithCardData,
   createBill,
   chargeBill,
   refundCharge,
