@@ -2,13 +2,37 @@
 // Integração com Vindi Public API (tokenização de cartão)
 // Esta API é chamada do backend para gerar gateway_token a partir de dados do cartão
 
+/* ------------------------------------------------------- *
+ * Helper: Normaliza URL base da Vindi Public API
+ * ------------------------------------------------------- */
+function normalizeBaseUrl(envValue, fallback) {
+  if (!envValue) {
+    return fallback;
+  }
+  
+  const trimmed = String(envValue).trim();
+  
+  // Se não começa com http, logar warning e usar fallback
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    console.warn(`[vindiPublic] VINDI_PUBLIC_BASE_URL inválida (não começa com http): "${trimmed}". Usando fallback.`);
+    return fallback;
+  }
+  
+  // Remove trailing slashes
+  return trimmed.replace(/\/+$/, "");
+}
+
 // Base URL da Vindi Public API
 // Configurável via VINDI_PUBLIC_BASE_URL ou VINDI_PUBLIC_URL
 // Produção: https://app.vindi.com.br/api/v1
 // Sandbox: https://sandbox-app.vindi.com.br/api/v1
-const VINDI_PUBLIC_BASE =
-  (process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL)?.replace(/\/+$/, "") ||
-  "https://app.vindi.com.br/api/v1";
+const VINDI_PUBLIC_BASE = normalizeBaseUrl(
+  process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL,
+  "https://app.vindi.com.br/api/v1"
+);
+
+// Log diagnóstico no boot
+console.log(`[vindiPublic] VINDI_PUBLIC_BASE configurado: ${VINDI_PUBLIC_BASE}`);
 
 const VINDI_PUBLIC_KEY = process.env.VINDI_PUBLIC_KEY || "";
 const VINDI_DEFAULT_GATEWAY = process.env.VINDI_DEFAULT_GATEWAY || "pagarme";

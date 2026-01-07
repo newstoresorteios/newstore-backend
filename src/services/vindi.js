@@ -2,13 +2,37 @@
 // Integração com Vindi API v1
 import crypto from "node:crypto";
 
-const VINDI_BASE =
-  (process.env.VINDI_API_BASE_URL && process.env.VINDI_API_BASE_URL.replace(/\/+$/, "")) ||
-  "https://app.vindi.com.br/api/v1";
+/* ------------------------------------------------------- *
+ * Helper: Normaliza URL base da Vindi
+ * ------------------------------------------------------- */
+function normalizeBaseUrl(envValue, fallback) {
+  if (!envValue) {
+    return fallback;
+  }
+  
+  const trimmed = String(envValue).trim();
+  
+  // Se não começa com http, logar warning e usar fallback
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    console.warn(`[vindi] VINDI_API_BASE_URL inválida (não começa com http): "${trimmed}". Usando fallback.`);
+    return fallback;
+  }
+  
+  // Remove trailing slashes
+  return trimmed.replace(/\/+$/, "");
+}
+
+const VINDI_BASE = normalizeBaseUrl(
+  process.env.VINDI_API_BASE_URL || process.env.VINDI_API_URL,
+  "https://app.vindi.com.br/api/v1"
+);
 
 const VINDI_API_KEY = process.env.VINDI_API_KEY || "";
 const VINDI_DEFAULT_PAYMENT_METHOD = process.env.VINDI_DEFAULT_PAYMENT_METHOD || "credit_card";
 const VINDI_DEFAULT_GATEWAY = process.env.VINDI_DEFAULT_GATEWAY || "pagarme";
+
+// Log diagnóstico no boot
+console.log(`[vindi] VINDI_BASE configurado: ${VINDI_BASE}`);
 
 /* ------------------------------------------------------- *
  * Logging estruturado (sem segredos)
@@ -93,16 +117,23 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
     error.response = json;
     error.path = path;
     error.url = url;
+    error.provider = "VINDI"; // Marca como erro do provider
     
     // Log do erro (sem dados sensíveis)
     err(`Vindi API erro: ${method} ${url}`, {
       status: response.status,
       error_message: errorMsg,
       errors_count: json?.errors?.length || 0,
+      provider: "VINDI",
     });
     
     throw error;
   }
+  
+  // Log de sucesso
+  log(`Vindi API sucesso: ${method} ${url}`, {
+    status: response.status,
+  });
 
   return json;
 }

@@ -1,118 +1,99 @@
-// Script de teste rápido para validar payload enviado à Vindi
+// Teste rápido da integração Vindi
 // Uso: node src/test_vindi_payload.js
+import "dotenv/config";
+import { ensureCustomer, createPaymentProfileWithCardData } from "./services/vindi.js";
 
-/**
- * Testa se o payload está correto:
- * - payment_company_id não deve existir quando null/undefined
- * - payment_company_code deve existir quando fornecido
- * - card_expiration sempre MM/YYYY
- */
+const TEST_EMAIL = process.env.TEST_EMAIL || "test@example.com";
+const TEST_NAME = process.env.TEST_NAME || "Teste Usuario";
 
-function testPayload() {
-  console.log("=== Teste de Payload Vindi ===\n");
+async function testVindiIntegration() {
+  console.log("=".repeat(60));
+  console.log("Teste de Integração Vindi");
+  console.log("=".repeat(60));
+  console.log();
 
-  // Teste 1: payment_company_id não deve existir quando null
-  const payload1 = {
-    allow_as_fallback: true,
-    holder_name: "João Silva",
-    card_number: "6504123456789012",
-    card_expiration: "05/2033",
-    card_cvv: "123",
-    payment_method_code: "credit_card",
-    payment_company_code: "elo",
-    payment_company_id: null,
-  };
-  
-  // Remove payment_company_id se for null/undefined/0
-  if (payload1.payment_company_id == null || payload1.payment_company_id === "" || payload1.payment_company_id === 0) {
-    delete payload1.payment_company_id;
+  // Verifica variáveis de ambiente
+  if (!process.env.VINDI_API_KEY) {
+    console.error("❌ VINDI_API_KEY não configurada");
+    process.exit(1);
   }
-  
-  console.log("Teste 1: payment_company_id null deve ser removido");
-  console.log("Payload:", JSON.stringify(payload1, null, 2));
-  console.log("✓ payment_company_id não existe:", !("payment_company_id" in payload1));
-  console.log("✓ payment_company_code existe:", "payment_company_code" in payload1);
-  console.log("✓ card_expiration formato MM/YYYY:", /^\d{2}\/\d{4}$/.test(payload1.card_expiration));
-  console.log("");
 
-  // Teste 2: payment_company_id válido deve ser mantido
-  const payload2 = {
-    allow_as_fallback: true,
-    holder_name: "Maria Santos",
-    card_number: "4111111111111111",
-    card_expiration: "12/2025",
-    card_cvv: "456",
-    payment_method_code: "credit_card",
-    payment_company_code: "visa",
-    payment_company_id: 123,
-  };
-  
-  const hasValidId = payload2.payment_company_id != null && 
-                    payload2.payment_company_id !== "" && 
-                    !isNaN(Number(payload2.payment_company_id)) && 
-                    Number(payload2.payment_company_id) > 0;
-  
-  if (!hasValidId) {
-    delete payload2.payment_company_id;
-  }
-  
-  console.log("Teste 2: payment_company_id válido deve ser mantido");
-  console.log("Payload:", JSON.stringify(payload2, null, 2));
-  console.log("✓ payment_company_id existe:", "payment_company_id" in payload2);
-  console.log("✓ payment_company_id valor:", payload2.payment_company_id);
-  console.log("");
+  const vindiBase = process.env.VINDI_API_BASE_URL || process.env.VINDI_API_URL || "https://app.vindi.com.br/api/v1";
+  console.log(`📡 VINDI_BASE: ${vindiBase}`);
+  console.log();
 
-  // Teste 3: payment_company_id undefined deve ser removido
-  const payload3 = {
-    allow_as_fallback: true,
-    holder_name: "Pedro Costa",
-    card_number: "5555555555554444",
-    card_expiration: "03/2026",
-    card_cvv: "789",
-    payment_method_code: "credit_card",
-    payment_company_code: "mastercard",
-  };
-  
-  if (payload3.payment_company_id == null || payload3.payment_company_id === "" || payload3.payment_company_id === 0) {
-    delete payload3.payment_company_id;
-  }
-  
-  console.log("Teste 3: payment_company_id undefined não deve existir");
-  console.log("Payload:", JSON.stringify(payload3, null, 2));
-  console.log("✓ payment_company_id não existe:", !("payment_company_id" in payload3));
-  console.log("✓ payment_company_code existe:", "payment_company_code" in payload3);
-  console.log("");
-
-  // Teste 4: Validação de card_expiration
-  const testDates = [
-    { input: "05/33", expected: "05/2033" },
-    { input: "12/25", expected: "12/2025" },
-    { input: "01/2030", expected: "01/2030" },
-  ];
-  
-  console.log("Teste 4: Validação de card_expiration");
-  testDates.forEach(({ input, expected }) => {
-    const parts = input.split("/");
-    const month = parts[0].padStart(2, "0");
-    let year = parts[1];
+  try {
+    // Teste 1: ensureCustomer
+    console.log("1️⃣  Testando ensureCustomer...");
+    console.log(`   Email: ${TEST_EMAIL}`);
+    console.log(`   Nome: ${TEST_NAME}`);
     
-    if (year.length === 2) {
-      const yy = parseInt(year, 10);
-      year = yy <= 79 ? `20${year.padStart(2, "0")}` : `19${year.padStart(2, "0")}`;
+    const customer = await ensureCustomer({
+      email: TEST_EMAIL,
+      name: TEST_NAME,
+      code: `test_${Date.now()}`,
+    });
+    
+    console.log(`   ✅ Customer ID: ${customer.customerId}`);
+    console.log();
+
+    // Teste 2: createPaymentProfileWithCardData (com dados fake)
+    console.log("2️⃣  Testando createPaymentProfileWithCardData...");
+    console.log("   ⚠️  Usando dados de cartão de teste (não válidos para cobrança)");
+    
+    // Dados de cartão de teste (não válidos para cobrança real)
+    const testCard = {
+      customerId: customer.customerId,
+      holderName: TEST_NAME,
+      cardNumber: "4111111111111111", // Cartão de teste Visa
+      cardExpiration: "12/25",
+      cardCvv: "123",
+      paymentCompanyCode: "visa",
+    };
+    
+    const paymentProfile = await createPaymentProfileWithCardData(testCard);
+    
+    console.log(`   ✅ Payment Profile ID: ${paymentProfile.paymentProfileId}`);
+    console.log(`   ✅ Last 4: ${paymentProfile.lastFour}`);
+    console.log(`   ✅ Card Type: ${paymentProfile.cardType || "N/A"}`);
+    console.log(`   ✅ Payment Company Code: ${paymentProfile.paymentCompanyCode || "N/A"}`);
+    console.log();
+
+    console.log("=".repeat(60));
+    console.log("✅ Testes concluídos com sucesso!");
+    console.log("=".repeat(60));
+    console.log();
+    console.log("Resumo:");
+    console.log(`  - Customer ID: ${customer.customerId}`);
+    console.log(`  - Payment Profile ID: ${paymentProfile.paymentProfileId}`);
+    console.log();
+
+  } catch (error) {
+    console.error();
+    console.error("=".repeat(60));
+    console.error("❌ Erro no teste:");
+    console.error("=".repeat(60));
+    console.error(`   Status: ${error?.status || "N/A"}`);
+    console.error(`   Provider: ${error?.provider || "N/A"}`);
+    console.error(`   Mensagem: ${error?.message || "Erro desconhecido"}`);
+    
+    if (error?.response?.errors) {
+      console.error("   Detalhes da Vindi:");
+      error.response.errors.forEach((err, idx) => {
+        console.error(`     ${idx + 1}. ${err.message || "Sem mensagem"}`);
+        if (err.parameter) {
+          console.error(`        Campo: ${err.parameter}`);
+        }
+      });
     }
     
-    const normalized = `${month}/${year}`;
-    console.log(`  Input: ${input} -> Normalizado: ${normalized} (esperado: ${expected})`);
-    console.log(`  ✓ Formato MM/YYYY:`, /^\d{2}\/\d{4}$/.test(normalized));
-  });
-  
-  console.log("\n=== Todos os testes concluídos ===");
+    console.error();
+    process.exit(1);
+  }
 }
 
-// Executa se chamado diretamente
-if (import.meta.url === `file://${process.argv[1]}`) {
-  testPayload();
-}
-
-export { testPayload };
-
+// Executa o teste
+testVindiIntegration().catch((error) => {
+  console.error("Erro fatal:", error);
+  process.exit(1);
+});

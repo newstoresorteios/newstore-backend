@@ -1,9 +1,30 @@
 // backend/src/services/vindi_payment_methods.js
 // Helper para obter e cachear payment_methods da Vindi e resolver payment_company_id
 
-const VINDI_BASE =
-  (process.env.VINDI_API_BASE_URL && process.env.VINDI_API_BASE_URL.replace(/\/+$/, "")) ||
-  "https://app.vindi.com.br/api/v1";
+/* ------------------------------------------------------- *
+ * Helper: Normaliza URL base da Vindi
+ * ------------------------------------------------------- */
+function normalizeBaseUrl(envValue, fallback) {
+  if (!envValue) {
+    return fallback;
+  }
+  
+  const trimmed = String(envValue).trim();
+  
+  // Se não começa com http, logar warning e usar fallback
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    console.warn(`[vindiPaymentMethods] VINDI_API_BASE_URL inválida (não começa com http): "${trimmed}". Usando fallback.`);
+    return fallback;
+  }
+  
+  // Remove trailing slashes
+  return trimmed.replace(/\/+$/, "");
+}
+
+const VINDI_BASE = normalizeBaseUrl(
+  process.env.VINDI_API_BASE_URL || process.env.VINDI_API_URL,
+  "https://app.vindi.com.br/api/v1"
+);
 
 const VINDI_API_KEY = process.env.VINDI_API_KEY || "";
 

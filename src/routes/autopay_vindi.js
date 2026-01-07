@@ -16,10 +16,21 @@ const router = express.Router();
 /**
  * Mapeia erros da Vindi para códigos HTTP apropriados
  * Evita que erros de autenticação da Vindi (401/403) sejam interpretados como erro de JWT
- * @param {Error} error - Erro da Vindi
+ * @param {Error} error - Erro da Vindi (deve ter error.provider === "VINDI")
  * @returns {object} - { httpStatus, code, message, providerStatus, details }
  */
 function mapVindiError(error) {
+  // Se não for erro do provider Vindi, retorna erro genérico
+  if (error?.provider !== "VINDI") {
+    return {
+      httpStatus: 500,
+      code: "INTERNAL_ERROR",
+      message: error?.message || "Erro interno",
+      providerStatus: null,
+      details: [{ message: error?.message || "Erro interno" }],
+    };
+  }
+  
   const vindiStatus = error?.status;
   const errorResponse = error?.response || {};
   const errors = errorResponse?.errors || [];
@@ -43,9 +54,9 @@ function mapVindiError(error) {
   }
   
   if (vindiStatus === 422) {
-    // Erro de validação → manter 422
+    // Erro de validação → 400 Bad Request (conforme solicitado)
     return {
-      httpStatus: 422,
+      httpStatus: 400,
       code: "VINDI_VALIDATION_ERROR",
       message: errorSummary,
       providerStatus: vindiStatus,
