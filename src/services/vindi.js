@@ -165,10 +165,9 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
     error.provider = "VINDI"; // Marca como erro do provider
     error.provider_status = response.status;
     
-    // Se Vindi responder 401/403: NÃO propagar 401 para o client
-    // Retornar 502 com code VINDI_AUTH_ERROR
+    // Se Vindi responder 401/403: retornar 401/403 com code VINDI_AUTH_ERROR
     if (response.status === 401 || response.status === 403) {
-      error.status = 502; // Não retornar 401 para o client
+      error.status = response.status; // Retornar 401/403 para o client
       error.code = "VINDI_AUTH_ERROR";
       error.message = "Falha de autenticação na Vindi (verifique VINDI_API_KEY/BASE_URL).";
       

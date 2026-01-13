@@ -23,7 +23,8 @@ const router = express.Router();
 function mapVindiError(error) {
   // Se o erro já tem um code definido (vindo de vindi.js ou vindi_public.js), usa diretamente
   if (error?.code) {
-    const httpStatus = error?.status || 502;
+    // Para erros de autenticação (401/403), preserva o status original
+    const httpStatus = error?.status || (error?.code === "VINDI_AUTH_ERROR" ? 401 : 502);
     const providerStatus = error?.provider_status || error?.status || null;
     const errorResponse = error?.response || {};
     const errors = errorResponse?.errors || [];
@@ -61,9 +62,9 @@ function mapVindiError(error) {
   
   // Mapeia status da Vindi para HTTP status apropriado
   if (vindiStatus === 401 || vindiStatus === 403) {
-    // Erro de autenticação da Vindi → 502 Bad Gateway (não 401 para não confundir com JWT)
+    // Erro de autenticação da Vindi → retornar 401/403 com code VINDI_AUTH_ERROR
     return {
-      httpStatus: 502,
+      httpStatus: vindiStatus, // Preserva 401/403
       code: "VINDI_AUTH_ERROR",
       message: "Falha de autenticação na Vindi (verifique VINDI_API_KEY/VINDI_API_BASE_URL).",
       providerStatus: vindiStatus,
@@ -439,7 +440,10 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
 
     // Verifica se Vindi está configurado
     if (!process.env.VINDI_API_KEY) {
-      console.error("[autopay/vindi/setup] VINDI_API_KEY não configurado");
+      console.error("[autopay/vindi/setup] VINDI_API_KEY não configurado", {
+        user_id,
+        requestId,
+      });
       await client.query("ROLLBACK");
       return res.status(502).json({ 
         ok: false,
@@ -598,67 +602,67 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
     let brand = existingProfile?.vindi_brand || profile.vindi_brand || payment_company_code || null;
 
     if (gateway_token) {
-      // PASSO 1: ensureCustomer
-      if (!vindiCustomerId) {
-        try {
-          // Busca email do usuário se não vier no token
-          let userEmail = req.user.email;
-          if (!userEmail) {
-            const userResult = await query(
-              `SELECT email, name FROM users WHERE id = $1 LIMIT 1`,
-              [user_id]
-            );
-            if (userResult.rows.length > 0) {
-              userEmail = userResult.rows[0].email;
-            }
+      // PASSO 1: Garantir customer (sempre, mesmo se já existir customer_id)
+      // Isso garante que o customer existe na Vindi antes de criar payment_profile
+      try {
+        // Busca email do usuário se não vier no token
+        let userEmail = req.user.email;
+        if (!userEmail) {
+          const userResult = await query(
+            `SELECT email, name FROM users WHERE id = $1 LIMIT 1`,
+            [user_id]
+          );
+          if (userResult.rows.length > 0) {
+            userEmail = userResult.rows[0].email;
           }
+        }
 
-          if (!userEmail) {
-            await client.query("ROLLBACK");
-            return res.status(422).json({
-              ok: false,
-              code: "MISSING_EMAIL",
-              error_message: "Email do usuário não encontrado",
-              requestId,
-            });
-          }
-
-          const customer = await ensureCustomer({
-            email: userEmail,
-            name: holder_name || req.user?.name || "Cliente",
-            code: `user_${user_id}`,
-            cpfCnpj: doc_number || null,
-          });
-          vindiCustomerId = customer.customerId;
-          
-          console.log("[autopay/vindi/setup] customer garantido", {
-            user_id,
-            requestId,
-            customer_id: vindiCustomerId,
-          });
-        } catch (ensureError) {
+        if (!userEmail) {
           await client.query("ROLLBACK");
-          const mappedError = mapVindiError(ensureError);
-          
-          console.error("[autopay/vindi/setup] falha ao garantir customer", {
-            user_id,
-            requestId,
-            code: mappedError.code,
-            provider_status: mappedError.providerStatus,
-          });
-          
-          return res.status(mappedError.httpStatus).json({
+          return res.status(422).json({
             ok: false,
-            code: mappedError.code,
-            error_message: mappedError.message,
-            provider_status: mappedError.providerStatus,
-            details: mappedError.details,
+            code: "MISSING_EMAIL",
+            error_message: "Email do usuário não encontrado",
             requestId,
           });
         }
+
+        // Sempre chama ensureCustomer para garantir que existe (busca ou cria)
+        const customer = await ensureCustomer({
+          email: userEmail,
+          name: holder_name || req.user?.name || "Cliente",
+          code: `user_${user_id}`,
+          cpfCnpj: doc_number || null,
+        });
+        vindiCustomerId = customer.customerId;
+        
+        console.log("[autopay/vindi/setup] customer garantido", {
+          user_id,
+          requestId,
+          customer_id: vindiCustomerId,
+        });
+      } catch (ensureError) {
+        await client.query("ROLLBACK");
+        const mappedError = mapVindiError(ensureError);
+        
+        console.error("[autopay/vindi/setup] falha ao garantir customer", {
+          user_id,
+          requestId,
+          code: mappedError.code,
+          provider_status: mappedError.providerStatus,
+        });
+        
+        return res.status(mappedError.httpStatus).json({
+          ok: false,
+          code: mappedError.code,
+          error_message: mappedError.message,
+          provider_status: mappedError.providerStatus,
+          details: mappedError.details,
+          requestId,
+        });
       }
 
-      // PASSO 2: createPaymentProfile com customer_id
+      // PASSO 2: createPaymentProfile com customer_id (garantido no passo anterior)
       try {
         const paymentProfile = await createPaymentProfile({
           customerId: vindiCustomerId,
@@ -693,7 +697,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
         return res.status(mappedError.httpStatus).json({
           ok: false,
           code: mappedError.code,
-          message: mappedError.message,
+          error_message: mappedError.message,
           provider_status: mappedError.providerStatus,
           details: mappedError.details,
           requestId,
