@@ -63,10 +63,15 @@ function mapVindiError(error) {
   // Mapeia status da Vindi para HTTP status apropriado
   if (vindiStatus === 401 || vindiStatus === 403) {
     // Erro de autenticação da Vindi → retornar 401/403 com code VINDI_AUTH_ERROR
+    // Mensagem específica para 401: "Chave da API inválida"
+    const authMessage = vindiStatus === 401 
+      ? "Chave da API inválida"
+      : "Falha de autenticação na Vindi (verifique VINDI_API_KEY/VINDI_API_BASE_URL).";
+    
     return {
       httpStatus: vindiStatus, // Preserva 401/403
       code: "VINDI_AUTH_ERROR",
-      message: "Falha de autenticação na Vindi (verifique VINDI_API_KEY/VINDI_API_BASE_URL).",
+      message: authMessage,
       providerStatus: vindiStatus,
       details: errors.length > 0 ? errors : [{ message: errorSummary }],
     };
@@ -151,7 +156,8 @@ function parseNumbers(input) {
  */
 router.post("/vindi/tokenize", requireAuth, async (req, res) => {
   const user_id = req.user?.id;
-  const requestId = crypto.randomUUID();
+  // Aceita requestId do header x-request-id do frontend, senão gera UUID
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
   
   try {
     if (!user_id) {
@@ -422,7 +428,8 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
 router.post("/vindi/setup", requireAuth, async (req, res) => {
   const pool = await getPool();
   const client = await pool.connect();
-  const requestId = crypto.randomUUID();
+  // Aceita requestId do header x-request-id do frontend, senão gera UUID
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
 
   try {
     const user_id = req.user.id;

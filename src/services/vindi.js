@@ -169,7 +169,10 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
     if (response.status === 401 || response.status === 403) {
       error.status = response.status; // Retornar 401/403 para o client
       error.code = "VINDI_AUTH_ERROR";
-      error.message = "Falha de autenticação na Vindi (verifique VINDI_API_KEY/BASE_URL).";
+      // Mensagem específica para 401: "Chave da API inválida"
+      error.message = response.status === 401 
+        ? "Chave da API inválida"
+        : "Falha de autenticação na Vindi (verifique VINDI_API_KEY/BASE_URL).";
       
       err(`Vindi API auth error: ${method} ${url}`, {
         status: response.status,
