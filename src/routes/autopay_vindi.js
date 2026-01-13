@@ -157,7 +157,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       return res.status(401).json({
         ok: false,
         code: "UNAUTHORIZED",
-        message: "Usuário não autenticado",
+        error_message: "Usuário não autenticado",
         requestId,
       });
     }
@@ -247,7 +247,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       return res.status(422).json({
         ok: false,
         code: "VALIDATION_ERROR",
-        message: "Campos obrigatórios não podem ficar em branco",
+        error_message: "Campos obrigatórios não podem ficar em branco",
         details: validationErrors,
         requestId,
       });
@@ -311,12 +311,12 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
           user_id,
           requestId,
         });
-        return res.status(500).json({
-          ok: false,
-          code: "TOKENIZATION_ERROR",
-          message: "Tokenização não retornou gateway_token",
-          requestId,
-        });
+      return res.status(500).json({
+        ok: false,
+        code: "TOKENIZATION_ERROR",
+        error_message: "Tokenização não retornou gateway_token",
+        requestId,
+      });
       }
 
       console.log("[autopay/vindi/tokenize] tokenização bem-sucedida", {
@@ -392,7 +392,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       return res.status(httpStatus).json({
         ok: false,
         code,
-        message,
+        error_message: message,
         provider_status: providerStatus,
         details: details.length > 0 ? details : undefined,
         requestId,
@@ -406,7 +406,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
     res.status(500).json({
       ok: false,
       code: "INTERNAL_ERROR",
-      message: e?.message || "Erro interno ao tokenizar cartão",
+      error_message: e?.message || "Erro interno ao tokenizar cartão",
       requestId: crypto.randomUUID(),
     });
   }
@@ -444,7 +444,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
       return res.status(502).json({ 
         ok: false,
         code: "VINDI_CONFIG_ERROR",
-        message: "VINDI_API_KEY não configurado no servidor",
+        error_message: "VINDI_API_KEY não configurado no servidor",
         requestId,
       });
     }
@@ -468,7 +468,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
         return res.status(400).json({
           ok: false,
           code: "MISSING_CUSTOMER_ID",
-          message: "customer_id é obrigatório quando payment_profile_id é fornecido",
+          error_message: "customer_id é obrigatório quando payment_profile_id é fornecido",
           requestId,
         });
       }
@@ -542,7 +542,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
         return res.status(400).json({
           ok: false,
           code: "MISSING_HOLDER_DATA",
-          message: "holder_name e doc_number são obrigatórios ao salvar cartão",
+          error_message: "holder_name e doc_number são obrigatórios ao salvar cartão",
           requestId,
         });
       }
@@ -556,7 +556,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
         return res.status(400).json({
           ok: false,
           code: "PAYMENT_PROFILE_REQUIRED",
-          message: "gateway_token é obrigatório quando não há cartão Vindi salvo",
+          error_message: "gateway_token é obrigatório quando não há cartão Vindi salvo",
           requestId,
         });
       }
@@ -618,7 +618,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
             return res.status(422).json({
               ok: false,
               code: "MISSING_EMAIL",
-              message: "Email do usuário não encontrado",
+              error_message: "Email do usuário não encontrado",
               requestId,
             });
           }
@@ -650,7 +650,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
           return res.status(mappedError.httpStatus).json({
             ok: false,
             code: mappedError.code,
-            message: mappedError.message,
+            error_message: mappedError.message,
             provider_status: mappedError.providerStatus,
             details: mappedError.details,
             requestId,
@@ -750,7 +750,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
     res.status(500).json({ 
       ok: false,
       code: "INTERNAL_ERROR",
-      message: e?.message || "Erro interno ao configurar autopay",
+      error_message: e?.message || "Erro interno ao configurar autopay",
       requestId,
     });
   } finally {
@@ -813,7 +813,11 @@ router.get("/vindi/status", requireAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("[autopay/vindi] status error:", e?.message || e);
-    res.status(500).json({ error: "status_failed" });
+    res.status(500).json({ 
+      ok: false,
+      code: "INTERNAL_ERROR",
+      error_message: "Erro ao buscar status do autopay",
+    });
   }
 });
 
@@ -875,7 +879,11 @@ router.post("/vindi/cancel", requireAuth, async (req, res) => {
       await client.query("ROLLBACK");
     } catch {}
     console.error("[autopay/vindi] cancel error:", e?.message || e);
-    res.status(500).json({ error: "cancel_failed" });
+    res.status(500).json({ 
+      ok: false,
+      code: "INTERNAL_ERROR",
+      error_message: "Erro ao cancelar autopay",
+    });
   } finally {
     client.release();
   }

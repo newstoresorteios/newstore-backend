@@ -140,6 +140,35 @@ app.use((req, res) => {
   res.status(404).json({ error: "not_found", path: req.originalUrl });
 });
 
+// Handler de erros global (sempre retorna JSON, nunca HTML)
+app.use((err, req, res, next) => {
+  // Se já foi enviada resposta, delegar para handler padrão do Express
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  // Log do erro (sem dados sensíveis)
+  console.error("[express] erro não tratado:", {
+    path: req.originalUrl,
+    method: req.method,
+    message: err?.message || String(err),
+    code: err?.code,
+    status: err?.status,
+  });
+
+  // Sempre retorna JSON padronizado
+  const status = err?.status || err?.statusCode || 500;
+  const code = err?.code || "INTERNAL_ERROR";
+  const message = err?.message || "Erro interno do servidor";
+
+  res.status(status).json({
+    ok: false,
+    code,
+    error_message: message,
+    ...(err?.provider_status && { provider_status: err.provider_status }),
+  });
+});
+
 // ── Validação de env Vindi no boot ───────────────────────────
 function validateVindiConfig() {
   const rawBaseUrl = process.env.VINDI_API_BASE_URL || process.env.VINDI_API_URL;
@@ -147,47 +176,69 @@ function validateVindiConfig() {
   const rawPublicBaseUrl = process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL;
   const rawPublicKey = process.env.VINDI_PUBLIC_KEY || "";
 
+  const trimmedApiKey = String(rawApiKey).trim();
+  const trimmedPublicKey = String(rawPublicKey).trim();
+
+  // Detecta ambiente (produção vs sandbox)
+  const isSandbox = process.env.VINDI_SANDBOX === "true" || process.env.NODE_ENV === "development";
+  const environment = isSandbox ? "SANDBOX" : "PRODUÇÃO";
+
   // Valida VINDI_API_BASE_URL
   let baseUrlHost = "N/A";
+  let baseUrlValid = false;
   if (rawBaseUrl) {
     try {
       const trimmed = String(rawBaseUrl).trim();
       if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
         baseUrlHost = new URL(trimmed).host;
+        baseUrlValid = true;
       } else {
-        console.warn(`[boot] VINDI_API_BASE_URL inválida (não começa com http): "${trimmed.substring(0, 50)}..."`);
+        console.error(`[boot] ERRO: VINDI_API_BASE_URL inválida (não começa com http): "${trimmed.substring(0, 50)}..."`);
+        console.error(`[boot] Usando fallback para ${environment.toLowerCase()}`);
       }
     } catch (e) {
-      console.warn(`[boot] VINDI_API_BASE_URL inválida (erro ao parsear): ${e.message}`);
+      console.error(`[boot] ERRO: VINDI_API_BASE_URL inválida (erro ao parsear): ${e.message}`);
     }
+  } else {
+    console.log(`[boot] VINDI_API_BASE_URL não configurada, usando fallback para ${environment.toLowerCase()}`);
   }
 
   // Valida VINDI_PUBLIC_BASE_URL
   let publicBaseUrlHost = "N/A";
+  let publicBaseUrlValid = false;
   if (rawPublicBaseUrl) {
     try {
       const trimmed = String(rawPublicBaseUrl).trim();
       if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
         publicBaseUrlHost = new URL(trimmed).host;
+        publicBaseUrlValid = true;
       } else {
-        console.warn(`[boot] VINDI_PUBLIC_BASE_URL inválida (não começa com http): "${trimmed.substring(0, 50)}..."`);
+        console.error(`[boot] ERRO: VINDI_PUBLIC_BASE_URL inválida (não começa com http): "${trimmed.substring(0, 50)}..."`);
+        console.error(`[boot] Usando fallback para ${environment.toLowerCase()}`);
       }
     } catch (e) {
-      console.warn(`[boot] VINDI_PUBLIC_BASE_URL inválida (erro ao parsear): ${e.message}`);
+      console.error(`[boot] ERRO: VINDI_PUBLIC_BASE_URL inválida (erro ao parsear): ${e.message}`);
     }
+  } else {
+    console.log(`[boot] VINDI_PUBLIC_BASE_URL não configurada, usando fallback para ${environment.toLowerCase()}`);
   }
 
   // Detecta "base url parecendo api key" (string curta/sem http)
-  if (rawBaseUrl && !rawBaseUrl.startsWith("http") && rawBaseUrl.length < 50 && rawBaseUrl.length > 10) {
-    console.warn(`[boot] ATENÇÃO: VINDI_API_BASE_URL parece ser uma API key (string curta sem http). Verifique a configuração.`);
+  if (rawBaseUrl && !baseUrlValid && rawBaseUrl.length < 50 && rawBaseUrl.length > 10) {
+    console.error(`[boot] ERRO: VINDI_API_BASE_URL parece ser uma API key (string curta sem http). Verifique a configuração.`);
   }
 
   // Log diagnóstico (sem expor secrets)
-  console.log(`[boot] Vindi Config:`);
-  console.log(`  VINDI_API_BASE_URL: ${baseUrlHost}`);
-  console.log(`  VINDI_API_KEY setado: ${!!String(rawApiKey).trim()}`);
-  console.log(`  VINDI_PUBLIC_BASE_URL: ${publicBaseUrlHost}`);
-  console.log(`  VINDI_PUBLIC_KEY setado: ${!!String(rawPublicKey).trim()}`);
+  console.log(`[boot] Vindi Config (${environment}):`);
+  console.log(`  VINDI_API_BASE_URL: ${baseUrlValid ? baseUrlHost : "INVÁLIDA (usando fallback)"}`);
+  console.log(`  VINDI_API_KEY setado: ${!!trimmedApiKey}`);
+  console.log(`  VINDI_PUBLIC_BASE_URL: ${publicBaseUrlValid ? publicBaseUrlHost : "INVÁLIDA (usando fallback)"}`);
+  console.log(`  VINDI_PUBLIC_KEY setado: ${!!trimmedPublicKey}`);
+
+  // Se VINDI_API_KEY e VINDI_PUBLIC_KEY forem iguais, logar WARNING
+  if (trimmedApiKey && trimmedPublicKey && trimmedApiKey === trimmedPublicKey) {
+    console.warn(`[boot] WARNING: VINDI_API_KEY e VINDI_PUBLIC_KEY são iguais. Isso pode indicar configuração incorreta.`);
+  }
 }
 
 // ── Bootstrap ───────────────────────────────────────────────

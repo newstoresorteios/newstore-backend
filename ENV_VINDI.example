@@ -1,0 +1,36 @@
+# Vindi API Configuration
+# ======================
+# Base URL da API privada da Vindi (para criar customers, payment_profiles, bills, etc)
+# Produção: https://app.vindi.com.br/api/v1
+# Sandbox: https://sandbox-app.vindi.com.br/api/v1
+# IMPORTANTE: Deve começar com http:// ou https://
+VINDI_API_BASE_URL=https://app.vindi.com.br/api/v1
+
+# Chave de API privada da Vindi (para autenticação Basic Auth)
+# Obtida no painel da Vindi em Configurações > API
+# Formato: string longa (ex: abc123def456...)
+VINDI_API_KEY=
+
+# Base URL da API pública da Vindi (para tokenização de cartões)
+# Geralmente é a mesma da API privada
+# Produção: https://app.vindi.com.br/api/v1
+# Sandbox: https://sandbox-app.vindi.com.br/api/v1
+# IMPORTANTE: Deve começar com http:// ou https://
+VINDI_PUBLIC_BASE_URL=https://app.vindi.com.br/api/v1
+
+# Chave de API pública da Vindi (para tokenização de cartões via Public API)
+# Diferente da VINDI_API_KEY (chave privada)
+# Obtida no painel da Vindi em Configurações > API > Public Key
+# Formato: string longa (ex: xyz789uvw012...)
+VINDI_PUBLIC_KEY=
+
+# Flag opcional para usar ambiente sandbox
+# Se VINDI_SANDBOX=true ou NODE_ENV=development, usa URLs de sandbox por padrão
+# VINDI_SANDBOX=true
+
+# Gateway padrão para pagamentos (opcional)
+# VINDI_DEFAULT_GATEWAY=pagarme
+
+# Método de pagamento padrão (opcional)
+# VINDI_DEFAULT_PAYMENT_METHOD=credit_card
+

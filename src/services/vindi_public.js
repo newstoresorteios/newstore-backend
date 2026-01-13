@@ -5,16 +5,16 @@
 /* ------------------------------------------------------- *
  * Helper: Normaliza URL base da Vindi Public API
  * ------------------------------------------------------- */
-function normalizeBaseUrl(envValue, fallback) {
+function normalizeBaseUrl(envValue, fallback, envName = "VINDI_PUBLIC_BASE_URL") {
   if (!envValue) {
     return fallback;
   }
   
   const trimmed = String(envValue).trim();
   
-  // Se não começa com http, logar warning e usar fallback
+  // Se não começa com http, logar ERRO e usar fallback
   if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
-    console.warn(`[vindiPublic] VINDI_PUBLIC_BASE_URL inválida (não começa com http): "${trimmed}". Usando fallback.`);
+    console.error(`[vindiPublic] ERRO: ${envName} inválida (não começa com http): "${trimmed.substring(0, 50)}...". Usando fallback: ${fallback}`);
     return fallback;
   }
   
@@ -26,10 +26,16 @@ function normalizeBaseUrl(envValue, fallback) {
 // Configurável via VINDI_PUBLIC_BASE_URL ou VINDI_PUBLIC_URL
 // Produção: https://app.vindi.com.br/api/v1
 // Sandbox: https://sandbox-app.vindi.com.br/api/v1
+const isSandbox = process.env.VINDI_SANDBOX === "true" || process.env.NODE_ENV === "development";
+const defaultPublicBaseUrl = isSandbox 
+  ? "https://sandbox-app.vindi.com.br/api/v1"
+  : "https://app.vindi.com.br/api/v1";
+
 const rawPublicBaseUrl = process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL;
 const VINDI_PUBLIC_BASE = normalizeBaseUrl(
   rawPublicBaseUrl,
-  "https://app.vindi.com.br/api/v1"
+  defaultPublicBaseUrl,
+  "VINDI_PUBLIC_BASE_URL"
 );
 
 // Log diagnóstico no boot (sem expor secrets)
