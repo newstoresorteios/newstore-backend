@@ -22,17 +22,36 @@ function normalizeBaseUrl(envValue, fallback) {
   return trimmed.replace(/\/+$/, "");
 }
 
+// Sanity-check de env: VINDI_API_BASE_URL
+const rawBaseUrl = process.env.VINDI_API_BASE_URL || process.env.VINDI_API_URL;
 const VINDI_BASE = normalizeBaseUrl(
-  process.env.VINDI_API_BASE_URL || process.env.VINDI_API_URL,
+  rawBaseUrl,
   "https://app.vindi.com.br/api/v1"
 );
 
-const VINDI_API_KEY = process.env.VINDI_API_KEY || "";
+// Sanity-check de env: VINDI_API_KEY
+// String(key).trim() e logar apenas boolean "setado" (NUNCA o valor)
+const rawApiKey = process.env.VINDI_API_KEY || "";
+const VINDI_API_KEY = String(rawApiKey).trim();
+const VINDI_API_KEY_SET = !!VINDI_API_KEY;
+
+// Detecta "base url parecendo api key" (string curta/sem http)
+const baseUrlLooksLikeKey = rawBaseUrl && 
+  !rawBaseUrl.startsWith("http") && 
+  rawBaseUrl.length < 50 && 
+  rawBaseUrl.length > 10;
+
+if (baseUrlLooksLikeKey) {
+  console.warn(`[vindi] ATENÇÃO: VINDI_API_BASE_URL parece ser uma API key (string curta sem http). Verifique a configuração.`);
+}
+
 const VINDI_DEFAULT_PAYMENT_METHOD = process.env.VINDI_DEFAULT_PAYMENT_METHOD || "credit_card";
 const VINDI_DEFAULT_GATEWAY = process.env.VINDI_DEFAULT_GATEWAY || "pagarme";
 
-// Log diagnóstico no boot
-console.log(`[vindi] VINDI_BASE configurado: ${VINDI_BASE}`);
+// Log diagnóstico no boot (sem expor secrets)
+const baseUrlHost = VINDI_BASE ? new URL(VINDI_BASE).host : "N/A";
+console.log(`[vindi] VINDI_BASE configurado: ${baseUrlHost}`);
+console.log(`[vindi] VINDI_API_KEY setado: ${VINDI_API_KEY_SET}`);
 
 /* ------------------------------------------------------- *
  * Logging estruturado (sem segredos)
@@ -67,6 +86,7 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
   if (!VINDI_API_KEY) {
     const error = new Error("VINDI_API_KEY não configurado no servidor.");
     error.status = 503;
+    error.code = "VINDI_CONFIG_ERROR";
     throw error;
   }
 
@@ -91,8 +111,26 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
   } catch (e) {
     clearTimeout(timeout);
     if (e?.name === "AbortError") {
-      throw new Error(`Vindi ${method} ${path} timeout após ${timeoutMs}ms`);
+      const error = new Error(`Vindi ${method} ${path} timeout após ${timeoutMs}ms`);
+      error.status = 502;
+      error.code = "VINDI_TIMEOUT";
+      throw error;
     }
+    
+    // Se fetch lançar TypeError "Failed to parse URL", retornar erro padronizado
+    if (e instanceof TypeError && e.message?.includes("Failed to parse URL")) {
+      const error = new Error("Configuração Vindi inválida (VINDI_API_BASE_URL).");
+      error.status = 502;
+      error.code = "VINDI_CONFIG_ERROR";
+      error.provider_status = null;
+      error.provider = "VINDI";
+      err(`Vindi URL parse error: ${method} ${path}`, {
+        url,
+        error_message: e.message,
+      });
+      throw error;
+    }
+    
     throw e;
   }
   clearTimeout(timeout);
@@ -118,6 +156,39 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
     error.path = path;
     error.url = url;
     error.provider = "VINDI"; // Marca como erro do provider
+    error.provider_status = response.status;
+    
+    // Se Vindi responder 401/403: NÃO propagar 401 para o client
+    // Retornar 502 com code VINDI_AUTH_ERROR
+    if (response.status === 401 || response.status === 403) {
+      error.status = 502; // Não retornar 401 para o client
+      error.code = "VINDI_AUTH_ERROR";
+      error.message = "Falha de autenticação na Vindi (verifique VINDI_API_KEY/BASE_URL).";
+      
+      err(`Vindi API auth error: ${method} ${url}`, {
+        status: response.status,
+        error_message: errorMsg,
+        errors_count: json?.errors?.length || 0,
+        provider: "VINDI",
+      });
+      
+      throw error;
+    }
+    
+    // Para demais erros Vindi, retornar 502 com code VINDI_UPSTREAM_ERROR
+    if (response.status >= 400) {
+      error.status = 502;
+      error.code = "VINDI_UPSTREAM_ERROR";
+      
+      err(`Vindi API error: ${method} ${url}`, {
+        status: response.status,
+        error_message: errorMsg,
+        errors_count: json?.errors?.length || 0,
+        provider: "VINDI",
+      });
+      
+      throw error;
+    }
     
     // Log do erro (sem dados sensíveis)
     err(`Vindi API erro: ${method} ${url}`, {

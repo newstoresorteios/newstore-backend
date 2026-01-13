@@ -26,17 +26,28 @@ function normalizeBaseUrl(envValue, fallback) {
 // Configurável via VINDI_PUBLIC_BASE_URL ou VINDI_PUBLIC_URL
 // Produção: https://app.vindi.com.br/api/v1
 // Sandbox: https://sandbox-app.vindi.com.br/api/v1
+const rawPublicBaseUrl = process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL;
 const VINDI_PUBLIC_BASE = normalizeBaseUrl(
-  process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL,
+  rawPublicBaseUrl,
   "https://app.vindi.com.br/api/v1"
 );
 
-// Log diagnóstico no boot
-console.log(`[vindiPublic] VINDI_PUBLIC_BASE configurado: ${VINDI_PUBLIC_BASE}`);
+// Log diagnóstico no boot (sem expor secrets)
+const publicBaseUrlHost = VINDI_PUBLIC_BASE ? new URL(VINDI_PUBLIC_BASE).host : "N/A";
+console.log(`[vindiPublic] VINDI_PUBLIC_BASE configurado: ${publicBaseUrlHost}`);
 
-const VINDI_PUBLIC_KEY = process.env.VINDI_PUBLIC_KEY || "";
+// Sanity-check de env: VINDI_PUBLIC_KEY
+const rawPublicKey = process.env.VINDI_PUBLIC_KEY || "";
+const VINDI_PUBLIC_KEY = String(rawPublicKey).trim();
+const VINDI_PUBLIC_KEY_SET = !!VINDI_PUBLIC_KEY;
+console.log(`[vindiPublic] VINDI_PUBLIC_KEY setado: ${VINDI_PUBLIC_KEY_SET}`);
+
 const VINDI_DEFAULT_GATEWAY = process.env.VINDI_DEFAULT_GATEWAY || "pagarme";
-const VINDI_API_KEY = process.env.VINDI_API_KEY || ""; // Para GET /payment_methods
+
+// Sanity-check de env: VINDI_API_KEY (para GET /payment_methods)
+const rawApiKey = process.env.VINDI_API_KEY || "";
+const VINDI_API_KEY = String(rawApiKey).trim();
+const VINDI_API_KEY_SET = !!VINDI_API_KEY;
 
 // Cache em memória para payment_company_codes válidos da Vindi
 let paymentCompanyCodesCache = {
@@ -126,7 +137,10 @@ function detectCardBrand(cardNumber) {
  */
 function buildPublicAuthHeader() {
   if (!VINDI_PUBLIC_KEY) {
-    throw new Error("VINDI_PUBLIC_KEY não configurado no servidor.");
+    const error = new Error("VINDI_PUBLIC_KEY não configurado no servidor.");
+    error.status = 503;
+    error.code = "VINDI_PUBLIC_CONFIG_ERROR";
+    throw error;
   }
   const authString = `${VINDI_PUBLIC_KEY}:`;
   const encoded = Buffer.from(authString).toString("base64");
@@ -257,6 +271,7 @@ export async function tokenizeCardPublic(payload) {
   if (!VINDI_PUBLIC_KEY) {
     const error = new Error("VINDI_PUBLIC_KEY não configurado no servidor.");
     error.status = 503;
+    error.code = "VINDI_PUBLIC_CONFIG_ERROR";
     throw error;
   }
 
@@ -431,8 +446,25 @@ export async function tokenizeCardPublic(payload) {
     } catch (e) {
       clearTimeout(timeout);
       if (e?.name === "AbortError") {
-        throw new Error("Vindi Public API timeout após 30s");
+        const error = new Error("Vindi Public API timeout após 30s");
+        error.status = 502;
+        error.code = "VINDI_TIMEOUT";
+        throw error;
       }
+      
+      // Se fetch lançar TypeError "Failed to parse URL", retornar erro padronizado
+      if (e instanceof TypeError && e.message?.includes("Failed to parse URL")) {
+        const error = new Error("Configuração Vindi Public inválida (VINDI_PUBLIC_BASE_URL).");
+        error.status = 502;
+        error.code = "VINDI_PUBLIC_CONFIG_ERROR";
+        error.provider_status = null;
+        err(`Vindi Public URL parse error`, {
+          url,
+          error_message: e.message,
+        });
+        throw error;
+      }
+      
       throw e;
     }
     clearTimeout(timeout);
@@ -513,15 +545,34 @@ export async function tokenizeCardPublic(payload) {
       }
 
       const error = new Error(errorMsg);
-      error.status = response.status; // Preserva status original (401/422 etc)
+      error.provider_status = response.status;
       error.response = {
         ...json,
         errors: errorsWithDetails.length > 0 ? errorsWithDetails : json?.errors || [],
       };
-      // Para 422, inclui details no erro para facilitar retorno ao frontend
-      if (response.status === 422 && errorsWithDetails.length > 0) {
-        error.details = errorsWithDetails;
+      
+      // Se Vindi responder 401/403: NÃO propagar 401 para o client
+      // Retornar 502 com code VINDI_AUTH_ERROR
+      if (response.status === 401 || response.status === 403) {
+        error.status = 502; // Não retornar 401 para o client
+        error.code = "VINDI_AUTH_ERROR";
+        error.message = "Falha de autenticação na Vindi (verifique VINDI_PUBLIC_KEY/BASE_URL).";
+        throw error;
       }
+      
+      // Para 422, mantém status 422 mas adiciona code
+      if (response.status === 422) {
+        error.status = 422;
+        error.code = "VINDI_VALIDATION_ERROR";
+        if (errorsWithDetails.length > 0) {
+          error.details = errorsWithDetails;
+        }
+        throw error;
+      }
+      
+      // Para demais erros, retornar 502 com code VINDI_UPSTREAM_ERROR
+      error.status = 502;
+      error.code = "VINDI_UPSTREAM_ERROR";
       throw error;
     }
 

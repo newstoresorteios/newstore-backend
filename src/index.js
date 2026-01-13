@@ -140,9 +140,62 @@ app.use((req, res) => {
   res.status(404).json({ error: "not_found", path: req.originalUrl });
 });
 
+// ── Validação de env Vindi no boot ───────────────────────────
+function validateVindiConfig() {
+  const rawBaseUrl = process.env.VINDI_API_BASE_URL || process.env.VINDI_API_URL;
+  const rawApiKey = process.env.VINDI_API_KEY || "";
+  const rawPublicBaseUrl = process.env.VINDI_PUBLIC_BASE_URL || process.env.VINDI_PUBLIC_URL;
+  const rawPublicKey = process.env.VINDI_PUBLIC_KEY || "";
+
+  // Valida VINDI_API_BASE_URL
+  let baseUrlHost = "N/A";
+  if (rawBaseUrl) {
+    try {
+      const trimmed = String(rawBaseUrl).trim();
+      if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+        baseUrlHost = new URL(trimmed).host;
+      } else {
+        console.warn(`[boot] VINDI_API_BASE_URL inválida (não começa com http): "${trimmed.substring(0, 50)}..."`);
+      }
+    } catch (e) {
+      console.warn(`[boot] VINDI_API_BASE_URL inválida (erro ao parsear): ${e.message}`);
+    }
+  }
+
+  // Valida VINDI_PUBLIC_BASE_URL
+  let publicBaseUrlHost = "N/A";
+  if (rawPublicBaseUrl) {
+    try {
+      const trimmed = String(rawPublicBaseUrl).trim();
+      if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+        publicBaseUrlHost = new URL(trimmed).host;
+      } else {
+        console.warn(`[boot] VINDI_PUBLIC_BASE_URL inválida (não começa com http): "${trimmed.substring(0, 50)}..."`);
+      }
+    } catch (e) {
+      console.warn(`[boot] VINDI_PUBLIC_BASE_URL inválida (erro ao parsear): ${e.message}`);
+    }
+  }
+
+  // Detecta "base url parecendo api key" (string curta/sem http)
+  if (rawBaseUrl && !rawBaseUrl.startsWith("http") && rawBaseUrl.length < 50 && rawBaseUrl.length > 10) {
+    console.warn(`[boot] ATENÇÃO: VINDI_API_BASE_URL parece ser uma API key (string curta sem http). Verifique a configuração.`);
+  }
+
+  // Log diagnóstico (sem expor secrets)
+  console.log(`[boot] Vindi Config:`);
+  console.log(`  VINDI_API_BASE_URL: ${baseUrlHost}`);
+  console.log(`  VINDI_API_KEY setado: ${!!String(rawApiKey).trim()}`);
+  console.log(`  VINDI_PUBLIC_BASE_URL: ${publicBaseUrlHost}`);
+  console.log(`  VINDI_PUBLIC_KEY setado: ${!!String(rawPublicKey).trim()}`);
+}
+
 // ── Bootstrap ───────────────────────────────────────────────
 async function bootstrap() {
   try {
+    // Validação de env Vindi
+    validateVindiConfig();
+
     await ensureSchema(); // cria o schema base/tabelas
     await ensureAppConfig(); // garante app_config e ticket_price_cents
 
