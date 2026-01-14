@@ -242,6 +242,19 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
       json?.message ||
       `Vindi ${method} ${path} falhou (${response.status})`;
 
+    // Extrai lista de erros por campo da resposta da Vindi
+    const fieldErrors = [];
+    if (json?.errors && Array.isArray(json.errors)) {
+      json.errors.forEach(err => {
+        if (err?.parameter && err?.message) {
+          fieldErrors.push({
+            field: err.parameter,
+            message: err.message,
+          });
+        }
+      });
+    }
+
     const error = new Error(errorMsg);
     error.status = response.status;
     error.response = json;
@@ -249,6 +262,7 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
     error.url = url;
     error.provider = "VINDI"; // Marca como erro do provider
     error.provider_status = response.status;
+    error.fieldErrors = fieldErrors; // Lista de erros por campo [{field, message}]
     
     // Se Vindi responder 401/403: retornar 401/403 com code VINDI_AUTH_ERROR
     if (response.status === 401 || response.status === 403) {
@@ -345,29 +359,35 @@ export async function ensureCustomer({ email, name, code, cpfCnpj }) {
 
 /**
  * Cria um payment_profile (cartão) na Vindi usando gateway_token
- * @param {object} params - { customerId, gatewayToken, holderName, docNumber?, phone? }
+ * MODO A (gateway_token presente): body mínimo conforme documentação Vindi
+ * { gateway_token, customer_id, payment_method_code: "credit_card" }
+ * 
+ * @param {object} params - { customerId, gatewayToken, holderName?, docNumber?, phone? }
  * @returns {Promise<{paymentProfileId: string, lastFour?: string, cardType?: string}>}
  */
 export async function createPaymentProfile({ customerId, gatewayToken, holderName, docNumber, phone }) {
-  if (!customerId || !gatewayToken || !holderName) {
-    throw new Error("customerId, gatewayToken e holderName são obrigatórios");
+  if (!customerId || !gatewayToken) {
+    throw new Error("customerId e gatewayToken são obrigatórios");
   }
 
   try {
+    // MODO A: gateway_token presente - body mínimo conforme documentação Vindi
+    // Não enviar holder_name, payment_company_code, registry_code quando usar gateway_token
     const body = {
       customer_id: customerId,
-      holder_name: holderName,
-      payment_method_code: VINDI_DEFAULT_PAYMENT_METHOD,
-      payment_company_code: VINDI_DEFAULT_GATEWAY,
       gateway_token: gatewayToken,
+      payment_method_code: "credit_card", // Sempre credit_card para gateway_token
     };
 
-    if (docNumber) {
-      body.registry_code = String(docNumber).replace(/\D+/g, "");
-    }
-    if (phone) {
-      body.phone = String(phone).replace(/\D+/g, "");
-    }
+    // NOTA: Não enviar payment_company_code quando usar gateway_token
+    // A Vindi detecta automaticamente a bandeira do cartão a partir do gateway_token
+    // payment_company_code é o gateway/adquirente (ex: pagarme), não a bandeira (visa/master/elo)
+
+    log("criando payment_profile com gateway_token (body mínimo)", {
+      customer_id: customerId,
+      has_gateway_token: !!gatewayToken,
+      payment_method_code: body.payment_method_code,
+    });
 
     const created = await vindiRequest("POST", "/payment_profiles", body);
     const profile = created.payment_profile;
@@ -376,6 +396,7 @@ export async function createPaymentProfile({ customerId, gatewayToken, holderNam
       paymentProfileId: profile?.id,
       customerId,
       lastFour: profile?.last_four,
+      cardType: profile?.card_type,
     });
 
     return {
@@ -388,6 +409,7 @@ export async function createPaymentProfile({ customerId, gatewayToken, holderNam
       customerId,
       msg: e?.message,
       status: e?.status,
+      code: e?.code,
     });
     throw e;
   }
@@ -466,7 +488,7 @@ export async function createPaymentProfileWithCardData({
  * @param {object} params - { customerId, amount, description, metadata?, paymentProfileId, dueAt? }
  * @returns {Promise<{billId: string, status: string}>}
  */
-export async function createBill({ customerId, amount, description, metadata, paymentProfileId, dueAt }) {
+export async function createBill({ customerId, amount, description, metadata, paymentProfileId, dueAt, idempotencyKey }) {
   if (!customerId || !amount || !paymentProfileId) {
     throw new Error("customerId, amount e paymentProfileId são obrigatórios");
   }
@@ -477,7 +499,7 @@ export async function createBill({ customerId, amount, description, metadata, pa
 
     const body = {
       customer_id: customerId,
-      payment_method_code: VINDI_DEFAULT_PAYMENT_METHOD,
+      payment_method_code: "credit_card", // Sempre credit_card para autopay
       bill_items: [
         {
           product_id: null, // pode ser null se não tiver produto cadastrado
@@ -499,6 +521,14 @@ export async function createBill({ customerId, amount, description, metadata, pa
     } else {
       // Por padrão, vence hoje (cobrança imediata)
       body.due_at = new Date().toISOString().split("T")[0];
+    }
+
+    // Idempotency: se fornecido, adiciona ao metadata
+    if (idempotencyKey) {
+      if (!body.metadata) {
+        body.metadata = {};
+      }
+      body.metadata.idempotency_key = idempotencyKey;
     }
 
     const created = await vindiRequest("POST", "/bills", body);

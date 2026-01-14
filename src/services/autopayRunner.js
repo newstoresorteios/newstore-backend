@@ -232,6 +232,9 @@ export async function runAutopayForDraw(draw_id) {
       try {
         const description = `Sorteio ${draw_id} – números: ${free.map(n => String(n).padStart(2, "0")).join(", ")}`;
         
+        // Idempotency key: "draw:{drawId}:user:{userId}"
+        const idempotencyKey = `draw:${draw_id}:user:${user_id}`;
+        
         // eslint-disable-next-line no-await-in-loop
         const bill = await createBill({
           customerId: p.vindi_customer_id,
@@ -239,6 +242,7 @@ export async function runAutopayForDraw(draw_id) {
           description,
           metadata: { user_id, draw_id, numbers: free },
           paymentProfileId: p.vindi_payment_profile_id,
+          idempotencyKey,
         });
 
         billId = bill.billId;

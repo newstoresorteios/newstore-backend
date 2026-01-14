@@ -28,7 +28,17 @@ function mapVindiError(error) {
     const providerStatus = error?.provider_status || error?.status || null;
     const errorResponse = error?.response || {};
     const errors = errorResponse?.errors || [];
-    const details = error?.details || (errors.length > 0 ? errors : []);
+    
+    // Prioriza fieldErrors se disponível, senão usa details ou errors
+    let fieldErrors = error?.fieldErrors || [];
+    if (fieldErrors.length === 0 && errors.length > 0) {
+      fieldErrors = errors.map(e => ({
+        field: e?.parameter || e?.field || "unknown",
+        message: e?.message || String(e),
+      }));
+    }
+    
+    const details = error?.details || fieldErrors;
 
     return {
       httpStatus,
@@ -36,6 +46,7 @@ function mapVindiError(error) {
       message: error.message || "Erro na integração com Vindi",
       providerStatus,
       details,
+      errors: fieldErrors, // Lista de erros por campo [{field, message}]
     };
   }
 
@@ -60,6 +71,12 @@ function mapVindiError(error) {
     ? errorMessages.join("; ").slice(0, 300)
     : error?.message || "Erro na integração com Vindi";
   
+  // Extrai erros por campo
+  const fieldErrors = error?.fieldErrors || errors.map(e => ({
+    field: e?.parameter || e?.field || "unknown",
+    message: e?.message || String(e),
+  }));
+  
   // Mapeia status da Vindi para HTTP status apropriado
   if (vindiStatus === 401 || vindiStatus === 403) {
     // Erro de autenticação da Vindi → retornar 401/403 com code VINDI_AUTH_ERROR
@@ -74,6 +91,7 @@ function mapVindiError(error) {
       message: authMessage,
       providerStatus: vindiStatus,
       details: errors.length > 0 ? errors : [{ message: errorSummary }],
+      errors: fieldErrors,
     };
   }
   
@@ -85,6 +103,7 @@ function mapVindiError(error) {
       message: errorSummary,
       providerStatus: vindiStatus,
       details: errors.length > 0 ? errors : [{ message: errorSummary }],
+      errors: fieldErrors, // Lista de erros por campo [{field, message}]
     };
   }
   
@@ -664,19 +683,19 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
           code: mappedError.code,
           error_message: mappedError.message,
           provider_status: mappedError.providerStatus,
-          details: mappedError.details,
+          errors: mappedError.errors || mappedError.details, // Lista de erros por campo [{field, message}]
           requestId,
         });
       }
 
       // PASSO 2: createPaymentProfile com customer_id (garantido no passo anterior)
+      // MODO A: gateway_token presente - body mínimo conforme documentação Vindi
+      // Não enviar holder_name, docNumber, phone quando usar gateway_token
       try {
         const paymentProfile = await createPaymentProfile({
           customerId: vindiCustomerId,
           gatewayToken: gateway_token,
-          holderName: holder_name,
-          docNumber: doc_number,
-          phone: req.user.phone || null,
+          // holderName, docNumber, phone não são enviados quando usar gateway_token
         });
 
         paymentProfileId = paymentProfile.paymentProfileId;
@@ -706,7 +725,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
           code: mappedError.code,
           error_message: mappedError.message,
           provider_status: mappedError.providerStatus,
-          details: mappedError.details,
+          errors: mappedError.errors || mappedError.details, // Lista de erros por campo [{field, message}]
           requestId,
         });
       }
@@ -897,6 +916,180 @@ router.post("/vindi/cancel", requireAuth, async (req, res) => {
     });
   } finally {
     client.release();
+  }
+});
+
+/**
+ * POST /api/autopay/vindi/webhook
+ * Webhook da Vindi para atualizar status de pagamentos (bills/charges)
+ * Body: evento do webhook da Vindi
+ * Validação mínima e logs estruturados
+ */
+router.post("/vindi/webhook", async (req, res) => {
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+  
+  try {
+    const payload = req.body;
+    const eventType = payload?.type || payload?.event_type || "unknown";
+    const data = payload?.data || payload;
+
+    console.log("[autopay/vindi/webhook] evento recebido", {
+      requestId,
+      event_type: eventType,
+      has_data: !!data,
+    });
+
+    // Validação mínima: verifica se tem dados básicos
+    if (!data) {
+      console.warn("[autopay/vindi/webhook] payload sem data", { requestId, payload });
+      return res.status(200).json({ ok: true, message: "ignored" }); // Sempre 200 para webhook
+    }
+
+    // Extrai IDs relevantes
+    const billId = data?.bill?.id || data?.bill_id || null;
+    const chargeId = data?.charge?.id || data?.charge_id || null;
+    const billStatus = data?.bill?.status || data?.status || null;
+    const chargeStatus = data?.charge?.status || null;
+
+    // Log estruturado
+    console.log("[autopay/vindi/webhook] processando evento", {
+      requestId,
+      event_type: eventType,
+      bill_id: billId,
+      charge_id: chargeId,
+      bill_status: billStatus,
+      charge_status: chargeStatus,
+    });
+
+    // Atualiza autopay_runs se tiver bill_id ou charge_id
+    if (billId || chargeId) {
+      const pool = await getPool();
+      const client = await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        // Busca autopay_runs relacionados a esta bill/charge
+        let runQuery = null;
+        if (billId) {
+          // Busca por vindi_bill_id no payments
+          const paymentResult = await client.query(
+            `SELECT id, user_id, draw_id, vindi_bill_id, vindi_charge_id 
+             FROM public.payments 
+             WHERE vindi_bill_id = $1 
+             LIMIT 1`,
+            [billId]
+          );
+
+          if (paymentResult.rows.length > 0) {
+            const payment = paymentResult.rows[0];
+            // Busca autopay_run pelo payment_id (mais direto)
+            runQuery = await client.query(
+              `SELECT ar.* 
+               FROM public.autopay_runs ar
+               WHERE ar.payment_id = $1
+               LIMIT 1`,
+              [payment.id]
+            );
+            
+            // Se não encontrou por payment_id, busca por user_id + draw_id (fallback)
+            if (!runQuery.rows.length) {
+              runQuery = await client.query(
+                `SELECT ar.* 
+                 FROM public.autopay_runs ar
+                 WHERE ar.user_id = $1 
+                   AND ar.draw_id = $2
+                 ORDER BY ar.created_at DESC
+                 LIMIT 1`,
+                [payment.user_id, payment.draw_id]
+              );
+            }
+          }
+        }
+
+        if (runQuery && runQuery.rows.length > 0) {
+          const run = runQuery.rows[0];
+          const newStatus = billStatus === "paid" || chargeStatus === "paid" ? "ok" : 
+                           billStatus === "failed" || chargeStatus === "rejected" ? "error" : 
+                           run.status;
+
+          // Atualiza status do autopay_run
+          await client.query(
+            `UPDATE public.autopay_runs
+             SET status = $1,
+                 error = CASE WHEN $1 = 'error' THEN $2 ELSE error END,
+                 updated_at = now()
+             WHERE id = $3`,
+            [newStatus, `Vindi: ${billStatus || chargeStatus}`, run.id]
+          );
+
+          // Atualiza payment se necessário
+          if (billId && billStatus) {
+            await client.query(
+              `UPDATE public.payments
+               SET status = CASE 
+                 WHEN $1 = 'paid' THEN 'approved'
+                 WHEN $1 = 'failed' THEN 'rejected'
+                 ELSE status
+               END,
+               vindi_status = $1,
+               paid_at = CASE WHEN $1 = 'paid' THEN now() ELSE paid_at END
+               WHERE vindi_bill_id = $2`,
+              [billStatus, billId]
+            );
+          }
+
+          await client.query("COMMIT");
+
+          console.log("[autopay/vindi/webhook] autopay_run atualizado", {
+            requestId,
+            run_id: run.id,
+            old_status: run.status,
+            new_status: newStatus,
+            bill_id: billId,
+            charge_id: chargeId,
+          });
+        } else {
+          await client.query("ROLLBACK");
+          console.log("[autopay/vindi/webhook] nenhum autopay_run encontrado", {
+            requestId,
+            bill_id: billId,
+            charge_id: chargeId,
+          });
+        }
+
+        client.release();
+      } catch (dbError) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {}
+        client.release();
+        
+        console.error("[autopay/vindi/webhook] erro ao processar no DB", {
+          requestId,
+          error: dbError?.message,
+        });
+        // Continua e retorna 200 para não fazer Vindi reenviar
+      }
+    }
+
+    // Sempre retorna 200 para o webhook não ser reenviado
+    return res.status(200).json({ 
+      ok: true, 
+      message: "webhook processed",
+      requestId,
+    });
+  } catch (e) {
+    console.error("[autopay/vindi/webhook] erro inesperado", {
+      requestId,
+      error: e?.message,
+    });
+    // Sempre retorna 200 para webhook não ser reenviado
+    return res.status(200).json({ 
+      ok: true, 
+      message: "webhook received",
+      requestId,
+    });
   }
 });
 
