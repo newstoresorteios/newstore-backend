@@ -130,13 +130,14 @@ function mapVindiError(error) {
   }
   
   if (vindiStatus && vindiStatus >= 400 && vindiStatus < 500) {
-    // Outros 4xx → 502 (não queremos confundir com nossos erros)
+    // Outros 4xx → 502 com VINDI_UPSTREAM_ERROR (não queremos confundir com nossos erros)
     return {
       httpStatus: 502,
-      code: "VINDI_CLIENT_ERROR",
+      code: "VINDI_UPSTREAM_ERROR",
       message: errorSummary,
       providerStatus: vindiStatus,
       details: errors.length > 0 ? errors : [{ message: errorSummary }],
+      errors: fieldErrors, // Lista de erros por campo [{field, message}]
     };
   }
   
@@ -458,7 +459,9 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
     const card_last4 = req.body?.card_last4 ? String(req.body.card_last4).slice(0, 4) : null;
     const payment_company_code = req.body?.payment_company_code ? String(req.body.payment_company_code).trim() : null;
     const holder_name = String(req.body?.holder_name || "").slice(0, 120);
-    const doc_number = String(req.body?.doc_number || "")
+    // Aceita aliases: doc_number || document_number || registry_code
+    const doc_number_raw = req.body?.doc_number || req.body?.document_number || req.body?.registry_code || "";
+    const doc_number = String(doc_number_raw)
       .replace(/\D+/g, "")
       .slice(0, 18);
     const numbers = parseNumbers(req.body?.numbers);
@@ -565,18 +568,9 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
       });
     }
 
-    // 3) Se veio gateway_token, valida dados obrigatórios
-    if (gateway_token) {
-      if (!holder_name || !doc_number) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          code: "MISSING_HOLDER_DATA",
-          error_message: "holder_name e doc_number são obrigatórios ao salvar cartão",
-          requestId,
-        });
-      }
-    }
+    // 3) Se veio gateway_token, holder_name e doc_number são OPCIONAIS
+    // A Vindi não exige esses campos quando usa gateway_token (body mínimo)
+    // Mas podemos aceitar se vierem do frontend para persistir no banco
 
     // Se não veio gateway_token nem payment_profile_id, e não tem perfil existente, permite apenas desativar
     const hasVindiProfile = !!(existingProfile?.vindi_payment_profile_id);
@@ -732,13 +726,16 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
     }
 
     // 8) Atualiza perfil com dados Vindi e limpa campos MP
+    // Persiste holder_name e doc_number se fornecidos (opcionais quando gateway_token está presente)
     const updateResult = await client.query(
       `update public.autopay_profiles
           set vindi_customer_id = COALESCE($2, vindi_customer_id),
               vindi_payment_profile_id = COALESCE($3, vindi_payment_profile_id),
               vindi_last4 = COALESCE($4, vindi_last4),
               vindi_brand = COALESCE($5, vindi_brand),
-              active = $6,
+              holder_name = COALESCE($6, holder_name),
+              doc_number = COALESCE($7, doc_number),
+              active = $8,
               mp_customer_id = NULL,
               mp_card_id = NULL,
               brand = NULL,
@@ -746,7 +743,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
               updated_at = now()
         where id=$1
         returning *`,
-      [profile.id, vindiCustomerId, paymentProfileId, lastFour, brand, active]
+      [profile.id, vindiCustomerId, paymentProfileId, lastFour, brand, holder_name || null, doc_number || null, active]
     );
 
     await client.query("COMMIT");
