@@ -71,6 +71,77 @@ const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ? JSON.st
 const err = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ? JSON.stringify(extra) : "");
 
 /**
+ * Mascara dados sensíveis em objetos para logs
+ * @param {any} obj - Objeto a ser mascarado
+ * @returns {any} - Objeto com dados sensíveis mascarados
+ */
+function maskSensitiveDataForLog(obj) {
+  if (!obj || typeof obj !== "object") {
+    return obj;
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map(item => maskSensitiveDataForLog(item));
+  }
+
+  const masked = {};
+  const sensitiveKeys = [
+    "card_number", "cardNumber", "card_cvv", "cardCvv", "cvv",
+    "document_number", "documentNumber", "registry_code", "registryCode",
+    "cpf", "cnpj", "cpfCnpj",
+    "gateway_token", "gatewayToken",
+    "api_key", "apiKey", "public_key", "publicKey",
+  ];
+
+  for (const [key, value] of Object.entries(obj)) {
+    const lowerKey = key.toLowerCase();
+    
+    if (sensitiveKeys.some(sk => lowerKey.includes(sk))) {
+      if (typeof value === "string" && value.length > 0) {
+        // Mascara strings sensíveis
+        if (lowerKey.includes("card_number") || lowerKey.includes("cardnumber")) {
+          // Número do cartão: primeiros 4 + últimos 4
+          const clean = value.replace(/\D+/g, "");
+          if (clean.length >= 8) {
+            masked[key] = `${clean.slice(0, 4)}${"*".repeat(Math.max(0, clean.length - 8))}${clean.slice(-4)}`;
+          } else {
+            masked[key] = "****";
+          }
+        } else if (lowerKey.includes("cvv")) {
+          // CVV: sempre mascarado
+          masked[key] = "***";
+        } else if (lowerKey.includes("token")) {
+          // Tokens: primeiros 8 + últimos 4
+          if (value.length >= 12) {
+            masked[key] = `${value.slice(0, 8)}...${value.slice(-4)}`;
+          } else {
+            masked[key] = "****";
+          }
+        } else if (lowerKey.includes("document") || lowerKey.includes("registry") || lowerKey.includes("cpf") || lowerKey.includes("cnpj")) {
+          // Documentos: primeiros 3 + últimos 2
+          const clean = value.replace(/\D+/g, "");
+          if (clean.length >= 5) {
+            masked[key] = `${clean.slice(0, 3)}${"*".repeat(Math.max(0, clean.length - 5))}${clean.slice(-2)}`;
+          } else {
+            masked[key] = "***";
+          }
+        } else {
+          // Outros campos sensíveis: mascarar completamente
+          masked[key] = "****";
+        }
+      } else {
+        masked[key] = value;
+      }
+    } else {
+      // Recursivamente mascarar objetos aninhados
+      masked[key] = maskSensitiveDataForLog(value);
+    }
+  }
+
+  return masked;
+}
+
+/**
  * Mascara número do cartão para logs (ex: 6504********5236)
  */
 function maskCardNumber(cardNumber) {
@@ -429,8 +500,22 @@ export async function tokenizeCardPublic(payload) {
     logPayload.has_cvv = !!payload.card_cvv;
     logPayload.has_document_number = !!payload.document_number;
     
+    // Log do payload final que será enviado à Vindi (mascarado)
     log("chamando Vindi Public API - request final", logPayload);
-    log("endpoint Vindi Public API", { url: `${VINDI_PUBLIC_BASE}/public/payment_profiles` });
+    
+    // Log do body completo que será enviado (form data mascarado)
+    const formDataObj = {};
+    for (const [key, value] of form.entries()) {
+      formDataObj[key] = value;
+    }
+    const maskedFormData = maskSensitiveDataForLog(formDataObj);
+    
+    log("Vindi Public API - body da requisição (mascarado)", {
+      url: `${VINDI_PUBLIC_BASE}/public/payment_profiles`,
+      method: "POST",
+      body: maskedFormData,
+      content_type: "application/x-www-form-urlencoded",
+    });
 
     const url = `${VINDI_PUBLIC_BASE}/public/payment_profiles`;
     const controller = new AbortController();
