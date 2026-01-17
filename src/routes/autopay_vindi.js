@@ -434,7 +434,7 @@ router.post("/vindi/tokenize", requireAuth, async (req, res) => {
       ok: false,
       code: "INTERNAL_ERROR",
       error_message: e?.message || "Erro interno ao tokenizar cartão",
-      requestId: crypto.randomUUID(),
+      requestId,
     });
   }
 });
@@ -520,6 +520,35 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
       );
       const profile = profileResult.rows[0];
 
+      // Validação: impedir colisão GLOBAL de números (outros usuários)
+      if (numbers.length) {
+        const takenResult = await client.query(
+          `select n, autopay_id
+             from public.autopay_numbers
+            where n = any($1::int2[])
+              and autopay_id <> $2`,
+          [numbers, profile.id]
+        );
+
+        if (takenResult.rows.length) {
+          const taken = [...new Set(takenResult.rows.map((r) => Number(r.n)))].sort((a, b) => a - b);
+          console.warn("[autopay/vindi/setup] numbers already taken", {
+            user_id,
+            requestId,
+            taken,
+          });
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            ok: false,
+            code: "NUMBERS_ALREADY_TAKEN",
+            message: "Alguns números já estão ocupados.",
+            error_message: "Alguns números já estão ocupados.",
+            taken,
+            requestId,
+          });
+        }
+      }
+
       // Atualiza números
       await client.query(
         `delete from public.autopay_numbers where autopay_id=$1`,
@@ -565,6 +594,7 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
           last4: card_last4 || updateResult.rows[0]?.vindi_last4 || null,
           has_card: true,
         },
+        requestId,
       });
     }
 
@@ -600,6 +630,35 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
       [user_id, active, holder_name || null, doc_number || null]
     );
     const profile = profileResult.rows[0];
+
+    // Validação: impedir colisão GLOBAL de números (outros usuários)
+    if (numbers.length) {
+      const takenResult = await client.query(
+        `select n, autopay_id
+           from public.autopay_numbers
+          where n = any($1::int2[])
+            and autopay_id <> $2`,
+        [numbers, profile.id]
+      );
+
+      if (takenResult.rows.length) {
+        const taken = [...new Set(takenResult.rows.map((r) => Number(r.n)))].sort((a, b) => a - b);
+        console.warn("[autopay/vindi/setup] numbers already taken", {
+          user_id,
+          requestId,
+          taken,
+        });
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          code: "NUMBERS_ALREADY_TAKEN",
+          message: "Alguns números já estão ocupados.",
+          error_message: "Alguns números já estão ocupados.",
+          taken,
+          requestId,
+        });
+      }
+    }
 
     // 4) Atualiza números (substitui todos)
     await client.query(
@@ -764,11 +823,52 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
         last4: lastFour || null,
         has_card: !!paymentProfileId,
       },
+      requestId,
     });
   } catch (e) {
     try {
       await client.query("ROLLBACK");
     } catch {}
+
+    // Se houver UNIQUE(global) em autopay_numbers(n), pode estourar aqui por corrida.
+    // Tentamos mapear para 409 com os números atualmente ocupados.
+    if (e?.code === "23505") {
+      try {
+        const user_id = req.user?.id;
+        const { rows: profRows } = await query(
+          `select id from public.autopay_profiles where user_id=$1 limit 1`,
+          [user_id]
+        );
+        const myAutopayId = profRows?.[0]?.id;
+        const numbers = parseNumbers(req.body?.numbers);
+
+        if (myAutopayId && numbers.length) {
+          const takenResult = await query(
+            `select n from public.autopay_numbers
+              where n = any($1::int2[])
+                and autopay_id <> $2`,
+            [numbers, myAutopayId]
+          );
+          const taken = [...new Set(takenResult.rows.map((r) => Number(r.n)))].sort((a, b) => a - b);
+          if (taken.length) {
+            console.warn("[autopay/vindi/setup] numbers already taken (race)", {
+              user_id,
+              requestId,
+              taken,
+            });
+            return res.status(409).json({
+              ok: false,
+              code: "NUMBERS_ALREADY_TAKEN",
+              message: "Alguns números já estão ocupados.",
+              error_message: "Alguns números já estão ocupados.",
+              taken,
+              requestId,
+            });
+          }
+        }
+      } catch {}
+    }
+
     console.error("[autopay/vindi] setup error:", {
       user_id: req.user?.id,
       requestId,
@@ -790,27 +890,37 @@ router.post("/vindi/setup", requireAuth, async (req, res) => {
  * Retorna status do autopay Vindi do usuário
  */
 router.get("/vindi/status", requireAuth, async (req, res) => {
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
   try {
-    const { rows } = await query(
-      `select ap.*, array(
-         select n from public.autopay_numbers an where an.autopay_id = ap.id order by n
-       ) as numbers
-       from public.autopay_profiles ap
-      where ap.user_id = $1
-      limit 1`,
-      [req.user.id]
+    const user_id = req.user.id;
+
+    // 1) Busca autopay_profile
+    const { rows: profiles } = await query(
+      `select * from public.autopay_profiles where user_id=$1 limit 1`,
+      [user_id]
     );
 
-    if (!rows.length) {
+    if (!profiles.length) {
       return res.json({
         active: false,
         has_vindi: false,
+        holder_name: null,
+        doc_number: null,
         numbers: [],
+        vindi: null,
         card: null,
+        requestId,
       });
     }
 
-    const p = rows[0];
+    const p = profiles[0];
+
+    // 2) Busca números cativos do usuário (sempre, mesmo se active=false)
+    const { rows: numberRows } = await query(
+      `select n from public.autopay_numbers where autopay_id=$1 order by n asc`,
+      [p.id]
+    );
+    const numbers = numberRows.map((r) => Number(r.n));
     const hasVindi = !!(p.vindi_customer_id && p.vindi_payment_profile_id);
 
     res.json({
@@ -818,7 +928,7 @@ router.get("/vindi/status", requireAuth, async (req, res) => {
       has_vindi: hasVindi,
       holder_name: p.holder_name || null,
       doc_number: p.doc_number || null,
-      numbers: p.numbers || [],
+      numbers,
       vindi: hasVindi
         ? {
             customer_id: p.vindi_customer_id,
@@ -837,13 +947,66 @@ router.get("/vindi/status", requireAuth, async (req, res) => {
             last4: null,
             has_card: false,
           },
+      requestId,
     });
   } catch (e) {
-    console.error("[autopay/vindi] status error:", e?.message || e);
+    console.error("[autopay/vindi] status error:", {
+      user_id: req.user?.id,
+      requestId,
+      msg: e?.message || e,
+    });
     res.status(500).json({ 
       ok: false,
       code: "INTERNAL_ERROR",
       error_message: "Erro ao buscar status do autopay",
+      requestId,
+    });
+  }
+});
+
+/**
+ * GET /api/autopay/vindi/claimed-numbers
+ * Retorna TODOS os números cativos cadastrados (global, todos usuários)
+ */
+router.get("/vindi/claimed-numbers", requireAuth, async (req, res) => {
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+
+  try {
+    const { rows } = await query(
+      `select an.n, an.autopay_id, ap.user_id
+         from public.autopay_numbers an
+         join public.autopay_profiles ap on ap.id = an.autopay_id
+        order by an.n asc`
+    );
+
+    const claimed = rows.map((r) => ({
+      n: Number(r.n),
+      user_id: Number(r.user_id),
+      autopay_id: String(r.autopay_id),
+    }));
+
+    const byNumber = {};
+    for (const c of claimed) {
+      byNumber[String(c.n)] = { user_id: c.user_id, autopay_id: c.autopay_id };
+    }
+
+    return res.json({
+      ok: true,
+      claimed,
+      byNumber,
+      requestId,
+    });
+  } catch (e) {
+    console.error("[autopay/vindi] claimed-numbers error:", {
+      user_id: req.user?.id,
+      requestId,
+      msg: e?.message || e,
+    });
+    return res.status(500).json({
+      ok: false,
+      code: "INTERNAL_ERROR",
+      error_message: "Erro ao buscar números cativos",
+      requestId,
     });
   }
 });
