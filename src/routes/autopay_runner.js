@@ -10,7 +10,8 @@ const router = Router();
  * POST /api/admin/autopay/run?force=true&limit=50
  */
 router.post("/run", requireAuth, requireAdmin, async (req, res) => {
-  const force = String(req.query.force || "").toLowerCase() === "true";
+  const forceRaw = String(req.query.force ?? "").toLowerCase();
+  const force = forceRaw === "true" || forceRaw === "1";
   const limit = Number(req.query.limit || 50) | 0;
   console.log("[autopay.route] POST /run", { force, limit, at: new Date().toISOString() });
 
@@ -24,7 +25,8 @@ router.post("/run", requireAuth, requireAdmin, async (req, res) => {
  */
 router.post("/run/:drawId", requireAuth, requireAdmin, async (req, res) => {
   const drawId = Number(req.params.drawId);
-  const force = String(req.query.force || "").toLowerCase() === "true";
+  const forceRaw = String(req.query.force ?? "").toLowerCase();
+  const force = forceRaw === "true" || forceRaw === "1";
   console.log("[autopay.route] POST /run/:drawId", { drawId, force, at: new Date().toISOString() });
 
   const out = await ensureAutopayForDraw(drawId, { force });

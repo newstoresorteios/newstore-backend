@@ -382,10 +382,11 @@ async function finalizePaidReservation(client, { draw_id, reservationId, user_id
 /* ------------------------------------------------------- *
  * Autopay para UM sorteio aberto
  * ------------------------------------------------------- */
-export async function runAutopayForDraw(draw_id) {
+export async function runAutopayForDraw(draw_id, { force = false } = {}) {
   const pool = await getPool();
   const client = await pool.connect();
-  log("RUN start", { draw_id });
+  const runTraceId = crypto.randomUUID();
+  log("RUN start", { runTraceId, draw_id });
 
   try {
     // lock de sessão para o draw (segura entre commits; evita concorrência do runner)
@@ -427,22 +428,135 @@ export async function runAutopayForDraw(draw_id) {
     await ensureNumbersForDraw(client, draw_id);
     await client.query("COMMIT");
 
-    // 4) Perfis elegíveis (Vindi + active + números agregados)
-    const { rows: profiles } = await client.query(
+    // 4) Scan de candidatos (inclui active=false) + números agregados
+    // Regras de elegibilidade (em JS):
+    // - hasVindi = vindi_customer_id && vindi_payment_profile_id
+    // - eligible = hasVindi && active=true && preferred.length>0
+    const { rows: scanned } = await client.query(
       `select
           ap.id as autopay_id,
           ap.user_id as user_id,
+          ap.active as active,
           ap.vindi_customer_id,
           ap.vindi_payment_profile_id,
           coalesce(array_agg(an.n order by an.n) filter (where an.n is not null), '{}') as numbers
         from public.autopay_profiles ap
         left join public.autopay_numbers an on an.autopay_id = ap.id
-       where ap.active = true
-         and ap.vindi_customer_id is not null
-         and ap.vindi_payment_profile_id is not null
-       group by ap.id, ap.user_id, ap.vindi_customer_id, ap.vindi_payment_profile_id`
+       group by ap.id, ap.user_id, ap.active, ap.vindi_customer_id, ap.vindi_payment_profile_id`
     );
-    log("eligible profiles (Vindi mode)", { count: profiles.length });
+
+    let eligible = 0;
+    let inactive = 0;
+    let noNumbers = 0;
+    let missingVindi = 0;
+
+    const candidates = [];
+
+    for (const p of scanned) {
+      const hasVindi = !!(p.vindi_customer_id && p.vindi_payment_profile_id);
+      const preferred = (p.numbers || []).map(Number).filter((n) => n >= 0 && n <= 99);
+
+      if (!hasVindi) {
+        missingVindi++;
+        console.warn(`${LP} skip profile`, {
+          runTraceId,
+          autopay_id: p.autopay_id,
+          user_id: p.user_id,
+          active: !!p.active,
+          preferred,
+          reason: "missingVindi",
+        });
+        // opcional: registrar em autopay_runs
+        if (p.user_id && p.autopay_id) {
+          await writeAutopayRun(client, {
+            autopay_id: p.autopay_id,
+            user_id: p.user_id,
+            draw_id,
+            tried_numbers: preferred,
+            status: "skipped_missing_vindi",
+            error: "missing_vindi_customer_or_payment_profile",
+            provider: "vindi",
+          });
+        }
+        continue;
+      }
+
+      // candidato = tem Vindi configurado
+      candidates.push(p);
+
+      if (!p.active) {
+        inactive++;
+        console.warn(`${LP} skip profile`, {
+          runTraceId,
+          autopay_id: p.autopay_id,
+          user_id: p.user_id,
+          active: false,
+          preferred,
+          reason: "inactive",
+        });
+        // opcional: registrar em autopay_runs
+        if (p.user_id && p.autopay_id) {
+          await writeAutopayRun(client, {
+            autopay_id: p.autopay_id,
+            user_id: p.user_id,
+            draw_id,
+            tried_numbers: preferred,
+            status: "skipped_inactive",
+            error: "profile_inactive",
+            provider: "vindi",
+          });
+        }
+        continue;
+      }
+
+      if (!preferred.length) {
+        noNumbers++;
+        console.warn(`${LP} skip profile`, {
+          runTraceId,
+          autopay_id: p.autopay_id,
+          user_id: p.user_id,
+          active: true,
+          preferred,
+          reason: "noNumbers",
+        });
+        // opcional: registrar em autopay_runs
+        if (p.user_id && p.autopay_id) {
+          await writeAutopayRun(client, {
+            autopay_id: p.autopay_id,
+            user_id: p.user_id,
+            draw_id,
+            tried_numbers: preferred,
+            status: "skipped_no_numbers",
+            error: "no_preferred_numbers",
+            provider: "vindi",
+          });
+        }
+        continue;
+      }
+
+      eligible++;
+    }
+
+    log("scan candidates", {
+      runTraceId,
+      total: scanned.length,
+      eligible,
+      inactive,
+      noNumbers,
+      missingVindi,
+    });
+
+    // Perfis elegíveis para processamento (apenas active=true + hasVindi + preferred>0)
+    const profiles = candidates
+      .filter((p) => !!p.active)
+      .map((p) => ({
+        autopay_id: p.autopay_id,
+        user_id: p.user_id,
+        vindi_customer_id: p.vindi_customer_id,
+        vindi_payment_profile_id: p.vindi_payment_profile_id,
+        numbers: (p.numbers || []).map(Number).filter((n) => n >= 0 && n <= 99),
+      }))
+      .filter((p) => p.numbers.length > 0);
 
     // 5) Preço
     const price_cents = await getTicketPriceCents(client);
@@ -456,10 +570,20 @@ export async function runAutopayForDraw(draw_id) {
 
     // 6) Loop usuários
     for (const p of profiles) {
+      const attemptTraceId = crypto.randomUUID();
       const user_id = p.user_id;
       const autopay_id = p.autopay_id;
       const wants = (p.numbers || []).map(Number).filter((n) => n >= 0 && n <= 99);
-      log("USER begin", { user_id, autopay_id, wants, provider: "vindi" });
+      log("attempt start", {
+        runTraceId,
+        attemptTraceId,
+        draw_id,
+        autopay_id,
+        user_id,
+        preferred: wants,
+        priceEach: price_cents,
+        provider: "vindi",
+      });
 
       if (!wants.length) {
         results.push({ user_id, status: "skipped", reason: "no_numbers" });
@@ -483,7 +607,16 @@ export async function runAutopayForDraw(draw_id) {
       const reservedNumbers = reserved.reservedNumbers;
       const reservationId = reserved.reservationId;
 
-      log("USER reserved numbers", { user_id, autopay_id, reservedNumbers, reservationId });
+      log("numbers free/reserved", {
+        runTraceId,
+        attemptTraceId,
+        draw_id,
+        autopay_id,
+        user_id,
+        preferred: wants,
+        free: reservedNumbers, // subset realmente reservado (livre no momento)
+        reservationId,
+      });
 
       if (!reservedNumbers.length || !reservationId) {
         // registra tentativa (sem reserva) e segue
@@ -526,15 +659,26 @@ export async function runAutopayForDraw(draw_id) {
           metadata: { user_id, draw_id, numbers: reservedNumbers, autopay_id, reservation_id: reservationId },
           paymentProfileId: p.vindi_payment_profile_id,
           idempotencyKey,
+          traceId: attemptTraceId,
         });
 
         billId = bill.billId;
         chargeId = bill.chargeId;
+        log("bill created", {
+          runTraceId,
+          attemptTraceId,
+          draw_id,
+          autopay_id,
+          user_id,
+          bill_id: billId,
+          bill_status: bill.status,
+          amount_cents,
+        });
 
         // Se não foi cobrado automaticamente, cobra agora
         if (!chargeId || bill.status !== "paid") {
           // eslint-disable-next-line no-await-in-loop
-          const chargeResult = await chargeBill(billId);
+          const chargeResult = await chargeBill(billId, { traceId: attemptTraceId });
           chargeId = chargeResult.chargeId;
         }
 
@@ -549,7 +693,16 @@ export async function runAutopayForDraw(draw_id) {
           throw new Error(`Bill não paga: status=${billStatus}`);
         }
 
-        log("Vindi charge ->", { user_id, billId, chargeId, status: billStatus });
+        log("bill charged", {
+          runTraceId,
+          attemptTraceId,
+          draw_id,
+          autopay_id,
+          user_id,
+          bill_id: billId,
+          charge_id: chargeId,
+          bill_status: billStatus,
+        });
       } catch (e) {
         const emsg = String(e?.message || e);
 
@@ -619,6 +772,15 @@ export async function runAutopayForDraw(draw_id) {
 
       // 6.3) Confirma (paid) + grava payment + audita autopay_runs (TX)
       try {
+        log("reserving numbers", {
+          runTraceId,
+          attemptTraceId,
+          draw_id,
+          autopay_id,
+          user_id,
+          reserved: reservedNumbers,
+          reservationId,
+        });
         // eslint-disable-next-line no-await-in-loop
         const fin = await finalizePaidReservation(client, {
           draw_id,
@@ -646,7 +808,19 @@ export async function runAutopayForDraw(draw_id) {
         });
 
         chargedOk++;
-        log("autopay ok", { user_id, autopay_id, reservationId, payment_id: fin.paymentId, reservedNumbers, amount_cents, billId, chargeId });
+        log("numbers sold", {
+          runTraceId,
+          attemptTraceId,
+          draw_id,
+          autopay_id,
+          user_id,
+          sold: reservedNumbers,
+          reservationId,
+          payment_id: fin.paymentId,
+          amount_cents,
+          bill_id: billId,
+          charge_id: chargeId,
+        });
         results.push({ user_id, status: "ok", numbers: reservedNumbers, amount_cents });
       } catch (e) {
         chargedFail++;
@@ -687,15 +861,19 @@ export async function runAutopayForDraw(draw_id) {
       }
     }
 
-    // 7) Marca draw como processado (após varrer todos)
-    await client.query("BEGIN");
-    await client.query(
-      `update public.draws set autopay_ran_at = now() where id=$1`,
-      [draw_id]
-    );
-    await client.query("COMMIT");
+    if (eligible > 0 || force) {
+      await client.query("BEGIN");
+      await client.query(
+        `update public.draws set autopay_ran_at = now() where id=$1`,
+        [draw_id]
+      );
+      await client.query("COMMIT");
+    } else {
+      warn("autopay_ran_at não atualizado (nenhum elegível)", { runTraceId, draw_id, eligible });
+    }
 
     log("RUN done", {
+      runTraceId,
       draw_id,
       eligible: profiles.length,
       totalReserved,
@@ -786,7 +964,7 @@ export async function ensureAutopayForDraw(draw_id, { force = false } = {}) {
       return { ok: true, skipped: true, reason: "already_ran" };
     }
 
-    return await runAutopayForDraw(draw_id);
+    return await runAutopayForDraw(draw_id, { force });
   } catch (e) {
     err("ensureAutopay erro", e?.message || e);
     return { ok: false, error: "ensure_failed" };

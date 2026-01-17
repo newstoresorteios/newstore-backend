@@ -160,7 +160,7 @@ function buildAuthHeader() {
  * @param {object} options - { timeoutMs }
  * @returns {Promise<object>} Resposta JSON da API
  */
-async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {}) {
+async function vindiRequestWithMeta(method, path, body = null, { timeoutMs = 30000 } = {}) {
   if (!VINDI_API_KEY) {
     const error = new Error("VINDI_API_KEY não configurado no servidor.");
     error.status = 503;
@@ -314,7 +314,34 @@ async function vindiRequest(method, path, body = null, { timeoutMs = 30000 } = {
     status: response.status,
   });
 
-  return json;
+  return { data: json, httpStatus: response.status, url };
+}
+
+async function vindiRequest(method, path, body = null, options = {}) {
+  const { data } = await vindiRequestWithMeta(method, path, body, options);
+  return data;
+}
+
+function summarizeBillBodyForLogs(body) {
+  const billItems = Array.isArray(body?.bill_items)
+    ? body.bill_items.map((it) => ({
+        product_id: it?.product_id ?? null,
+        quantity: it?.quantity ?? null,
+        description: it?.description ?? null,
+        price: it?.pricing_schema?.price ?? null,
+      }))
+    : [];
+
+  return {
+    customer_id: body?.customer_id ?? null,
+    payment_method_code: body?.payment_method_code ?? null,
+    payment_profile_id: body?.payment_profile_id
+      ? `${String(body.payment_profile_id).slice(0, 8)}...`
+      : null,
+    due_at: body?.due_at ?? null,
+    bill_items: billItems,
+    metadata: maskSensitiveData(body?.metadata ?? null),
+  };
 }
 
 /**
@@ -488,7 +515,7 @@ export async function createPaymentProfileWithCardData({
  * @param {object} params - { customerId, amount, description, metadata?, paymentProfileId, dueAt? }
  * @returns {Promise<{billId: string, status: string}>}
  */
-export async function createBill({ customerId, amount, description, metadata, paymentProfileId, dueAt, idempotencyKey }) {
+export async function createBill({ customerId, amount, description, metadata, paymentProfileId, dueAt, idempotencyKey, traceId }) {
   if (!customerId || !amount || !paymentProfileId) {
     throw new Error("customerId, amount e paymentProfileId são obrigatórios");
   }
@@ -531,8 +558,23 @@ export async function createBill({ customerId, amount, description, metadata, pa
       body.metadata.idempotency_key = idempotencyKey;
     }
 
-    const created = await vindiRequest("POST", "/bills", body);
+    log("req POST /bills", {
+      traceId,
+      method: "POST",
+      url: `${VINDI_BASE}/bills`,
+      body: summarizeBillBodyForLogs(body),
+    });
+
+    const { data: created, httpStatus } = await vindiRequestWithMeta("POST", "/bills", body);
     const bill = created.bill;
+
+    log("res POST /bills", {
+      traceId,
+      httpStatus,
+      bill_id: bill?.id ?? null,
+      bill_status: bill?.status ?? null,
+      amount: bill?.amount ?? amountDecimal,
+    });
 
     log("bill criada", {
       billId: bill?.id,
@@ -547,11 +589,16 @@ export async function createBill({ customerId, amount, description, metadata, pa
       chargeId: bill?.charges?.[0]?.id || null,
     };
   } catch (e) {
-    err("createBill falhou", {
+    err("err POST /bills", {
+      traceId,
       customerId,
       amount,
       msg: e?.message,
       status: e?.status,
+      provider_status: e?.provider_status,
+      code: e?.code,
+      response: maskSensitiveData(e?.response || null),
+      stack: e?.stack,
     });
     throw e;
   }
@@ -563,16 +610,25 @@ export async function createBill({ customerId, amount, description, metadata, pa
  * @param {string} billId
  * @returns {Promise<{chargeId: string, status: string}>}
  */
-export async function chargeBill(billId) {
+export async function chargeBill(billId, { traceId } = {}) {
   if (!billId) {
     throw new Error("billId é obrigatório");
   }
 
   try {
-    const result = await vindiRequest("POST", `/bills/${billId}/charge`, {});
+    log("req POST /bills/:id/charge", {
+      traceId,
+      method: "POST",
+      url: `${VINDI_BASE}/bills/${billId}/charge`,
+      body: {},
+    });
+
+    const { data: result, httpStatus } = await vindiRequestWithMeta("POST", `/bills/${billId}/charge`, {});
     const charge = result.charge;
 
-    log("bill cobrada", {
+    log("res POST /bills/:id/charge", {
+      traceId,
+      httpStatus,
       billId,
       chargeId: charge?.id,
       status: charge?.status,
@@ -584,10 +640,15 @@ export async function chargeBill(billId) {
       billStatus: result.bill?.status,
     };
   } catch (e) {
-    err("chargeBill falhou", {
+    err("err POST /bills/:id/charge", {
+      traceId,
       billId,
       msg: e?.message,
       status: e?.status,
+      provider_status: e?.provider_status,
+      code: e?.code,
+      response: maskSensitiveData(e?.response || null),
+      stack: e?.stack,
     });
     throw e;
   }
