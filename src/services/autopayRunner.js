@@ -585,6 +585,18 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         provider: "vindi",
       });
 
+      // Auditoria: registra SEMPRE o início da tentativa (mesmo se falhar depois)
+      // eslint-disable-next-line no-await-in-loop
+      await writeAutopayRun(client, {
+        autopay_id,
+        user_id,
+        draw_id,
+        tried_numbers: wants,
+        status: "attempt",
+        error: null,
+        provider: "vindi",
+      });
+
       if (!wants.length) {
         results.push({ user_id, status: "skipped", reason: "no_numbers" });
         continue;
@@ -649,12 +661,14 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           .join(", ")}`;
         
         // Idempotency key: "draw:{drawId}:user:{userId}"
-        const idempotencyKey = `draw:${draw_id}:user:${user_id}`;
+        const idempotencyKey = `autopay:draw:${draw_id}:user:${user_id}`;
         
         // eslint-disable-next-line no-await-in-loop
         const bill = await createBill({
           customerId: p.vindi_customer_id,
-          amount: amount_cents,
+          amount_cents_total: amount_cents,
+          price_each_cents: price_cents,
+          quantity: reservedNumbers.length,
           description,
           metadata: { user_id, draw_id, numbers: reservedNumbers, autopay_id, reservation_id: reservationId },
           paymentProfileId: p.vindi_payment_profile_id,

@@ -328,6 +328,7 @@ function summarizeBillBodyForLogs(body) {
         product_id: it?.product_id ?? null,
         quantity: it?.quantity ?? null,
         description: it?.description ?? null,
+        amount: it?.amount ?? null,
         price: it?.pricing_schema?.price ?? null,
       }))
     : [];
@@ -339,6 +340,7 @@ function summarizeBillBodyForLogs(body) {
       ? `${String(body.payment_profile_id).slice(0, 8)}...`
       : null,
     due_at: body?.due_at ?? null,
+    code: body?.code ?? null,
     bill_items: billItems,
     metadata: maskSensitiveData(body?.metadata ?? null),
   };
@@ -515,26 +517,44 @@ export async function createPaymentProfileWithCardData({
  * @param {object} params - { customerId, amount, description, metadata?, paymentProfileId, dueAt? }
  * @returns {Promise<{billId: string, status: string}>}
  */
-export async function createBill({ customerId, amount, description, metadata, paymentProfileId, dueAt, idempotencyKey, traceId }) {
-  if (!customerId || !amount || !paymentProfileId) {
-    throw new Error("customerId, amount e paymentProfileId são obrigatórios");
+export async function createBill({ customerId, amount_cents_total, price_each_cents, quantity, description, metadata, paymentProfileId, dueAt, idempotencyKey, traceId }) {
+  if (!customerId || !paymentProfileId) {
+    throw new Error("customerId e paymentProfileId são obrigatórios");
+  }
+  const q = Number(quantity);
+  if (!Number.isInteger(q) || q <= 0) {
+    throw new Error("quantity inválido (deve ser inteiro > 0)");
+  }
+
+  // ENV obrigatório: produto existente no painel Vindi
+  const rawProductId = process.env.VINDI_AUTOPAY_PRODUCT_ID;
+  const productId = Number(rawProductId);
+  if (!rawProductId || !Number.isFinite(productId) || productId <= 0) {
+    const error = new Error("VINDI_AUTOPAY_PRODUCT_ID não configurado ou inválido.");
+    error.status = 502;
+    error.code = "VINDI_CONFIG_ERROR";
+    error.provider = "VINDI";
+    throw error;
+  }
+
+  // priceEach em centavos -> reais (decimal)
+  const unitCents = Number(price_each_cents);
+  if (!Number.isFinite(unitCents) || unitCents <= 0) {
+    throw new Error("price_each_cents inválido");
   }
 
   try {
-    // Converte centavos para reais (Vindi usa decimal)
-    const amountDecimal = Number((Number(amount) / 100).toFixed(2));
+    const amountEachDecimal = Number((unitCents / 100).toFixed(2));
 
     const body = {
       customer_id: customerId,
       payment_method_code: "credit_card", // Sempre credit_card para autopay
       bill_items: [
         {
-          product_id: null, // pode ser null se não tiver produto cadastrado
+          product_id: productId,
           description: description || "Autopay",
-          quantity: 1,
-          pricing_schema: {
-            price: amountDecimal,
-          },
+          quantity: q,
+          amount: amountEachDecimal, // preço unitário (em reais) — Vindi calcula total = quantity * amount
         },
       ],
       payment_profile_id: paymentProfileId,
@@ -550,12 +570,11 @@ export async function createBill({ customerId, amount, description, metadata, pa
       body.due_at = new Date().toISOString().split("T")[0];
     }
 
-    // Idempotency: se fornecido, adiciona ao metadata
+    // Idempotência: usa campo "code" (recomendado) + mantém metadata.idempotency_key (compat)
     if (idempotencyKey) {
-      if (!body.metadata) {
-        body.metadata = {};
-      }
-      body.metadata.idempotency_key = idempotencyKey;
+      body.code = String(idempotencyKey);
+      if (!body.metadata) body.metadata = {};
+      body.metadata.idempotency_key = String(idempotencyKey);
     }
 
     log("req POST /bills", {
@@ -573,13 +592,14 @@ export async function createBill({ customerId, amount, description, metadata, pa
       httpStatus,
       bill_id: bill?.id ?? null,
       bill_status: bill?.status ?? null,
-      amount: bill?.amount ?? amountDecimal,
+      response: maskSensitiveData(created),
     });
 
     log("bill criada", {
       billId: bill?.id,
       customerId,
-      amount: amountDecimal,
+      quantity: q,
+      amount_each: amountEachDecimal,
       status: bill?.status,
     });
 
@@ -592,7 +612,9 @@ export async function createBill({ customerId, amount, description, metadata, pa
     err("err POST /bills", {
       traceId,
       customerId,
-      amount,
+      amount_cents_total: amount_cents_total ?? null,
+      price_each_cents: unitCents,
+      quantity: q,
       msg: e?.message,
       status: e?.status,
       provider_status: e?.provider_status,
