@@ -40,6 +40,24 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     const draw = ins.rows[0];
     console.log("[admin/draws/new] novo draw id =", draw.id);
 
+    // Garante tabela numbers 00..99 (runner também garante, mas aqui evita corrida inicial)
+    try {
+      await query(
+        `insert into public.numbers(draw_id, n, status, reservation_id)
+         select $1, gs::int2, 'available', null
+           from generate_series(0,99) as gs
+          where not exists (
+            select 1 from public.numbers n where n.draw_id=$1 and n.n = gs::int2
+          )`,
+        [draw.id]
+      );
+    } catch (e) {
+      console.warn("[admin/draws/new] falha ao garantir numbers 00..99 (seguindo mesmo assim)", {
+        draw_id: draw.id,
+        msg: e?.message || e,
+      });
+    }
+
     const result = await runAutopayForDraw(draw.id);
     if (!result?.ok) {
       return res.status(500).json({

@@ -907,8 +907,16 @@ router.get("/vindi/status", requireAuth, async (req, res) => {
         holder_name: null,
         doc_number: null,
         numbers: [],
-        vindi: null,
-        card: null,
+        vindi: {
+          customer_id: null,
+          payment_profile_id: null,
+          last_four: null,
+        },
+        card: {
+          has_card: false,
+          brand: null,
+          last4: null,
+        },
         requestId,
       });
     }
@@ -924,29 +932,22 @@ router.get("/vindi/status", requireAuth, async (req, res) => {
     const hasVindi = !!(p.vindi_customer_id && p.vindi_payment_profile_id);
 
     res.json({
-      active: !!p.active && hasVindi,
+      // active é o "toggle" do usuário; has_vindi indica se tem cartão configurado
+      active: !!p.active,
       has_vindi: hasVindi,
       holder_name: p.holder_name || null,
       doc_number: p.doc_number || null,
       numbers,
-      vindi: hasVindi
-        ? {
-            customer_id: p.vindi_customer_id,
-            payment_profile_id: p.vindi_payment_profile_id,
-            last_four: p.vindi_last4,
-          }
-        : null,
-      card: hasVindi
-        ? {
-            brand: p.vindi_brand || null,
-            last4: p.vindi_last4 || null,
-            has_card: true,
-          }
-        : {
-            brand: null,
-            last4: null,
-            has_card: false,
-          },
+      vindi: {
+        customer_id: p.vindi_customer_id || null,
+        payment_profile_id: p.vindi_payment_profile_id || null,
+        last_four: p.vindi_last4 || null,
+      },
+      card: {
+        has_card: hasVindi,
+        brand: p.vindi_brand || null,
+        last4: p.vindi_last4 || null,
+      },
       requestId,
     });
   } catch (e) {
@@ -959,6 +960,63 @@ router.get("/vindi/status", requireAuth, async (req, res) => {
       ok: false,
       code: "INTERNAL_ERROR",
       error_message: "Erro ao buscar status do autopay",
+      requestId,
+    });
+  }
+});
+
+/**
+ * GET /api/autopay/vindi/claimed
+ * Retorna números cativos globais (apenas perfis ativos) e números do usuário autenticado.
+ * Response: { claimed_numbers: number[], my_numbers: number[] }
+ */
+router.get("/vindi/claimed", requireAuth, async (req, res) => {
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+  const user_id = req.user?.id;
+
+  try {
+    // 1) autopay_id do usuário
+    const { rows: myProfileRows } = await query(
+      `select id from public.autopay_profiles where user_id = $1 limit 1`,
+      [user_id]
+    );
+    const myAutopayId = myProfileRows?.[0]?.id || null;
+
+    // 2) claimed_numbers globais (somente perfis ativos)
+    const { rows: claimedRows } = await query(
+      `select distinct an.n
+         from public.autopay_numbers an
+         join public.autopay_profiles ap on ap.id = an.autopay_id
+        where ap.active = true
+        order by an.n asc`
+    );
+    const claimed_numbers = claimedRows.map((r) => Number(r.n));
+
+    // 3) my_numbers
+    let my_numbers = [];
+    if (myAutopayId) {
+      const { rows: myNumberRows } = await query(
+        `select n from public.autopay_numbers where autopay_id = $1 order by n asc`,
+        [myAutopayId]
+      );
+      my_numbers = myNumberRows.map((r) => Number(r.n));
+    }
+
+    return res.json({
+      claimed_numbers,
+      my_numbers,
+      requestId,
+    });
+  } catch (e) {
+    console.error("[autopay/vindi] claimed error:", {
+      user_id,
+      requestId,
+      msg: e?.message || e,
+    });
+    return res.status(500).json({
+      ok: false,
+      code: "INTERNAL_ERROR",
+      error_message: "Erro ao buscar números cativos",
       requestId,
     });
   }
