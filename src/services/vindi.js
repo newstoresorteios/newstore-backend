@@ -587,14 +587,14 @@ export async function createBill({ customerId, amount_cents_total, quantity, des
     };
 
     // Importante: bill_items deve ser simples e validado pela Vindi.
-    // No ambiente funcionou com amount em CENTAVOS (ex: 16500) e sem campos conflitantes.
+    // Para este projeto, enviar amount em REAIS (decimal), ex: 165.00.
     const body = {
       ...baseBody,
       bill_items: [
         {
           product_id: productId,
           description: description || "Autopay",
-          amount: amountCentsInt,
+          amount: amountTotalDecimal,
         },
       ],
     };
@@ -628,6 +628,7 @@ export async function createBill({ customerId, amount_cents_total, quantity, des
       customerId,
       quantity: q,
       amount_total: amountTotalDecimal,
+      amount_cents_total: amountCentsInt,
       status: bill?.status,
       chargeId: charge0?.id ?? null,
       chargeStatus: charge0?.status ?? null,

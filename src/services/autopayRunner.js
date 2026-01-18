@@ -782,7 +782,8 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         const createdPaid =
           createdBillStatus === "paid" ||
           createdChargeStatus === "paid" ||
-          createdLastTxStatus === "success";
+          createdLastTxStatus === "success" ||
+          createdLastTxStatus === "authorized";
 
         if (createdPaid) {
           charge = { status: "approved", paymentId: chargeId || billId };
@@ -801,7 +802,8 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
             !!charge0?.paid_at ||
             billStatus === "paid" ||
             chargeStatus === "paid" ||
-            lastTxStatus === "success";
+            lastTxStatus === "success" ||
+            lastTxStatus === "authorized";
           const rejected = lastTxStatus === "rejected";
           const pending =
             billStatus === "pending" ||
@@ -815,31 +817,8 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           if (paid) {
             charge = { status: "approved", paymentId: chargeId || billId };
           } else if (pending) {
-            // pendente: mantém reserva e encerra sem rollback
-            // eslint-disable-next-line no-await-in-loop
-            await updateAutopayRunAttempt(client, {
-              attempt_trace_id: attemptTraceId,
-              status: "pending",
-              provider_bill_id: billId,
-              provider_charge_id: chargeId || charge0?.id || null,
-              provider_response: billInfo || null,
-              error_message: `pending:${billStatus || chargeStatus || lastTxStatus || "unknown"}`,
-            });
-            warn("pagamento pendente (sem rollback)", {
-              runTraceId,
-              attemptTraceId,
-              draw_id,
-              autopay_id,
-              user_id,
-              bill_id: billId,
-              charge_id: chargeId || charge0?.id || null,
-              bill_status: billStatus,
-              charge_status: chargeStatus,
-              last_transaction_status: lastTxStatus,
-              gateway_message: gatewayMessage,
-            });
-            results.push({ user_id, status: "pending", provider, billId, chargeId: chargeId || charge0?.id || null });
-            continue;
+            // pendente: não confirma pagamento => tratar como falha controlada (não segurar números)
+            throw new Error(`Pagamento pendente: ${billStatus || chargeStatus || lastTxStatus || "unknown"}`);
           } else {
             throw new Error(`Bill não paga: status=${billStatus || "unknown"}`);
           }
