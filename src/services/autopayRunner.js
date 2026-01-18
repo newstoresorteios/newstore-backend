@@ -14,77 +14,114 @@ const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ?? "");
 const err  = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ?? "");
 
 /* ------------------------------------------------------- *
- * AutopayRun upsert (compatível com UNIQUE(user_id,draw_id) se existir)
+ * Autopay Runs (1 linha por attempt_trace_id) — com CASTS explícitos
  * ------------------------------------------------------- */
-async function writeAutopayRun(client, run) {
+async function insertAutopayRunAttempt(client, run) {
   const {
+    run_trace_id,
+    attempt_trace_id,
     autopay_id,
     user_id,
     draw_id,
     tried_numbers,
-    bought_numbers = null,
-    amount_cents = null,
-    status,
-    error = null,
-    provider = "vindi",
-    payment_id = null,
     reservation_id = null,
+    provider = "vindi",
+    status,
+    amount_cents = null,
+    provider_status = null,
+    provider_bill_id = null,
+    provider_charge_id = null,
+    provider_request = null,
+    provider_response = null,
+    error_message = null,
   } = run;
 
-  try {
-    await client.query(
-      `insert into public.autopay_runs
-         (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,error,provider,payment_id,reservation_id)
-       values
-         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [
-        autopay_id,
-        user_id,
-        draw_id,
+  const providerRequestJson = provider_request != null ? JSON.stringify(provider_request) : null;
+  const providerResponseJson = provider_response != null ? JSON.stringify(provider_response) : null;
+
+  await client.query(
+    `insert into public.autopay_runs (
+        run_trace_id, attempt_trace_id,
+        autopay_id, user_id, draw_id,
         tried_numbers,
-        bought_numbers,
-        amount_cents,
-        status,
-        error,
-        provider,
-        payment_id,
         reservation_id,
-      ]
-    );
-  } catch (e) {
-    // Se existir UNIQUE(user_id, draw_id), fazemos UPDATE idempotente
-    if (e?.code === "23505") {
-      await client.query(
-        `update public.autopay_runs
-            set tried_numbers = $4,
-                bought_numbers = $5,
-                amount_cents = $6,
-                status = $7,
-                error = $8,
-                provider = $9,
-                payment_id = $10,
-                reservation_id = $11,
-                updated_at = now()
-          where user_id = $2
-            and draw_id = $3`,
-        [
-          autopay_id,
-          user_id,
-          draw_id,
-          tried_numbers,
-          bought_numbers,
-          amount_cents,
-          status,
-          error,
-          provider,
-          payment_id,
-          reservation_id,
-        ]
-      );
-      return;
-    }
-    throw e;
-  }
+        provider, status, amount_cents,
+        provider_status, provider_bill_id, provider_charge_id,
+        provider_request, provider_response,
+        error_message
+      ) values (
+        $1::uuid, $2::uuid,
+        $3::uuid, $4::int4, $5::int4,
+        $6::int2[],
+        $7::uuid,
+        $8::text, $9::text, $10::int4,
+        $11::int4, $12::text, $13::text,
+        $14::jsonb, $15::jsonb,
+        $16::text
+      )`,
+    [
+      run_trace_id,
+      attempt_trace_id,
+      autopay_id,
+      user_id,
+      draw_id,
+      tried_numbers,
+      reservation_id,
+      provider,
+      status,
+      amount_cents,
+      provider_status,
+      provider_bill_id,
+      provider_charge_id,
+      providerRequestJson,
+      providerResponseJson,
+      error_message,
+    ]
+  );
+}
+
+async function updateAutopayRunAttempt(client, run) {
+  const {
+    attempt_trace_id,
+    reservation_id = null,
+    status,
+    amount_cents = null,
+    provider_status = null,
+    provider_bill_id = null,
+    provider_charge_id = null,
+    provider_request = null,
+    provider_response = null,
+    error_message = null,
+  } = run;
+
+  const providerRequestJson = provider_request != null ? JSON.stringify(provider_request) : null;
+  const providerResponseJson = provider_response != null ? JSON.stringify(provider_response) : null;
+
+  await client.query(
+    `update public.autopay_runs
+        set reservation_id   = coalesce($2::uuid, reservation_id),
+            status           = $3::text,
+            amount_cents     = coalesce($4::int4, amount_cents),
+            provider_status  = coalesce($5::int4, provider_status),
+            provider_bill_id = coalesce($6::text, provider_bill_id),
+            provider_charge_id = coalesce($7::text, provider_charge_id),
+            provider_request = coalesce($8::jsonb, provider_request),
+            provider_response = coalesce($9::jsonb, provider_response),
+            error_message    = coalesce($10::text, error_message)
+      where attempt_trace_id = $1::uuid`,
+    [
+      attempt_trace_id,
+      reservation_id,
+      status,
+      amount_cents,
+      provider_status,
+      provider_bill_id,
+      provider_charge_id,
+      providerRequestJson,
+      providerResponseJson,
+      error_message,
+    ]
+  );
 }
 
 /* ------------------------------------------------------- *
@@ -467,17 +504,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           reason: "missingVindi",
         });
         // opcional: registrar em autopay_runs
-        if (p.user_id && p.autopay_id) {
-          await writeAutopayRun(client, {
-            autopay_id: p.autopay_id,
-            user_id: p.user_id,
-            draw_id,
-            tried_numbers: preferred,
-            status: "skipped_missing_vindi",
-            error: "missing_vindi_customer_or_payment_profile",
-            provider: "vindi",
-          });
-        }
+        // (opcional) não gravamos em autopay_runs aqui para evitar poluição fora do attempt
         continue;
       }
 
@@ -495,17 +522,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           reason: "inactive",
         });
         // opcional: registrar em autopay_runs
-        if (p.user_id && p.autopay_id) {
-          await writeAutopayRun(client, {
-            autopay_id: p.autopay_id,
-            user_id: p.user_id,
-            draw_id,
-            tried_numbers: preferred,
-            status: "skipped_inactive",
-            error: "profile_inactive",
-            provider: "vindi",
-          });
-        }
+        // (opcional) não gravamos em autopay_runs aqui para evitar poluição fora do attempt
         continue;
       }
 
@@ -520,17 +537,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           reason: "noNumbers",
         });
         // opcional: registrar em autopay_runs
-        if (p.user_id && p.autopay_id) {
-          await writeAutopayRun(client, {
-            autopay_id: p.autopay_id,
-            user_id: p.user_id,
-            draw_id,
-            tried_numbers: preferred,
-            status: "skipped_no_numbers",
-            error: "no_preferred_numbers",
-            provider: "vindi",
-          });
-        }
+        // (opcional) não gravamos em autopay_runs aqui para evitar poluição fora do attempt
         continue;
       }
 
@@ -585,16 +592,25 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         provider: "vindi",
       });
 
-      // Auditoria: registra SEMPRE o início da tentativa (mesmo se falhar depois)
+      // Auditoria: 1 registro por attempt (sempre)
       // eslint-disable-next-line no-await-in-loop
-      await writeAutopayRun(client, {
+      await insertAutopayRunAttempt(client, {
+        run_trace_id: runTraceId,
+        attempt_trace_id: attemptTraceId,
         autopay_id,
         user_id,
         draw_id,
         tried_numbers: wants,
-        status: "attempt",
-        error: null,
+        reservation_id: null,
         provider: "vindi",
+        status: "attempt",
+        amount_cents: null,
+        provider_status: null,
+        provider_bill_id: null,
+        provider_charge_id: null,
+        provider_request: null,
+        provider_response: null,
+        error_message: null,
       });
 
       if (!wants.length) {
@@ -605,7 +621,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
       // Idempotência por perfil: se já teve OK nesse draw, não reprocessa
       // eslint-disable-next-line no-await-in-loop
       const alreadyOk = await client.query(
-        `select 1 from public.autopay_runs where autopay_id=$1 and draw_id=$2 and status='ok' limit 1`,
+        `select 1 from public.autopay_runs where autopay_id=$1 and draw_id=$2 and status='charged_ok' limit 1`,
         [autopay_id, draw_id]
       );
       if (alreadyOk.rowCount) {
@@ -631,16 +647,12 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
       });
 
       if (!reservedNumbers.length || !reservationId) {
-        // registra tentativa (sem reserva) e segue
+        // atualiza attempt: não reservou nada
         // eslint-disable-next-line no-await-in-loop
-        await writeAutopayRun(client, {
-          autopay_id,
-          user_id,
-          draw_id,
-          tried_numbers: wants,
-          status: "skipped",
-          error: "none_available",
-          provider: "vindi",
+        await updateAutopayRunAttempt(client, {
+          attempt_trace_id: attemptTraceId,
+          status: "skipped_no_available",
+          error_message: "none_available",
         });
         results.push({ user_id, status: "skipped", reason: "none_available" });
         continue;
@@ -648,6 +660,15 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
 
       totalReserved += reservedNumbers.length;
       const amount_cents = reservedNumbers.length * price_cents;
+
+      // atualiza attempt: reservado
+      // eslint-disable-next-line no-await-in-loop
+      await updateAutopayRunAttempt(client, {
+        attempt_trace_id: attemptTraceId,
+        reservation_id: reservationId,
+        status: "reserved",
+        amount_cents,
+      });
 
       // 6.2) Cobrança Vindi avulsa (fora da TX do banco)
       let charge;
@@ -662,15 +683,38 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         
         // Idempotency key: "draw:{drawId}:user:{userId}"
         const idempotencyKey = `autopay:draw:${draw_id}:user:${user_id}`;
+        const amount_reais = Number((amount_cents / 100).toFixed(2));
+
+        const providerRequest = {
+          endpoint: "/bills",
+          customer_id: Number(p.vindi_customer_id),
+          payment_profile_id: Number(p.vindi_payment_profile_id),
+          code: idempotencyKey,
+          amount_cents,
+          amount_reais,
+          quantity: reservedNumbers.length,
+          numbers: reservedNumbers,
+          reservation_id: reservationId,
+          autopay_id,
+          user_id,
+          draw_id,
+        };
         
         // eslint-disable-next-line no-await-in-loop
         const bill = await createBill({
           customerId: p.vindi_customer_id,
           amount_cents_total: amount_cents,
-          price_each_cents: price_cents,
           quantity: reservedNumbers.length,
           description,
-          metadata: { user_id, draw_id, numbers: reservedNumbers, autopay_id, reservation_id: reservationId },
+          metadata: {
+            user_id,
+            draw_id,
+            numbers: reservedNumbers,
+            autopay_id,
+            reservation_id: reservationId,
+            amount_cents,
+            amount_reais,
+          },
           paymentProfileId: p.vindi_payment_profile_id,
           idempotencyKey,
           traceId: attemptTraceId,
@@ -678,6 +722,18 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
 
         billId = bill.billId;
         chargeId = bill.chargeId;
+
+        // atualiza attempt: billed (salva req/res do provider)
+        // eslint-disable-next-line no-await-in-loop
+        await updateAutopayRunAttempt(client, {
+          attempt_trace_id: attemptTraceId,
+          status: "billed",
+          provider_status: bill.httpStatus ?? null,
+          provider_bill_id: billId,
+          provider_charge_id: chargeId,
+          provider_request: providerRequest,
+          provider_response: bill.raw || null,
+        });
         log("bill created", {
           runTraceId,
           attemptTraceId,
@@ -694,6 +750,15 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           // eslint-disable-next-line no-await-in-loop
           const chargeResult = await chargeBill(billId, { traceId: attemptTraceId });
           chargeId = chargeResult.chargeId;
+
+          // eslint-disable-next-line no-await-in-loop
+          await updateAutopayRunAttempt(client, {
+            attempt_trace_id: attemptTraceId,
+            status: "charged",
+            provider_status: chargeResult.httpStatus ?? null,
+            provider_charge_id: chargeId,
+            provider_response: chargeResult.raw || null,
+          });
         }
 
         // Verifica status da bill
@@ -741,19 +806,12 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           err("falha ao cancelar reserva após charge fail", { user_id, reservationId, msg: cancelErr?.message });
         }
 
-        // audita autopay_run
+        // audita attempt: charged_fail
         // eslint-disable-next-line no-await-in-loop
-        await writeAutopayRun(client, {
-          autopay_id,
-          user_id,
-          draw_id,
-          tried_numbers: wants,
-          bought_numbers: reservedNumbers,
-          amount_cents,
-          status: "error",
-          error: emsg,
-          provider,
-          reservation_id: reservationId,
+        await updateAutopayRunAttempt(client, {
+          attempt_trace_id: attemptTraceId,
+          status: "charged_fail",
+          error_message: emsg,
         });
 
         err("falha ao cobrar Vindi", { user_id, provider, msg: emsg });
@@ -767,17 +825,10 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         // eslint-disable-next-line no-await-in-loop
         await cancelReservation(client, { draw_id, reservationId });
         // eslint-disable-next-line no-await-in-loop
-        await writeAutopayRun(client, {
-          autopay_id,
-          user_id,
-          draw_id,
-          tried_numbers: wants,
-          bought_numbers: reservedNumbers,
-          amount_cents,
-          status: "error",
-          error: "not_approved",
-          provider,
-          reservation_id: reservationId,
+        await updateAutopayRunAttempt(client, {
+          attempt_trace_id: attemptTraceId,
+          status: "charged_fail",
+          error_message: "not_approved",
         });
         warn("pagamento não aprovado", { user_id, draw_id, provider });
         results.push({ user_id, status: "error", error: "not_approved", provider });
@@ -808,17 +859,12 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         });
 
         // eslint-disable-next-line no-await-in-loop
-        await writeAutopayRun(client, {
-          autopay_id,
-          user_id,
-          draw_id,
-          tried_numbers: wants,
-          bought_numbers: reservedNumbers,
-          amount_cents,
-          status: "ok",
-          provider,
-          payment_id: fin.paymentId,
-          reservation_id: reservationId,
+        await updateAutopayRunAttempt(client, {
+          attempt_trace_id: attemptTraceId,
+          status: "charged_ok",
+          provider_bill_id: billId,
+          provider_charge_id: chargeId,
+          error_message: null,
         });
 
         chargedOk++;
@@ -858,17 +904,10 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
 
         // audita erro
         // eslint-disable-next-line no-await-in-loop
-        await writeAutopayRun(client, {
-          autopay_id,
-          user_id,
-          draw_id,
-          tried_numbers: wants,
-          bought_numbers: reservedNumbers,
-          amount_cents,
-          status: "error",
-          error: emsg,
-          provider,
-          reservation_id: reservationId,
+        await updateAutopayRunAttempt(client, {
+          attempt_trace_id: attemptTraceId,
+          status: "charged_fail",
+          error_message: emsg,
         });
 
         results.push({ user_id, status: "error", error: "persist_failed", provider });

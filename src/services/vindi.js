@@ -160,7 +160,7 @@ function buildAuthHeader() {
  * @param {object} options - { timeoutMs }
  * @returns {Promise<object>} Resposta JSON da API
  */
-async function vindiRequestWithMeta(method, path, body = null, { timeoutMs = 30000 } = {}) {
+async function vindiRequestWithMeta(method, path, body = null, { timeoutMs = 30000, traceId } = {}) {
   if (!VINDI_API_KEY) {
     const error = new Error("VINDI_API_KEY não configurado no servidor.");
     error.status = 503;
@@ -170,19 +170,16 @@ async function vindiRequestWithMeta(method, path, body = null, { timeoutMs = 300
 
   const url = `${VINDI_BASE}${path.startsWith("/") ? path : `/${path}`}`;
   
-  // Log da requisição com body mascarado
+  // Log da requisição com body mascarado (nunca loga Authorization)
   const logData = {
+    traceId,
     method,
     url,
     path,
     hasBody: body != null,
+    body: body != null ? maskSensitiveData(body) : null,
   };
-  
-  if (body != null) {
-    logData.body = maskSensitiveData(body);
-  }
-  
-  log(`chamando Vindi API: ${method} ${url}`, logData);
+  log(`req ${method} ${path}`, logData);
   
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -235,6 +232,16 @@ async function vindiRequestWithMeta(method, path, body = null, { timeoutMs = 300
     json = { raw: text };
   }
 
+  const maskedJson = maskSensitiveData(json);
+
+  // Log da resposta (mesmo em erro) para auditoria
+  log(`res ${method} ${path}`, {
+    traceId,
+    status: response.status,
+    ok: response.ok,
+    response: maskedJson,
+  });
+
   if (!response.ok) {
     const errorMsg =
       json?.errors?.[0]?.message ||
@@ -273,11 +280,12 @@ async function vindiRequestWithMeta(method, path, body = null, { timeoutMs = 300
         ? "Chave da API inválida"
         : "Falha de autenticação na Vindi (verifique VINDI_API_KEY/BASE_URL).";
       
-      err(`Vindi API auth error: ${method} ${url}`, {
-        status: response.status,
+      err(`err ${method} ${path}`, {
+        traceId,
+        provider_status: response.status,
+        code: error.code,
         error_message: errorMsg,
-        errors_count: json?.errors?.length || 0,
-        provider: "VINDI",
+        response: maskedJson,
       });
       
       throw error;
@@ -288,32 +296,29 @@ async function vindiRequestWithMeta(method, path, body = null, { timeoutMs = 300
       error.status = 502;
       error.code = "VINDI_UPSTREAM_ERROR";
       
-      err(`Vindi API error: ${method} ${url}`, {
-        status: response.status,
+      err(`err ${method} ${path}`, {
+        traceId,
+        provider_status: response.status,
+        code: error.code,
         error_message: errorMsg,
-        errors_count: json?.errors?.length || 0,
-        provider: "VINDI",
+        response: maskedJson,
       });
       
       throw error;
     }
     
     // Log do erro (sem dados sensíveis)
-    err(`Vindi API erro: ${method} ${url}`, {
-      status: response.status,
+    err(`err ${method} ${path}`, {
+      traceId,
+      provider_status: response.status,
+      code: error.code,
       error_message: errorMsg,
-      errors_count: json?.errors?.length || 0,
-      provider: "VINDI",
+      response: maskedJson,
     });
     
     throw error;
   }
   
-  // Log de sucesso
-  log(`Vindi API sucesso: ${method} ${url}`, {
-    status: response.status,
-  });
-
   return { data: json, httpStatus: response.status, url };
 }
 
@@ -517,7 +522,7 @@ export async function createPaymentProfileWithCardData({
  * @param {object} params - { customerId, amount, description, metadata?, paymentProfileId, dueAt? }
  * @returns {Promise<{billId: string, status: string}>}
  */
-export async function createBill({ customerId, amount_cents_total, price_each_cents, quantity, description, metadata, paymentProfileId, dueAt, idempotencyKey, traceId }) {
+export async function createBill({ customerId, amount_cents_total, quantity, description, metadata, paymentProfileId, dueAt, idempotencyKey, traceId }) {
   if (!customerId || !paymentProfileId) {
     throw new Error("customerId e paymentProfileId são obrigatórios");
   }
@@ -537,27 +542,27 @@ export async function createBill({ customerId, amount_cents_total, price_each_ce
     throw error;
   }
 
-  // priceEach em centavos -> reais (decimal)
-  const unitCents = Number(price_each_cents);
-  if (!Number.isFinite(unitCents) || unitCents <= 0) {
-    throw new Error("price_each_cents inválido");
+  const totalCents = Number(amount_cents_total);
+  if (!Number.isFinite(totalCents) || totalCents <= 0) {
+    throw new Error("amount_cents_total inválido");
   }
 
   try {
-    const amountEachDecimal = Number((unitCents / 100).toFixed(2));
+    // total em reais (decimal)
+    const amountTotalDecimal = Number((totalCents / 100).toFixed(2));
 
     const body = {
-      customer_id: customerId,
+      customer_id: Number(customerId),
       payment_method_code: "credit_card", // Sempre credit_card para autopay
+      payment_profile_id: Number(paymentProfileId),
       bill_items: [
         {
           product_id: productId,
           description: description || "Autopay",
-          quantity: q,
-          amount: amountEachDecimal, // preço unitário (em reais) — Vindi calcula total = quantity * amount
+          quantity: 1,
+          amount: amountTotalDecimal, // total em reais
         },
       ],
-      payment_profile_id: paymentProfileId,
     };
 
     if (metadata) {
@@ -570,12 +575,19 @@ export async function createBill({ customerId, amount_cents_total, price_each_ce
       body.due_at = new Date().toISOString().split("T")[0];
     }
 
+    // Metadata: adiciona valores de auditoria (sem dados sensíveis)
+    const meta = { ...(metadata || {}) };
+    meta.amount_cents = totalCents | 0;
+    meta.amount_reais = amountTotalDecimal;
+    meta.quantity = q;
+
     // Idempotência: usa campo "code" (recomendado) + mantém metadata.idempotency_key (compat)
     if (idempotencyKey) {
       body.code = String(idempotencyKey);
-      if (!body.metadata) body.metadata = {};
-      body.metadata.idempotency_key = String(idempotencyKey);
+      meta.idempotency_key = String(idempotencyKey);
     }
+
+    body.metadata = meta;
 
     log("req POST /bills", {
       traceId,
@@ -584,7 +596,7 @@ export async function createBill({ customerId, amount_cents_total, price_each_ce
       body: summarizeBillBodyForLogs(body),
     });
 
-    const { data: created, httpStatus } = await vindiRequestWithMeta("POST", "/bills", body);
+    const { data: created, httpStatus } = await vindiRequestWithMeta("POST", "/bills", body, { traceId });
     const bill = created.bill;
 
     log("res POST /bills", {
@@ -599,7 +611,7 @@ export async function createBill({ customerId, amount_cents_total, price_each_ce
       billId: bill?.id,
       customerId,
       quantity: q,
-      amount_each: amountEachDecimal,
+      amount_total: amountTotalDecimal,
       status: bill?.status,
     });
 
@@ -607,13 +619,15 @@ export async function createBill({ customerId, amount_cents_total, price_each_ce
       billId: bill?.id,
       status: bill?.status,
       chargeId: bill?.charges?.[0]?.id || null,
+      httpStatus,
+      raw: created,
+      request: summarizeBillBodyForLogs(body),
     };
   } catch (e) {
     err("err POST /bills", {
       traceId,
       customerId,
-      amount_cents_total: amount_cents_total ?? null,
-      price_each_cents: unitCents,
+      amount_cents_total: totalCents ?? null,
       quantity: q,
       msg: e?.message,
       status: e?.status,
@@ -645,7 +659,7 @@ export async function chargeBill(billId, { traceId } = {}) {
       body: {},
     });
 
-    const { data: result, httpStatus } = await vindiRequestWithMeta("POST", `/bills/${billId}/charge`, {});
+    const { data: result, httpStatus } = await vindiRequestWithMeta("POST", `/bills/${billId}/charge`, {}, { traceId });
     const charge = result.charge;
 
     log("res POST /bills/:id/charge", {
@@ -660,6 +674,8 @@ export async function chargeBill(billId, { traceId } = {}) {
       chargeId: charge?.id,
       status: charge?.status,
       billStatus: result.bill?.status,
+      httpStatus,
+      raw: result,
     };
   } catch (e) {
     err("err POST /bills/:id/charge", {
