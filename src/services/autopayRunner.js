@@ -786,6 +786,8 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         const emsg = String(e?.message || e);
 
         chargedFail++;
+        const providerStatus = e?.provider_status ?? e?.status ?? null;
+        const providerResp = e?.response ?? null;
 
         // Se foi Vindi e falhou, tenta refund se já cobrou (best-effort)
         if (billId && chargeId) {
@@ -800,10 +802,20 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
 
         // libera reserva
         try {
+          warn("rollback reservation", {
+            runTraceId,
+            attemptTraceId,
+            draw_id,
+            user_id,
+            autopay_id,
+            reservationId,
+            reason: "charge_fail",
+          });
           // eslint-disable-next-line no-await-in-loop
           await cancelReservation(client, { draw_id, reservationId });
+          log("rollback reservation ok", { attemptTraceId, reservationId });
         } catch (cancelErr) {
-          err("falha ao cancelar reserva após charge fail", { user_id, reservationId, msg: cancelErr?.message });
+          err("falha ao cancelar reserva após charge fail", { attemptTraceId, user_id, reservationId, msg: cancelErr?.message });
         }
 
         // audita attempt: charged_fail
@@ -811,6 +823,9 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         await updateAutopayRunAttempt(client, {
           attempt_trace_id: attemptTraceId,
           status: "charged_fail",
+          provider_status: providerStatus,
+          provider_request: providerRequest,
+          provider_response: providerResp,
           error_message: emsg,
         });
 
@@ -823,7 +838,21 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         chargedFail++;
         // libera reserva e registra
         // eslint-disable-next-line no-await-in-loop
-        await cancelReservation(client, { draw_id, reservationId });
+        try {
+          warn("rollback reservation", {
+            runTraceId,
+            attemptTraceId,
+            draw_id,
+            user_id,
+            autopay_id,
+            reservationId,
+            reason: "not_approved",
+          });
+          await cancelReservation(client, { draw_id, reservationId });
+          log("rollback reservation ok", { attemptTraceId, reservationId });
+        } catch (cancelErr) {
+          err("falha ao cancelar reserva após not_approved", { attemptTraceId, user_id, reservationId, msg: cancelErr?.message });
+        }
         // eslint-disable-next-line no-await-in-loop
         await updateAutopayRunAttempt(client, {
           attempt_trace_id: attemptTraceId,
@@ -899,8 +928,22 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         }
 
         // cancela reserva para liberar números
-        // eslint-disable-next-line no-await-in-loop
-        await cancelReservation(client, { draw_id, reservationId });
+        try {
+          warn("rollback reservation", {
+            runTraceId,
+            attemptTraceId,
+            draw_id,
+            user_id,
+            autopay_id,
+            reservationId,
+            reason: "persist_failed",
+          });
+          // eslint-disable-next-line no-await-in-loop
+          await cancelReservation(client, { draw_id, reservationId });
+          log("rollback reservation ok", { attemptTraceId, reservationId });
+        } catch (cancelErr) {
+          err("falha ao cancelar reserva após persist_failed", { attemptTraceId, user_id, reservationId, msg: cancelErr?.message });
+        }
 
         // audita erro
         // eslint-disable-next-line no-await-in-loop

@@ -34,3 +34,7 @@ VINDI_PUBLIC_KEY=
 # Método de pagamento padrão (opcional)
 # VINDI_DEFAULT_PAYMENT_METHOD=credit_card
 
+# Produto Vindi usado pelo Autopay (OBRIGATÓRIO)
+# Deve ser um product_id existente no painel da Vindi (número > 0)
+VINDI_AUTOPAY_PRODUCT_ID=
+
