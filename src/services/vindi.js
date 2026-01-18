@@ -566,8 +566,9 @@ export async function createBill({ customerId, amount_cents_total, quantity, des
   }
 
   try {
-    // total em reais (decimal)
+    // total em reais (decimal) - apenas para logs/metadata
     const amountTotalDecimal = Number((totalCents / 100).toFixed(2));
+    const amountCentsInt = Math.round(totalCents);
 
     const baseBody = {
       customer_id: Number(customerId),
@@ -577,7 +578,7 @@ export async function createBill({ customerId, amount_cents_total, quantity, des
       code: idempotencyKey ? String(idempotencyKey) : undefined,
       metadata: (() => {
         const meta = { ...(metadata || {}) };
-        meta.amount_cents = totalCents | 0;
+        meta.amount_cents = amountCentsInt;
         meta.amount_reais = amountTotalDecimal;
         meta.quantity = q;
         if (idempotencyKey) meta.idempotency_key = String(idempotencyKey);
@@ -585,109 +586,64 @@ export async function createBill({ customerId, amount_cents_total, quantity, des
       })(),
     };
 
-    // Variantes de bill_items (só avança em 422 bill_items)
-    const variants = [
-      {
-        variant: "amount_cents",
-        bill_items: [
-          { product_id: productId, description: description || "Autopay", amount: totalCents },
-        ],
-      },
-      {
-        variant: "pricing_schema",
-        bill_items: [
-          {
-            product_id: productId,
-            description: description || "Autopay",
-            quantity: q,
-            pricing_schema: { price: Number((amountTotalDecimal / q).toFixed(2)) },
-          },
-        ],
-      },
-      {
-        variant: "amount_decimal",
-        bill_items: [
-          { product_id: productId, description: description || "Autopay", amount: amountTotalDecimal },
-        ],
-      },
-      {
-        variant: "quantity_only",
-        bill_items: [
-          { product_id: productId, description: description || "Autopay", quantity: q },
-        ],
-      },
-    ];
-
-    const isBillItems422 = (e) => {
-      const ps = e?.provider_status ?? e?.status;
-      if (ps !== 422) return false;
-      const errs = e?.response?.errors;
-      if (!Array.isArray(errs)) return false;
-      return errs.some((x) => String(x?.parameter || "").toLowerCase() === "bill_items");
+    // Importante: bill_items deve ser simples e validado pela Vindi.
+    // No ambiente funcionou com amount em CENTAVOS (ex: 16500) e sem campos conflitantes.
+    const body = {
+      ...baseBody,
+      bill_items: [
+        {
+          product_id: productId,
+          description: description || "Autopay",
+          amount: amountCentsInt,
+        },
+      ],
     };
 
-    let lastErr = null;
-    for (const v of variants) {
-      const body = { ...baseBody, bill_items: v.bill_items };
+    log("req POST /bills", {
+      traceId,
+      method: "POST",
+      url: `${VINDI_BASE}/bills`,
+      body: summarizeBillBodyForLogs(body),
+    });
 
-      log("req POST /bills", {
-        traceId,
-        variant: v.variant,
-        method: "POST",
-        url: `${VINDI_BASE}/bills`,
-        body: summarizeBillBodyForLogs(body),
-      });
+    const { data: created, httpStatus } = await vindiRequestWithMeta("POST", "/bills", body, { traceId });
+    const bill = created.bill;
+    const charge0 = bill?.charges?.[0] || null;
+    const lastTx = charge0?.last_transaction || null;
 
-      try {
-        const { data: created, httpStatus } = await vindiRequestWithMeta("POST", "/bills", body, { traceId });
-        const bill = created.bill;
+    log("res POST /bills", {
+      traceId,
+      httpStatus,
+      bill_id: bill?.id ?? null,
+      bill_status: bill?.status ?? null,
+      charge_id: charge0?.id ?? null,
+      charge_status: charge0?.status ?? null,
+      last_transaction_status: lastTx?.status ?? null,
+      gateway_message: lastTx?.gateway_message ?? null,
+      response: maskSensitiveData(created),
+    });
 
-        log("res POST /bills", {
-          traceId,
-          variant: v.variant,
-          httpStatus,
-          bill_id: bill?.id ?? null,
-          bill_status: bill?.status ?? null,
-          response: maskSensitiveData(created),
-        });
+    log("bill criada", {
+      billId: bill?.id,
+      customerId,
+      quantity: q,
+      amount_total: amountTotalDecimal,
+      status: bill?.status,
+      chargeId: charge0?.id ?? null,
+      chargeStatus: charge0?.status ?? null,
+    });
 
-        log("bill criada", {
-          billId: bill?.id,
-          customerId,
-          quantity: q,
-          amount_total: amountTotalDecimal,
-          status: bill?.status,
-        });
-
-        return {
-          billId: bill?.id,
-          status: bill?.status,
-          chargeId: bill?.charges?.[0]?.id || null,
-          httpStatus,
-          raw: created,
-          request: summarizeBillBodyForLogs(body),
-          variant: v.variant,
-        };
-      } catch (e) {
-        lastErr = e;
-
-        err("err POST /bills", {
-          traceId,
-          variant: v.variant,
-          provider_status: e?.provider_status ?? e?.status ?? null,
-          code: e?.code,
-          error_message: e?.message,
-          errors: maskSensitiveData(e?.response?.errors || null),
-        });
-
-        if (isBillItems422(e)) {
-          continue;
-        }
-        throw e;
-      }
-    }
-
-    throw lastErr || new Error("Falha ao criar bill (todas variantes falharam)");
+    // Retorno padronizado para o runner tomar decisão
+    return {
+      billId: bill?.id ?? null,
+      billStatus: bill?.status ?? null,
+      chargeId: charge0?.id ?? null,
+      chargeStatus: charge0?.status ?? null,
+      lastTransactionStatus: lastTx?.status ?? null,
+      gatewayMessage: lastTx?.gateway_message ?? null,
+      httpStatus,
+      raw: maskSensitiveData(created),
+    };
 
   } catch (e) {
     err("err POST /bills", {
@@ -745,6 +701,53 @@ export async function chargeBill(billId, { traceId } = {}) {
     };
   } catch (e) {
     err("err POST /bills/:id/charge", {
+      traceId,
+      billId,
+      msg: e?.message,
+      status: e?.status,
+      provider_status: e?.provider_status,
+      code: e?.code,
+      response: maskSensitiveData(e?.response || null),
+      stack: e?.stack,
+    });
+    throw e;
+  }
+}
+
+/**
+ * Cancela uma bill (DELETE /bills/{id})
+ * Usado quando a cobrança falhou/não foi paga (não faz sentido estornar).
+ * @param {string} billId
+ * @returns {Promise<{billId: string, httpStatus?: number, raw?: any}>}
+ */
+export async function cancelBill(billId, { traceId } = {}) {
+  if (!billId) {
+    throw new Error("billId é obrigatório");
+  }
+
+  try {
+    log("req DELETE /bills/:id", {
+      traceId,
+      method: "DELETE",
+      url: `${VINDI_BASE}/bills/${billId}`,
+    });
+
+    const { data: result, httpStatus } = await vindiRequestWithMeta("DELETE", `/bills/${billId}`, {}, { traceId });
+
+    log("res DELETE /bills/:id", {
+      traceId,
+      httpStatus,
+      billId,
+      response: maskSensitiveData(result),
+    });
+
+    return {
+      billId,
+      httpStatus,
+      raw: maskSensitiveData(result),
+    };
+  } catch (e) {
+    err("err DELETE /bills/:id", {
       traceId,
       billId,
       msg: e?.message,

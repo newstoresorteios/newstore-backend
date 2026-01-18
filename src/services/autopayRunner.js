@@ -2,7 +2,7 @@
 import { getPool } from "../db.js";
 // MP desabilitado para autopay (mantido apenas para compatibilidade de imports, não usado)
 // import { mpChargeCard } from "./mercadopago.js";
-import { createBill, chargeBill, refundCharge, getBill } from "./vindi.js";
+import { createBill, chargeBill, refundCharge, getBill, cancelBill } from "./vindi.js";
 import crypto from "node:crypto";
 
 /* ------------------------------------------------------- *
@@ -12,6 +12,8 @@ const LP = "[autopayRunner]";
 const log  = (msg, extra = null) => console.log(`${LP} ${msg}`, extra ?? "");
 const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ?? "");
 const err  = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ?? "");
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /* ------------------------------------------------------- *
  * Autopay Runs (1 linha por attempt_trace_id) — com CASTS explícitos
@@ -742,12 +744,27 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           autopay_id,
           user_id,
           bill_id: billId,
-          bill_status: bill.status,
+          bill_status: bill.billStatus,
+          charge_id: bill.chargeId,
+          charge_status: bill.chargeStatus,
+          last_transaction_status: bill.lastTransactionStatus,
+          gateway_message: bill.gatewayMessage,
           amount_cents,
         });
 
-        // Se não foi cobrado automaticamente, cobra agora
-        if (!chargeId || bill.status !== "paid") {
+        const norm = (v) => String(v || "").toLowerCase();
+        const createdBillStatus = norm(bill.billStatus);
+        const createdChargeStatus = norm(bill.chargeStatus);
+        const createdLastTxStatus = norm(bill.lastTransactionStatus);
+
+        // rejected => falha imediata
+        if (createdLastTxStatus === "rejected") {
+          throw new Error(`Vindi rejected: ${bill.gatewayMessage || "rejected"}`);
+        }
+
+        // Se a criação já veio com charge/last_transaction, NÃO chamar /bills/:id/charge automaticamente.
+        // Só chama chargeBill quando não veio chargeId na criação.
+        if (!chargeId) {
           // eslint-disable-next-line no-await-in-loop
           const chargeResult = await chargeBill(billId, { traceId: attemptTraceId });
           chargeId = chargeResult.chargeId;
@@ -762,15 +779,70 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           });
         }
 
-        // Verifica status da bill
-        // eslint-disable-next-line no-await-in-loop
-        const billInfo = await getBill(billId);
-        const billStatus = billInfo?.status?.toLowerCase();
+        const createdPaid =
+          createdBillStatus === "paid" ||
+          createdChargeStatus === "paid" ||
+          createdLastTxStatus === "success";
 
-        if (billStatus === "paid") {
+        if (createdPaid) {
           charge = { status: "approved", paymentId: chargeId || billId };
         } else {
-          throw new Error(`Bill não paga: status=${billStatus}`);
+          // 1 re-check curto
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(1000);
+          // eslint-disable-next-line no-await-in-loop
+          const billInfo = await getBill(billId);
+          const billStatus = String(billInfo?.status || "").toLowerCase();
+          const charge0 = billInfo?.charges?.[0] || null;
+          const chargeStatus = String(charge0?.status || "").toLowerCase();
+          const lastTxStatus = String(charge0?.last_transaction?.status || "").toLowerCase();
+          const gatewayMessage = charge0?.last_transaction?.gateway_message || null;
+          const paid =
+            !!charge0?.paid_at ||
+            billStatus === "paid" ||
+            chargeStatus === "paid" ||
+            lastTxStatus === "success";
+          const rejected = lastTxStatus === "rejected";
+          const pending =
+            billStatus === "pending" ||
+            billStatus === "processing" ||
+            chargeStatus === "pending" ||
+            lastTxStatus === "pending";
+
+          if (rejected) {
+            throw new Error(`Vindi rejected: ${gatewayMessage || "rejected"}`);
+          }
+          if (paid) {
+            charge = { status: "approved", paymentId: chargeId || billId };
+          } else if (pending) {
+            // pendente: mantém reserva e encerra sem rollback
+            // eslint-disable-next-line no-await-in-loop
+            await updateAutopayRunAttempt(client, {
+              attempt_trace_id: attemptTraceId,
+              status: "pending",
+              provider_bill_id: billId,
+              provider_charge_id: chargeId || charge0?.id || null,
+              provider_response: billInfo || null,
+              error_message: `pending:${billStatus || chargeStatus || lastTxStatus || "unknown"}`,
+            });
+            warn("pagamento pendente (sem rollback)", {
+              runTraceId,
+              attemptTraceId,
+              draw_id,
+              autopay_id,
+              user_id,
+              bill_id: billId,
+              charge_id: chargeId || charge0?.id || null,
+              bill_status: billStatus,
+              charge_status: chargeStatus,
+              last_transaction_status: lastTxStatus,
+              gateway_message: gatewayMessage,
+            });
+            results.push({ user_id, status: "pending", provider, billId, chargeId: chargeId || charge0?.id || null });
+            continue;
+          } else {
+            throw new Error(`Bill não paga: status=${billStatus || "unknown"}`);
+          }
         }
 
         log("bill charged", {
@@ -781,7 +853,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           user_id,
           bill_id: billId,
           charge_id: chargeId,
-          bill_status: billStatus,
+          bill_status: "paid",
         });
       } catch (e) {
         const emsg = String(e?.message || e);
@@ -790,14 +862,37 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         const providerStatus = e?.provider_status ?? e?.status ?? null;
         const providerResp = e?.response ?? null;
 
-        // Se foi Vindi e falhou, tenta refund se já cobrou (best-effort)
-        if (billId && chargeId) {
+        // Provider cleanup:
+        // - Só faz REFUND se realmente houve pagamento confirmado
+        // - Se NÃO foi pago: cancela a bill (não tenta refund)
+        if (billId) {
           try {
             // eslint-disable-next-line no-await-in-loop
-            await refundCharge(chargeId, true);
-            warn("Vindi: refund executado após falha", { user_id, billId, chargeId });
-          } catch (refundErr) {
-            err("Vindi: falha ao fazer refund", { user_id, billId, chargeId, msg: refundErr?.message });
+            const billInfo = await getBill(billId);
+            const charge0 = billInfo?.charges?.[0] || null;
+            const effectiveChargeId = chargeId || charge0?.id || null;
+            const paid =
+              !!charge0?.paid_at ||
+              String(charge0?.status || "").toLowerCase() === "paid" ||
+              String(charge0?.last_transaction?.status || "").toLowerCase() === "success" ||
+              String(billInfo?.status || "").toLowerCase() === "paid";
+
+            if (paid && effectiveChargeId) {
+              // eslint-disable-next-line no-await-in-loop
+              await refundCharge(effectiveChargeId, true);
+              warn("Vindi: refund executado após falha", { user_id, billId, chargeId: effectiveChargeId });
+            } else {
+              // eslint-disable-next-line no-await-in-loop
+              await cancelBill(billId, { traceId: attemptTraceId });
+              warn("Vindi: bill cancelada após falha (sem refund)", { user_id, billId, chargeId: effectiveChargeId });
+            }
+          } catch (providerCleanupErr) {
+            err("Vindi: falha no cleanup (cancel/refund)", {
+              user_id,
+              billId,
+              chargeId,
+              msg: providerCleanupErr?.message,
+            });
           }
         }
 
@@ -917,14 +1012,30 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         const emsg = String(e?.message || e);
         err("finalize paid failed (refund+cancel)", { user_id, reservationId, msg: emsg });
 
-        // refund best-effort
-        if (chargeId) {
+        // Provider cleanup best-effort (refund só se pago; senão cancela bill)
+        if (billId || chargeId) {
           try {
             // eslint-disable-next-line no-await-in-loop
-            await refundCharge(chargeId, true);
-            warn("Vindi: refund executado após falha de persistência", { user_id, billId, chargeId });
-          } catch (refundErr) {
-            err("Vindi: falha ao fazer refund após falha de persistência", { user_id, billId, chargeId, msg: refundErr?.message });
+            const billInfo = billId ? await getBill(billId) : null;
+            const charge0 = billInfo?.charges?.[0] || null;
+            const effectiveChargeId = chargeId || charge0?.id || null;
+            const paid =
+              !!charge0?.paid_at ||
+              String(charge0?.status || "").toLowerCase() === "paid" ||
+              String(charge0?.last_transaction?.status || "").toLowerCase() === "success" ||
+              String(billInfo?.status || "").toLowerCase() === "paid";
+
+            if (paid && effectiveChargeId) {
+              // eslint-disable-next-line no-await-in-loop
+              await refundCharge(effectiveChargeId, true);
+              warn("Vindi: refund executado após falha de persistência", { user_id, billId, chargeId: effectiveChargeId });
+            } else if (billId) {
+              // eslint-disable-next-line no-await-in-loop
+              await cancelBill(billId, { traceId: attemptTraceId });
+              warn("Vindi: bill cancelada após falha de persistência (sem refund)", { user_id, billId, chargeId: effectiveChargeId });
+            }
+          } catch (providerCleanupErr) {
+            err("Vindi: falha no cleanup após persist_failed", { user_id, billId, chargeId, msg: providerCleanupErr?.message });
           }
         }
 
