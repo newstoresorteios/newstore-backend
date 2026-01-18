@@ -675,6 +675,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
       let provider = "vindi";
       let billId = null;
       let chargeId = null;
+      let providerRequest = null;
 
       try {
         const description = `Autopay draw ${draw_id} — ${reservedNumbers.length} números: ${reservedNumbers
@@ -685,7 +686,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         const idempotencyKey = `autopay:draw:${draw_id}:user:${user_id}`;
         const amount_reais = Number((amount_cents / 100).toFixed(2));
 
-        const providerRequest = {
+        providerRequest = {
           endpoint: "/bills",
           customer_id: Number(p.vindi_customer_id),
           payment_profile_id: Number(p.vindi_payment_profile_id),
