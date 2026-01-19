@@ -17,12 +17,9 @@ function fmtDate(d) {
   return `${y}-${m}-${day}`;
 }
 
-function makeUserCouponCode(userId) {
+function makeUserGiftCardCouponCode(userId) {
   const id = Number(userId || 0);
-  const base = `NSU-${String(id).padStart(4, "0")}`;
-  const salt = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const tail = salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
-  return `${base}-${tail}`;
+  return `NSU-${String(id).padStart(4, "0")}-GC`;
 }
 
 async function ensureCouponTraySyncTable() {
@@ -148,7 +145,8 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
       console.log(`[tray.coupon.ensure] user_not_found user=${uid} rid=${rid}`);
       return { ok: false, status: "USER_NOT_FOUND" };
     }
-    code = (r.rows[0].coupon_code && String(r.rows[0].coupon_code).trim()) || makeUserCouponCode(uid);
+    // Código fixo do Cartão Presente (conforme requisito)
+    code = makeUserGiftCardCouponCode(uid);
     valueCents = Number(r.rows[0].coupon_value_cents || 0);
 
     if (!r.rows[0].coupon_code) {
@@ -183,10 +181,14 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     if (v >= 3101 && v <= 4200) return 30000;
     return null;
   };
-  const minPurchase = minPurchaseForGiftCard(giftValueBRL);
+  let minPurchase = minPurchaseForGiftCard(giftValueBRL);
+  if (minPurchase == null) {
+    console.warn(`[tray.coupon.rules] WARN giftValueBRL=${giftValueBRL.toFixed(2)} fora da tabela -> value_start=30000.00`);
+    minPurchase = 30000;
+  }
 
   console.log(
-    `[tray.coupon.ensure] computed user=${uid} rid=${rid} code=${code} value=${valueCents} giftValueBRL=${giftValueBRL.toFixed(2)} minPurchase=${minPurchase ?? "null"} lastPurchaseAt=${lastPurchaseAt.toISOString()} starts=${startsAt} ends=${endsAt}`
+    `[tray.coupon.ensure] computed user=${uid} rid=${rid} code=${code} value=${valueCents} giftValueBRL=${giftValueBRL.toFixed(2)} value_start=${Number(minPurchase).toFixed(2)} lastPurchaseAt=${lastPurchaseAt.toISOString()} starts=${startsAt} ends=${endsAt} usage_counter_limit=1 usage_counter_limit_customer=1`
   );
 
   // Status tracking (best-effort)
@@ -223,6 +225,60 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     return { found: false, trayId: null };
   };
 
+  const confirmAndValidate = async (trayId, expected) => {
+    const conf = await withAbort(shortTimeoutMs, (signal) => trayGetCouponById(trayId, { signal })).catch(() => null);
+    const c = conf?.coupon || null;
+    if (!conf?.ok || !c) return { ok: false, reason: "confirm_failed", coupon: c };
+
+    const normDate = (v) => (v ? String(v).slice(0, 10) : null);
+    const normNum2 = (v) => {
+      const n = Number(String(v).replace(",", "."));
+      return Number.isFinite(n) ? n.toFixed(2) : null;
+    };
+
+    const got = {
+      starts_at: normDate(c.starts_at),
+      ends_at: normDate(c.ends_at),
+      value: normNum2(c.value),
+      value_start: normNum2(c.value_start),
+      usage_counter_limit: String(c.usage_counter_limit || ""),
+      usage_counter_limit_customer: String(c.usage_counter_limit_customer || ""),
+    };
+
+    const exp = {
+      starts_at: expected.startsAt,
+      ends_at: expected.endsAt,
+      value: Number(expected.valueBRL).toFixed(2),
+      value_start: Number(expected.valueStartBRL).toFixed(2),
+      usage_counter_limit: "1",
+      usage_counter_limit_customer: "1",
+    };
+
+    console.log("[tray.coupon.confirm]", {
+      id: String(trayId),
+      ok: true,
+      starts: got.starts_at,
+      ends: got.ends_at,
+      value: got.value,
+      value_start: got.value_start,
+      usage_counter_limit: got.usage_counter_limit,
+      usage_counter_limit_customer: got.usage_counter_limit_customer,
+    });
+
+    const matches =
+      got.starts_at === exp.starts_at &&
+      got.ends_at === exp.ends_at &&
+      got.value === exp.value &&
+      got.value_start === exp.value_start &&
+      got.usage_counter_limit === exp.usage_counter_limit &&
+      got.usage_counter_limit_customer === exp.usage_counter_limit_customer;
+
+    if (!matches) {
+      console.warn("[tray.coupon.confirm] WARN mismatch", { expected: exp, got });
+    }
+    return { ok: matches, reason: matches ? null : "mismatch", coupon: c, expected: exp, got };
+  };
+
   try {
     // 1) token (se faltar bootstrap, não falhar UX)
     try {
@@ -249,12 +305,15 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
       const existingStarts = found?.coupon?.starts_at || null;
       const existingEnds = found?.coupon?.ends_at || null;
       const existingValue = found?.coupon?.value || null;
+      const existingValueStart = found?.coupon?.value_start || null;
       const desiredValue = giftValueBRL.toFixed(2);
+      const desiredValueStart = Number(minPurchase).toFixed(2);
 
       const needsUpdate =
         (existingStarts && existingStarts !== startsAt) ||
         (existingEnds && existingEnds !== endsAt) ||
-        (existingValue && String(existingValue) !== desiredValue);
+        (existingValue && String(existingValue) !== desiredValue) ||
+        (existingValueStart && String(existingValueStart) !== desiredValueStart);
 
       if (!needsUpdate) {
         console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=exists trayId=${trayId || ""}`);
@@ -290,11 +349,24 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
         return { ok: true, status: "FAILED", action: "failed", code };
       }
 
-      console.log(`[tray.coupon.update.resp] user=${uid} rid=${rid} status=${updated?.status ?? ""} id=${trayId}`);
-      await withAbort(shortTimeoutMs, (signal) => trayGetCouponById(trayId, { signal })).catch(() => null);
-      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=updated trayId=${trayId || ""}`);
-      await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
-      return { ok: true, status: "SYNCED", action: "updated", code, trayId };
+      console.log(`[tray.coupon.update.resp] user=${uid} rid=${rid} status=${updated?.status ?? ""} ok=${!!updated?.ok} id=${trayId}`);
+
+      // Confirmar e validar regras antes de marcar updated
+      const conf = await confirmAndValidate(trayId, {
+        startsAt,
+        endsAt,
+        valueBRL: giftValueBRL,
+        valueStartBRL: minPurchase,
+      });
+      if (updated?.ok || conf.ok) {
+        console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=updated trayId=${trayId || ""}`);
+        await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
+        return { ok: true, status: "SYNCED", action: "updated", code, trayId };
+      }
+
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=failed status=update_not_confirmed`);
+      await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "update_not_confirmed", trayCouponId: trayId, syncedAt: null }).catch(() => {});
+      return { ok: true, status: "FAILED", action: "failed", code };
     }
 
     // 3) create
@@ -331,11 +403,20 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     const trayId = created?.id ?? null;
     if (trayId) {
       console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=created trayId=${trayId || ""}`);
-      // (6) confirmar via GET /discount_coupons/:id
-      await withAbort(shortTimeoutMs, (signal) => trayGetCouponById(trayId, { signal })).catch(() => null);
-      console.log(`[tray.coupon.confirm] user=${uid} rid=${rid} id=${trayId} ok=true`);
-      await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
-      return { ok: true, status: "SYNCED", action: "created", code, trayId };
+      const conf = await confirmAndValidate(trayId, {
+        startsAt,
+        endsAt,
+        valueBRL: giftValueBRL,
+        valueStartBRL: minPurchase,
+      });
+      if (conf.ok) {
+        await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
+        return { ok: true, status: "SYNCED", action: "created", code, trayId };
+      }
+
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=failed status=create_not_confirmed`);
+      await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "create_not_confirmed", trayCouponId: trayId, syncedAt: null }).catch(() => {});
+      return { ok: true, status: "FAILED", action: "failed", code };
     }
 
     // Sem id: confirma por GET antes de falhar
