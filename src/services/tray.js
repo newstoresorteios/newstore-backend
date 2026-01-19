@@ -295,9 +295,13 @@ function extractCouponsList(body) {
 
 function normalizeCoupon(c) {
   const obj = c?.DiscountCoupon && typeof c.DiscountCoupon === "object" ? c.DiscountCoupon : c;
+  const normDate = (v) => (v ? String(v).slice(0, 10) : null);
   return {
     id: obj?.id ?? null,
     code: obj?.code ?? null,
+    starts_at: normDate(obj?.starts_at ?? obj?.startsAt ?? null),
+    ends_at: normDate(obj?.ends_at ?? obj?.endsAt ?? null),
+    value: obj?.value != null ? String(obj.value) : null,
     raw: obj || c,
   };
 }
@@ -388,13 +392,29 @@ async function createCouponWithType(params, typeValue) {
 
   const maskUrlToken = (u) => String(u).replace(/(access_token=)[^&]+/i, (_m, p1) => `${p1}${String(token).slice(0, 8)}…`);
 
+  // TABELA: Cartão Presente -> mínimo de compra permitido (value_start)
+  function minPurchaseForGiftCard(giftValueBRL) {
+    const v = Number(giftValueBRL);
+    if (!Number.isFinite(v)) return null;
+    if (v >= 50 && v <= 250) return 1500;
+    if (v >= 251 && v <= 600) return 3500;
+    if (v >= 601 && v <= 800) return 5500;
+    if (v >= 801 && v <= 1100) return 7500;
+    if (v >= 1101 && v <= 2100) return 15000;
+    if (v >= 2101 && v <= 3100) return 22500;
+    if (v >= 3101 && v <= 4200) return 30000;
+    return null;
+  }
+
   const buildCouponBody = (style) => {
     const p = new URLSearchParams();
     const code = String(params.code);
     const description = String(params.description || `Cupom ${params.code}`);
     const startsAt = String(params.startsAt);
     const endsAt = String(params.endsAt);
-    const value = Number(params.value || 0).toFixed(2);
+    const giftValueBRL = Number(params.value || 0);
+    const value = Number(giftValueBRL || 0).toFixed(2);
+    const minPurchase = minPurchaseForGiftCard(giftValueBRL);
 
     // Doc: keys no formato ["DiscountCoupon"]["campo"]
     const k = (field) => (style === "doc" ? `["DiscountCoupon"]["${field}"]` : `DiscountCoupon[${field}]`);
@@ -406,9 +426,15 @@ async function createCouponWithType(params, typeValue) {
     p.append(k("value"), value);
     p.append(k("type"), typeValue); // somente "$" ou "%"
 
-    // Campos opcionais (enviar vazio = sem limite)
-    p.append(k("value_start"), "");
-    p.append(k("value_end"), "");
+    // Regras: value_start de acordo com tabela (mínimo de compra permitido)
+    if (minPurchase != null) {
+      p.append(k("value_start"), Number(minPurchase).toFixed(2));
+      p.append(k("value_end"), "");
+    } else {
+      console.log(`[tray.coupon.rules] WARN giftValueBRL=${giftValueBRL} fora da tabela, value_start=empty`);
+      p.append(k("value_start"), "");
+      p.append(k("value_end"), "");
+    }
 
     // Se quiser 1 uso por cliente, alinhar os dois:
     p.append(k("usage_sum_limit"), "");
@@ -430,6 +456,19 @@ async function createCouponWithType(params, typeValue) {
   const send = async (style) => {
     const body = buildCouponBody(style);
     const bodyStr = body.toString();
+    const giftValueBRL = Number(params.value || 0);
+    const minPurchase = minPurchaseForGiftCard(giftValueBRL);
+    const valueStart = minPurchase != null ? Number(minPurchase).toFixed(2) : "";
+    console.log("[tray.coupon.create.req.meta]", {
+      code: String(params.code),
+      giftValueBRL: Number.isFinite(giftValueBRL) ? Number(giftValueBRL.toFixed(2)) : null,
+      minPurchase,
+      value_start: valueStart,
+      usage_counter_limit: 1,
+      usage_counter_limit_customer: 1,
+      cumulative_discount: 1,
+      type: typeValue,
+    });
     console.log("[tray.coupon.create.req]", {
       url: maskUrlToken(url),
       style,
@@ -505,11 +544,68 @@ export async function trayGetCouponById(id, { signal } = {}) {
   const parsed = await readBodySafe(r);
   const j = parsed?.body || null;
   const gotId = j?.DiscountCoupon?.id ?? j?.discount_coupon?.id ?? null;
+  const gotCode = j?.DiscountCoupon?.code ?? j?.discount_coupon?.code ?? null;
   const ok = r.ok && !!gotId;
   const keys = j && typeof j === "object" ? Object.keys(j) : [];
-  console.log("[tray.coupon.confirm]", { id: String(id), ok, status: r.status, hasId: !!gotId, keys });
+  console.log("[tray.coupon.confirm]", { id: String(id), ok, status: r.status, hasId: !!gotId, code: gotCode || null, keys });
   if (!ok) console.log("[tray.coupon.confirm.body]", j && typeof j === "object" ? j : { body: j });
   return { ok, status: r.status, body: j };
+}
+
+export async function trayUpdateCouponById(id, { startsAt, endsAt, valueBRL, minPurchaseBRL = null, description = null, signal } = {}) {
+  if (!id) throw new Error("tray_coupon_id_missing");
+  const token = await trayToken({ signal });
+  const apiBase = await getTrayApiBase();
+  const url = `${apiBase}/discount_coupons/${encodeURIComponent(id)}/?access_token=${encodeURIComponent(token)}`;
+  const urlMasked = String(url).replace(/(access_token=)[^&]+/i, (_m, p1) => `${p1}${String(token).slice(0, 8)}…`);
+
+  const payload = new URLSearchParams();
+  payload.append('["DiscountCoupon"]["starts_at"]', String(startsAt));
+  payload.append('["DiscountCoupon"]["ends_at"]', String(endsAt));
+  payload.append('["DiscountCoupon"]["value"]', Number(valueBRL || 0).toFixed(2));
+  payload.append('["DiscountCoupon"]["type"]', "$");
+  payload.append('["DiscountCoupon"]["description"]', String(description || ""));
+
+  if (minPurchaseBRL != null) {
+    payload.append('["DiscountCoupon"]["value_start"]', Number(minPurchaseBRL).toFixed(2));
+    payload.append('["DiscountCoupon"]["value_end"]', "");
+  } else {
+    payload.append('["DiscountCoupon"]["value_start"]', "");
+    payload.append('["DiscountCoupon"]["value_end"]', "");
+  }
+
+  payload.append('["DiscountCoupon"]["usage_sum_limit"]', "");
+  payload.append('["DiscountCoupon"]["usage_counter_limit"]', "1");
+  payload.append('["DiscountCoupon"]["usage_counter_limit_customer"]', "1");
+  payload.append('["DiscountCoupon"]["cumulative_discount"]', "1");
+
+  const bodyStr = payload.toString();
+  console.log("[tray.coupon.update]", {
+    id: String(id),
+    url: urlMasked,
+    starts: String(startsAt),
+    ends: String(endsAt),
+    value: Number(valueBRL || 0).toFixed(2),
+    value_start: minPurchaseBRL != null ? Number(minPurchaseBRL).toFixed(2) : "",
+  });
+  console.log("[tray.coupon.update.req]", { body: bodyStr });
+
+  const r = await fetchWithRetry(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+    body: bodyStr,
+    signal,
+  }, { label: "tray.coupon.update" });
+
+  const parsed = await readBodySafe(r);
+  const j = parsed?.body || null;
+  const gotId = j?.DiscountCoupon?.id ?? j?.discount_coupon?.id ?? null;
+  const hasId = !!gotId;
+  const keys = j && typeof j === "object" ? Object.keys(j) : [];
+  console.log("[tray.coupon.update.resp]", { status: r.status, hasId, id: gotId || null, keys });
+  if (!hasId) console.log("[tray.coupon.update.resp.body]", j && typeof j === "object" ? j : { body: j });
+
+  return { ok: r.ok && hasId, status: r.status, body: j, id: gotId || null };
 }
 export async function trayDeleteCoupon(id) {
   if (!id) return;

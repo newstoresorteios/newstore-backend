@@ -6,7 +6,7 @@
 // - Idempotente por code (find antes de create)
 
 import { query } from "../db.js";
-import { trayToken, trayFindCouponByCode, trayCreateCoupon, trayGetCouponById } from "./tray.js";
+import { trayToken, trayFindCouponByCode, trayCreateCoupon, trayGetCouponById, trayUpdateCouponById } from "./tray.js";
 
 const VALID_DAYS = Number(process.env.TRAY_COUPON_VALID_DAYS || 180);
 
@@ -78,6 +78,52 @@ function normalizeErrForLog(e) {
   };
 }
 
+function addMonthsClamped(date, months) {
+  const d = new Date(date.getTime());
+  const day = d.getUTCDate();
+  // move to first day to avoid overflow
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth();
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(day, lastDay));
+  return d;
+}
+
+async function hasColumn(table, column, schema = "public") {
+  const { rows } = await query(
+    `SELECT 1
+       FROM information_schema.columns
+      WHERE table_schema=$1 AND table_name=$2 AND column_name=$3
+      LIMIT 1`,
+    [schema, table, column]
+  );
+  return !!rows.length;
+}
+
+async function getUserLastApprovedPurchaseDate(userId) {
+  // status real do sistema (ampliado)
+  const statuses = ["approved", "paid", "pago", "completed"];
+  const parts = [];
+  if (await hasColumn("payments", "paid_at")) parts.push("COALESCE(paid_at, to_timestamp(0))");
+  if (await hasColumn("payments", "approved_at")) parts.push("COALESCE(approved_at, to_timestamp(0))");
+  parts.push("COALESCE(created_at, to_timestamp(0))");
+  const tExpr = parts.length === 1 ? parts[0] : `GREATEST(${Array.from(new Set(parts)).join(", ")})`;
+
+  const r = await query(
+    `select ${tExpr} as t
+       from payments
+      where user_id=$1
+        and lower(status) = any($2::text[])
+      order by ${tExpr} desc
+      limit 1`,
+    [Number(userId), statuses]
+  );
+  const t = r.rows?.[0]?.t || null;
+  return t ? new Date(t) : null;
+}
+
 /**
  * ensureTrayCouponForUser(userId)
  * - Sempre retorna rapidamente e nunca joga erro para o caller (best-effort)
@@ -115,11 +161,32 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     return { ok: false, status: "USER_LOAD_FAILED" };
   }
 
-  const startsAt = fmtDate(new Date());
-  const endsAt = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
+  // REGRAS NOVAS: starts_at = última compra aprovada; ends_at = starts + 6 meses
+  const lastPurchaseAt = await getUserLastApprovedPurchaseDate(uid).catch(() => null);
+  console.log(`[tray.coupon.ensure] lastPurchase user=${uid} rid=${rid} lastPurchaseAt=${lastPurchaseAt ? lastPurchaseAt.toISOString() : "null"}`);
+  if (!lastPurchaseAt) {
+    console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} action=no_purchase`);
+    return { ok: true, status: "NO_PURCHASE", action: "no_purchase", code };
+  }
+
+  const startsAt = fmtDate(lastPurchaseAt);
+  const endsAt = fmtDate(addMonthsClamped(lastPurchaseAt, 6));
+  const giftValueBRL = Number((valueCents / 100).toFixed(2));
+  const minPurchaseForGiftCard = (v) => {
+    if (!Number.isFinite(v)) return null;
+    if (v >= 50 && v <= 250) return 1500;
+    if (v >= 251 && v <= 600) return 3500;
+    if (v >= 601 && v <= 800) return 5500;
+    if (v >= 801 && v <= 1100) return 7500;
+    if (v >= 1101 && v <= 2100) return 15000;
+    if (v >= 2101 && v <= 3100) return 22500;
+    if (v >= 3101 && v <= 4200) return 30000;
+    return null;
+  };
+  const minPurchase = minPurchaseForGiftCard(giftValueBRL);
 
   console.log(
-    `[tray.coupon.ensure] computed user=${uid} rid=${rid} code=${code} value=${valueCents} starts=${startsAt} ends=${endsAt}`
+    `[tray.coupon.ensure] computed user=${uid} rid=${rid} code=${code} value=${valueCents} giftValueBRL=${giftValueBRL.toFixed(2)} minPurchase=${minPurchase ?? "null"} lastPurchaseAt=${lastPurchaseAt.toISOString()} starts=${startsAt} ends=${endsAt}`
   );
 
   // Status tracking (best-effort)
@@ -179,9 +246,55 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     const found = await withAbort(shortTimeoutMs, (signal) => trayFindCouponByCode(code, { maxPages: 3, signal }));
     if (found?.found) {
       const trayId = found?.coupon?.id ?? null;
-      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=already_exists trayId=${trayId || ""}`);
+      const existingStarts = found?.coupon?.starts_at || null;
+      const existingEnds = found?.coupon?.ends_at || null;
+      const existingValue = found?.coupon?.value || null;
+      const desiredValue = giftValueBRL.toFixed(2);
+
+      const needsUpdate =
+        (existingStarts && existingStarts !== startsAt) ||
+        (existingEnds && existingEnds !== endsAt) ||
+        (existingValue && String(existingValue) !== desiredValue);
+
+      if (!needsUpdate) {
+        console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=exists trayId=${trayId || ""}`);
+        await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
+        return { ok: true, status: "SYNCED", action: "exists", code, trayId };
+      }
+
+      console.log(`[tray.coupon.update] user=${uid} rid=${rid} id=${trayId} code=${code} starts=${startsAt} ends=${endsAt} value=${desiredValue} value_start=${minPurchase != null ? Number(minPurchase).toFixed(2) : ""}`);
+      let updated = null;
+      try {
+        updated = await withAbort(createTimeoutMs, (signal) =>
+          trayUpdateCouponById(trayId, {
+            startsAt,
+            endsAt,
+            valueBRL: giftValueBRL,
+            minPurchaseBRL: minPurchase,
+            description: `Crédito do cliente ${uid} - New Store`,
+            signal,
+          })
+        );
+      } catch (e) {
+        const aborted = e?.name === "AbortError" || String(e?.message || "").includes("timeout");
+        if (!aborted) throw e;
+        console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=update_timeout_confirming`);
+        const confirmed = await pollFindAfterTimeout();
+        if (confirmed.found) {
+          console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=updated_confirmed_after_timeout trayId=${confirmed.trayId || ""}`);
+          await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: confirmed.trayId, syncedAt: new Date().toISOString() }).catch(() => {});
+          return { ok: true, status: "SYNCED", action: "updated_confirmed_after_timeout", code, trayId: confirmed.trayId };
+        }
+        console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=failed status=update_timeout_not_confirmed`);
+        await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "update_timeout_not_confirmed", trayCouponId: trayId, syncedAt: null }).catch(() => {});
+        return { ok: true, status: "FAILED", action: "failed", code };
+      }
+
+      console.log(`[tray.coupon.update.resp] user=${uid} rid=${rid} status=${updated?.status ?? ""} id=${trayId}`);
+      await withAbort(shortTimeoutMs, (signal) => trayGetCouponById(trayId, { signal })).catch(() => null);
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=updated trayId=${trayId || ""}`);
       await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
-      return { ok: true, status: "SYNCED", action: "already_exists", code, trayId };
+      return { ok: true, status: "SYNCED", action: "updated", code, trayId };
     }
 
     // 3) create
