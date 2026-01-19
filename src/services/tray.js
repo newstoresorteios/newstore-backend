@@ -302,14 +302,47 @@ function normalizeCoupon(c) {
   };
 }
 
+function getPagingInfo(body) {
+  const paging = body?.paging || body?.Paging || body?.pagination || null;
+  const total = Number(paging?.total ?? paging?.Total ?? paging?.total_count ?? paging?.count ?? NaN);
+  const limit = Number(paging?.limit ?? paging?.Limit ?? paging?.per_page ?? paging?.page_size ?? 50);
+  const safeLimit = Number.isFinite(limit) && limit > 0 ? limit : 50;
+  const safeTotal = Number.isFinite(total) && total >= 0 ? total : null;
+  const lastPage = safeTotal != null ? Math.max(1, Math.ceil(safeTotal / safeLimit)) : null;
+  return { total: safeTotal, limit: safeLimit, lastPage };
+}
+
 export async function trayFindCouponByCode(code, { maxPages = 5, signal } = {}) {
   const token = await trayToken({ signal });
   const target = String(code || "").trim();
   if (!target) return { found: false, coupon: null };
 
-  for (let page = 1; page <= maxPages; page++) {
-    const apiBase = await getTrayApiBase();
-    const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}&page=${page}`;
+  // A Tray costuma ordenar por id ASC -> cupons novos ficam no final.
+  // Então buscamos nas ÚLTIMAS páginas (até 3 páginas), mas antes pegamos paging via page=1.
+  const apiBase = await getTrayApiBase();
+  const firstUrl = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}&limit=50&page=1`;
+  const r0 = await fetchWithRetry(firstUrl, { method: "GET", signal }, { label: "tray.coupon.find" });
+  const parsed0 = await readBodySafe(r0);
+  const body0 = parsed0?.body || null;
+  if (!r0.ok) {
+    err("[tray.coupon.find] fail", { code: target, page: 1, status: r0.status, body: body0 });
+    throw new Error("tray_coupon_find_failed");
+  }
+
+  const paging0 = getPagingInfo(body0);
+  const fallbackLast = Math.max(1, maxPages);
+  const lastPage = paging0.lastPage || fallbackLast;
+
+  const pagesToTry = [];
+  for (let i = 0; i < 3; i++) {
+    const p = lastPage - i;
+    if (p >= 1) pagesToTry.push(p);
+  }
+  // Se lastPage < 3, garante page=1 no conjunto
+  if (!pagesToTry.includes(1)) pagesToTry.push(1);
+
+  for (const page of Array.from(new Set(pagesToTry)).sort((a, b) => b - a)) {
+    const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}&limit=50&page=${page}`;
     const r = await fetchWithRetry(url, { method: "GET", signal }, { label: "tray.coupon.find" });
     const parsed = await readBodySafe(r);
     const body = parsed?.body || null;
@@ -317,12 +350,22 @@ export async function trayFindCouponByCode(code, { maxPages = 5, signal } = {}) 
       err("[tray.coupon.find] fail", { code: target, page, status: r.status, body });
       throw new Error("tray_coupon_find_failed");
     }
+
+    const paging = getPagingInfo(body);
     const list = extractCouponsList(body);
     const normalized = list.map(normalizeCoupon);
     const hit = normalized.find((x) => String(x?.code || "").trim() === target);
-    dbg("[tray.coupon.find]", { code: target, page, found: !!hit, count: normalized.length });
+
+    console.log("[tray.coupon.find]", {
+      code: target,
+      page,
+      found: !!hit,
+      count: normalized.length,
+      total: paging.total ?? paging0.total ?? null,
+      lastPage: paging.lastPage ?? paging0.lastPage ?? null,
+    });
+
     if (hit) return { found: true, coupon: hit };
-    // Heurística: se veio vazio, não tem mais páginas.
     if (!normalized.length) break;
   }
   return { found: false, coupon: null };
@@ -344,19 +387,20 @@ async function createCouponWithType(params, typeValue) {
   const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
 
   const body = new URLSearchParams();
-  body.append("DiscountCoupon[code]", String(params.code));
-  body.append("DiscountCoupon[description]", String(params.description || `Cupom ${params.code}`));
-  body.append("DiscountCoupon[starts_at]", String(params.startsAt)); // YYYY-MM-DD
-  body.append("DiscountCoupon[ends_at]",   String(params.endsAt));   // YYYY-MM-DD
-  body.append("DiscountCoupon[value]",     Number(params.value || 0).toFixed(2));
-  body.append("DiscountCoupon[type]",      typeValue);
+  // Doc oficial: ["DiscountCoupon"]["field"]
+  body.append('["DiscountCoupon"]["code"]', String(params.code));
+  body.append('["DiscountCoupon"]["description"]', String(params.description || `Cupom ${params.code}`));
+  body.append('["DiscountCoupon"]["starts_at"]', String(params.startsAt)); // YYYY-MM-DD
+  body.append('["DiscountCoupon"]["ends_at"]',   String(params.endsAt));   // YYYY-MM-DD
+  body.append('["DiscountCoupon"]["value"]',     Number(params.value || 0).toFixed(2));
+  body.append('["DiscountCoupon"]["type"]',      typeValue);
 
   // limites para o checkout reconhecer o valor (e não estourar o saldo)
   const money = Number(params.value || 0).toFixed(2);
-  body.append("DiscountCoupon[usage_sum_limit]", money);
-  body.append("DiscountCoupon[usage_counter_limit]", "1");
-  body.append("DiscountCoupon[usage_counter_limit_customer]", "1");
-  body.append("DiscountCoupon[cumulative_discount]", "1");
+  body.append('["DiscountCoupon"]["usage_sum_limit"]', money);
+  body.append('["DiscountCoupon"]["usage_counter_limit"]', "1");
+  body.append('["DiscountCoupon"]["usage_counter_limit_customer"]', "1");
+  body.append('["DiscountCoupon"]["cumulative_discount"]', "1");
 
   dbg("[tray.coupon.create]", {
     code: String(params.code),
@@ -375,13 +419,17 @@ async function createCouponWithType(params, typeValue) {
 
   const parsed = await readBodySafe(r);
   const j = parsed?.body || null;
-  if (!r.ok) {
-    err("[tray.create] fail", { status: r.status, body: j });
-  } else {
-    dbg("[tray.create] resp", { status: r.status, bodyKeys: j ? Object.keys(j) : [] });
+  const id = j?.DiscountCoupon?.id ?? j?.discount_coupon?.id ?? null;
+  const hasId = !!id;
+  const keys = j && typeof j === "object" ? Object.keys(j) : [];
+  console.log("[tray.coupon.create.resp]", { status: r.status, hasId, id: id || null, keys });
+  if (!hasId) {
+    // body resumido para auditoria (sem tokens)
+    console.log("[tray.coupon.create.resp.body]", j && typeof j === "object" ? j : { body: j });
   }
+  if (!r.ok) err("[tray.create] fail", { status: r.status, body: j });
 
-  return { ok: r.ok && !!j?.DiscountCoupon?.id, status: r.status, body: j };
+  return { ok: r.ok && hasId, status: r.status, body: j };
 }
 
 export async function trayCreateCoupon({ code, value, startsAt, endsAt, description, signal } = {}) {

@@ -127,15 +127,39 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     await upsertCouponTraySync({ userId: uid, code, status: "PENDING", lastError: null, trayCouponId: null, syncedAt: null });
   } catch {}
 
-  // Timeout + AbortSignal compartilhado para token/find/create
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(new Error("timeout")), Math.max(100, timeoutMs));
-  const signal = controller.signal;
+  const shortTimeoutMs = Math.max(1000, Number(timeoutMs || 5000)); // token/find
+  const createTimeoutMs = 20_000; // (2) obrigatório: POST cupom 20s
+  const pollMaxMs = 25_000; // (3) obrigatório: polling até 25s
+
+  const withAbort = async (ms, fn) => {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(new Error("timeout")), ms);
+    try {
+      return await fn(c.signal);
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  const pollFindAfterTimeout = async () => {
+    const started = Date.now();
+    const maxAttempts = 5;
+    for (let i = 0; i < maxAttempts; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, i === 0 ? 0 : 5000));
+      // eslint-disable-next-line no-await-in-loop
+      const found = await withAbort(shortTimeoutMs, (signal) => trayFindCouponByCode(code, { maxPages: 3, signal })).catch(() => null);
+      const trayId = found?.coupon?.id ?? null;
+      if (found?.found) return { found: true, trayId };
+      if (Date.now() - started > pollMaxMs) break;
+    }
+    return { found: false, trayId: null };
+  };
 
   try {
     // 1) token (se faltar bootstrap, não falhar UX)
     try {
-      await trayToken({ signal });
+      await withAbort(shortTimeoutMs, (signal) => trayToken({ signal }));
     } catch (e) {
       if (String(e?.message || "").includes("tray_no_refresh_and_no_code")) {
         const flags = authFlagsFromEnv();
@@ -152,7 +176,7 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     }
 
     // 2) find (idempotência)
-    const found = await trayFindCouponByCode(code, { maxPages: 3, signal });
+    const found = await withAbort(shortTimeoutMs, (signal) => trayFindCouponByCode(code, { maxPages: 3, signal }));
     if (found?.found) {
       const trayId = found?.coupon?.id ?? null;
       console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=already_exists trayId=${trayId || ""}`);
@@ -162,26 +186,62 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
 
     // 3) create
     console.log(`[tray.coupon.create] user=${uid} rid=${rid} code=${code} value=${valueCents} starts=${startsAt} ends=${endsAt}`);
-    const created = await trayCreateCoupon({
-      code,
-      value: valueCents / 100,
-      startsAt,
-      endsAt,
-      description: `Crédito do cliente ${uid} - New Store`,
-      signal,
-    });
+    let created = null;
+    try {
+      created = await withAbort(createTimeoutMs, (signal) =>
+        trayCreateCoupon({
+          code,
+          value: valueCents / 100,
+          startsAt,
+          endsAt,
+          description: `Crédito do cliente ${uid} - New Store`,
+          signal,
+        })
+      );
+    } catch (e) {
+      const aborted = e?.name === "AbortError" || String(e?.message || "").includes("timeout");
+      if (!aborted) throw e;
+
+      // (3) obrigatório: não finalizar com timeout sem confirmar via GET
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=create_timeout_confirming`);
+      const confirmed = await pollFindAfterTimeout();
+      if (confirmed.found) {
+        console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=created_confirmed_after_timeout trayId=${confirmed.trayId || ""}`);
+        await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: confirmed.trayId, syncedAt: new Date().toISOString() }).catch(() => {});
+        return { ok: true, status: "SYNCED", action: "created_confirmed_after_timeout", code, trayId: confirmed.trayId };
+      }
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=failed status=timeout_not_confirmed`);
+      await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "timeout_not_confirmed", trayCouponId: null, syncedAt: null }).catch(() => {});
+      return { ok: true, status: "FAILED", action: "failed", code };
+    }
 
     const trayId = created?.id ?? null;
-    console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=created trayId=${trayId || ""}`);
-    await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
-    return { ok: true, status: "SYNCED", action: "created", code, trayId };
+    if (trayId) {
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=created trayId=${trayId || ""}`);
+      await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
+      return { ok: true, status: "SYNCED", action: "created", code, trayId };
+    }
+
+    // Sem id: confirma por GET antes de falhar
+    console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=create_no_id_confirming`);
+    const confirmed = await pollFindAfterTimeout();
+    if (confirmed.found) {
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=created_confirmed_after_timeout trayId=${confirmed.trayId || ""}`);
+      await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: confirmed.trayId, syncedAt: new Date().toISOString() }).catch(() => {});
+      return { ok: true, status: "SYNCED", action: "created_confirmed_after_timeout", code, trayId: confirmed.trayId };
+    }
+
+    console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=failed status=create_no_id_not_confirmed`);
+    await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "create_no_id_not_confirmed", trayCouponId: null, syncedAt: null }).catch(() => {});
+    return { ok: true, status: "FAILED", action: "failed", code };
   } catch (e) {
     const info = normalizeErrForLog(e);
     const aborted = e?.name === "AbortError" || String(e?.message || "").includes("timeout");
     if (aborted) {
-      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=timeout`);
+      // Nunca retornar "timeout" sem confirmação -> aqui tratamos como falha controlada
+      console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=failed status=timeout`);
       await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "TIMEOUT", trayCouponId: null, syncedAt: null }).catch(() => {});
-      return { ok: true, status: "PENDING", action: "pending", code };
+      return { ok: true, status: "FAILED", action: "failed", code };
     }
 
     console.log(
@@ -192,8 +252,6 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     }
     await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: info.msg, trayCouponId: null, syncedAt: null }).catch(() => {});
     return { ok: true, status: "FAILED", action: "failed", code };
-  } finally {
-    clearTimeout(t);
   }
 }
 
