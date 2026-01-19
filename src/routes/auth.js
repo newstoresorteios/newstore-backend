@@ -6,6 +6,7 @@ import nodemailer from 'nodemailer';
 
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { ensureTrayCouponForUser } from '../services/trayCouponEnsure.js';
 
 const router = express.Router();
 
@@ -299,6 +300,13 @@ router.post('/login', async (req, res) => {
       path: '/',
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
+
+    // Best-effort: garante cupom na Tray sem bloquear login (consistência eventual)
+    try {
+      setImmediate(() => {
+        ensureTrayCouponForUser(full?.id || user.id).catch(() => {});
+      });
+    } catch {}
 
     return res.json({ ok: true, token, user: full });
   } catch (e) {

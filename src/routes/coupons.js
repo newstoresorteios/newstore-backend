@@ -1,8 +1,9 @@
 // backend/src/routes/coupons.js
 import { Router } from "express";
 import { query } from "../db.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { trayCreateCoupon, trayDeleteCoupon } from "../services/tray.js";
+import { ensureTrayCouponForUser } from "../services/trayCouponEnsure.js";
 
 const router = Router();
 const VALID_DAYS = Number(process.env.TRAY_COUPON_VALID_DAYS || 180);
@@ -195,16 +196,11 @@ router.post("/sync", requireAuth, async (req, res) => {
       }
       const startsAt = fmtDate(new Date());
       const endsAt = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
-      console.log(`[coupons.sync#${rid}] creating Tray coupon`, { code, value: finalCents / 100, startsAt, endsAt });
+      console.log(`[tray.coupon.sync#${rid}] user=${uid} creating`, { code, value: finalCents / 100, startsAt, endsAt });
       try {
-        const created = await trayCreateCoupon({
-          code,
-          value: finalCents / 100,
-          startsAt,
-          endsAt,
-          description: `Crédito do cliente ${uid} - New Store`,
-        });
-        trayId = String(created.id);
+        // Usa o ensure best-effort (idempotente por code) e atualiza id
+        const ensured = await ensureTrayCouponForUser(uid);
+        trayId = ensured?.id ? String(ensured.id) : trayId;
         await query(
           `UPDATE users
               SET tray_coupon_id = $2,
@@ -214,7 +210,7 @@ router.post("/sync", requireAuth, async (req, res) => {
         );
       } catch (e) {
         // ok: mantemos valor no banco mesmo que a Tray falhe
-        console.warn(`[coupons.sync#${rid}] tray create warn:`, e?.message || e);
+        console.warn(`[tray.coupon.sync#${rid}] tray ensure warn:`, e?.message || e);
       }
     }
 
@@ -232,6 +228,63 @@ router.post("/sync", requireAuth, async (req, res) => {
     console.error(`[coupons.sync#${rid}] error:`, e?.message || e);
     // Valor já pode ter sido ajustado dentro da transação; mantém UI funcional.
     return res.status(200).json({ ok: false, error: "sync_failed" });
+  }
+});
+
+/**
+ * POST /api/coupons/ensure
+ * Chamado pelo frontend após login (best-effort).
+ */
+router.post("/ensure", requireAuth, async (req, res) => {
+  const userId = req.user?.id;
+  console.log(`[api.coupons.ensure] called user=${userId}`);
+
+  // best-effort: nunca retornar erro para UX
+  const out = await ensureTrayCouponForUser(userId, { timeoutMs: 5000 });
+  return res.json({
+    ok: true,
+    tray: {
+      status: out.status,
+      action: out.action,
+      code: out.code || null,
+      trayId: out.trayId || null,
+    },
+  });
+});
+
+/**
+ * POST /api/coupons/sync-tray-pending
+ * Admin-only: reprocessa cupons pendentes/failed (consistência eventual).
+ */
+router.post("/sync-tray-pending", requireAuth, requireAdmin, async (req, res) => {
+  const batch = Math.random().toString(36).slice(2, 8);
+  const limit = Math.max(1, Math.min(200, Number(req.body?.limit || 50)));
+  try {
+    const { rows } = await query(
+      `select user_id
+         from coupon_tray_sync
+        where tray_sync_status <> 'SYNCED'
+        order by updated_at asc
+        limit $1`,
+      [limit]
+    );
+    const pending = rows.length;
+    let ok = 0;
+    let failed = 0;
+
+    console.log(`[tray.coupon.sync] batch=${batch} pending=${pending}`);
+    for (const r of rows) {
+      // eslint-disable-next-line no-await-in-loop
+      const out = await ensureTrayCouponForUser(r.user_id);
+      if (out?.ok) ok++;
+      else failed++;
+    }
+
+    console.log(`[tray.coupon.sync] batch=${batch} pending=${pending} ok=${ok} failed=${failed}`);
+    return res.json({ ok: true, batch, pending, okCount: ok, failedCount: failed });
+  } catch (e) {
+    console.warn(`[tray.coupon.sync] batch=${batch} error:`, e?.message || e);
+    return res.status(200).json({ ok: false, batch, error: "sync_failed" });
   }
 });
 
