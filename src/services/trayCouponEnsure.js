@@ -170,7 +170,8 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
   const startsAt = fmtDate(lastPurchaseAt);
   const endsAt = fmtDate(addMonthsClamped(lastPurchaseAt, 6));
   const giftValueBRL = Number((valueCents / 100).toFixed(2));
-  const minPurchaseForGiftCard = (v) => {
+
+  function getMinPurchaseByGiftValue(v) {
     if (!Number.isFinite(v)) return null;
     if (v >= 50 && v <= 250) return 1500;
     if (v >= 251 && v <= 600) return 3500;
@@ -180,8 +181,19 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     if (v >= 2101 && v <= 3100) return 22500;
     if (v >= 3101 && v <= 4200) return 30000;
     return null;
-  };
-  let minPurchase = minPurchaseForGiftCard(giftValueBRL);
+  }
+
+  // Regra obrigatória: GC < 50 => não criar/atualizar cupom (evita rejeições e cupom inválido)
+  if (Number.isFinite(giftValueBRL) && giftValueBRL < 50) {
+    console.warn(`[tray.coupon.rules] WARN giftValueBRL=${giftValueBRL.toFixed(2)} abaixo do mínimo (50.00) -> skip_below_min`);
+    console.log(
+      `[tray.coupon.ensure] computed user=${uid} rid=${rid} code=${code} value=${valueCents} giftValueBRL=${giftValueBRL.toFixed(2)} value_start=SKIP lastPurchaseAt=${lastPurchaseAt.toISOString()} starts=${startsAt} ends=${endsAt} usage_counter_limit=1 usage_counter_limit_customer=1`
+    );
+    await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "skip_below_min", trayCouponId: null, syncedAt: null }).catch(() => {});
+    return { ok: true, status: "SKIPPED", action: "skip_below_min", code };
+  }
+
+  let minPurchase = getMinPurchaseByGiftValue(giftValueBRL);
   if (minPurchase == null) {
     console.warn(`[tray.coupon.rules] WARN giftValueBRL=${giftValueBRL.toFixed(2)} fora da tabela -> value_start=30000.00`);
     minPurchase = 30000;
@@ -376,7 +388,8 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
       created = await withAbort(createTimeoutMs, (signal) =>
         trayCreateCoupon({
           code,
-          value: valueCents / 100,
+          valueBRL: giftValueBRL,
+          valueStartBRL: minPurchase,
           startsAt,
           endsAt,
           description: `Crédito do cliente ${uid} - New Store`,

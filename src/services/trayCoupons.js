@@ -27,23 +27,29 @@ export async function upsertTrayCoupon({ code, value_cents = 0, coupon_id }) {
   const value = (Number(value_cents) / 100).toFixed(2); // "10.00"
 
   const payload = new URLSearchParams();
-  // Doc oficial: ["DiscountCoupon"]["field"]
-  payload.append('["DiscountCoupon"]["code"]', code);
-  payload.append('["DiscountCoupon"]["description"]', `Cupom New Store - ${code}`);
-  payload.append('["DiscountCoupon"]["value"]', value);
-  payload.append('["DiscountCoupon"]["type"]', '$');         // desconto em R$
-  payload.append('["DiscountCoupon"]["usage_counter_limit"]', '1');
-  payload.append('["DiscountCoupon"]["usage_counter_limit_customer"]', '1');
-  payload.append('["DiscountCoupon"]["cumulative_discount"]', '1');
+  // Formato padrão PHP (compatível com backend Tray)
+  payload.append("DiscountCoupon[code]", code);
+  payload.append("DiscountCoupon[description]", `Cupom New Store - ${code}`);
+  payload.append("DiscountCoupon[value]", value);
+  payload.append("DiscountCoupon[type]", "$"); // desconto em R$
+  payload.append("DiscountCoupon[usage_counter_limit]", "1");
+  payload.append("DiscountCoupon[usage_counter_limit_customer]", "1");
+  payload.append("DiscountCoupon[cumulative_discount]", "1");
   // Demais campos são opcionais, manter simples.
 
   const path   = coupon_id ? `/discount_coupons/${coupon_id}` : `/discount_coupons`;
   const method = coupon_id ? 'PUT' : 'POST';
 
+  const bodyStr = payload.toString();
+  const contentLength = Buffer.byteLength(bodyStr);
   const r = await fetch(`${API}${path}?access_token=${encodeURIComponent(token)}`, {
     method,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: payload,
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "Content-Length": String(contentLength),
+    },
+    body: bodyStr,
   });
 
   const j = await readJsonSafe(r);

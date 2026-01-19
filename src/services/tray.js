@@ -310,7 +310,7 @@ function normalizeCoupon(c) {
   };
 }
 
-function buildDiscountCouponFormPayload({
+function buildCouponFormPayload({
   code,
   description,
   startsAt,
@@ -332,19 +332,19 @@ function buildDiscountCouponFormPayload({
   if (!(type === "$" || type === "%")) throw new Error("tray_coupon_invalid_type");
 
   const p = new URLSearchParams();
-  // Formato oficial Tray:
-  if (c) p.append('["DiscountCoupon"]["code"]', c);
-  p.append('["DiscountCoupon"]["description"]', desc);
-  p.append('["DiscountCoupon"]["starts_at"]', s);
-  p.append('["DiscountCoupon"]["ends_at"]', e);
-  p.append('["DiscountCoupon"]["value"]', v.toFixed(2));
-  p.append('["DiscountCoupon"]["type"]', type);
-  p.append('["DiscountCoupon"]["value_start"]', vs.toFixed(2));
-  p.append('["DiscountCoupon"]["value_end"]', "");
-  p.append('["DiscountCoupon"]["usage_sum_limit"]', "");
-  p.append('["DiscountCoupon"]["usage_counter_limit"]', "1");
-  p.append('["DiscountCoupon"]["usage_counter_limit_customer"]', "1");
-  p.append('["DiscountCoupon"]["cumulative_discount"]', "1");
+  // Formato padrão PHP (compatível com backend Tray):
+  if (c) p.append("DiscountCoupon[code]", c);
+  p.append("DiscountCoupon[description]", desc);
+  p.append("DiscountCoupon[starts_at]", s);
+  p.append("DiscountCoupon[ends_at]", e);
+  p.append("DiscountCoupon[value]", v.toFixed(2));
+  p.append("DiscountCoupon[type]", type);
+  p.append("DiscountCoupon[value_start]", vs.toFixed(2));
+  p.append("DiscountCoupon[value_end]", "");
+  p.append("DiscountCoupon[usage_sum_limit]", "");
+  p.append("DiscountCoupon[usage_counter_limit]", "1");
+  p.append("DiscountCoupon[usage_counter_limit_customer]", "1");
+  p.append("DiscountCoupon[cumulative_discount]", "1");
 
   const bodyStr = p.toString();
   const contentLength = Buffer.byteLength(bodyStr);
@@ -368,7 +368,11 @@ async function trayHttp({ method, url, token, bodyStr, contentLength, headers, s
     throw new Error("tray_http_empty_body");
   }
 
-  const r = await fetchWithRetry(url, { method, headers, body: bodyStr, signal }, { label: `tray.http.${method}` });
+  const finalHeaders = {
+    ...(headers || {}),
+    "Content-Length": String(contentLength),
+  };
+  const r = await fetchWithRetry(url, { method, headers: finalHeaders, body: bodyStr, signal }, { label: `tray.http.${method}` });
   const parsed = await readBodySafe(r);
   const j = parsed?.body ?? null;
   const keys = j && typeof j === "object" ? Object.keys(j) : [];
@@ -466,7 +470,7 @@ async function createCouponWithType(params, typeValue) {
   const masked = (token || "").slice(0, 8) + "…";
   dbg("[tray.create] tentando criar cupom", {
     code: params.code,
-    value: params.value,
+    value: params.valueBRL,
     type: typeValue,
     startsAt: params.startsAt,
     endsAt: params.endsAt,
@@ -476,32 +480,18 @@ async function createCouponWithType(params, typeValue) {
   const apiBase = await getTrayApiBase();
   const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
 
-  // TABELA: Cartão Presente -> mínimo de compra permitido (value_start)
-  function minPurchaseForGiftCard(giftValueBRL) {
-    const v = Number(giftValueBRL);
-    if (!Number.isFinite(v)) return null;
-    if (v >= 50 && v <= 250) return 1500;
-    if (v >= 251 && v <= 600) return 3500;
-    if (v >= 601 && v <= 800) return 5500;
-    if (v >= 801 && v <= 1100) return 7500;
-    if (v >= 1101 && v <= 2100) return 15000;
-    if (v >= 2101 && v <= 3100) return 22500;
-    if (v >= 3101 && v <= 4200) return 30000;
-    return null;
-  }
-
   dbg("[tray.coupon.create]", {
     code: String(params.code),
-    value: Number(params.value || 0).toFixed(2),
+    value: Number(params.valueBRL || 0).toFixed(2),
     starts: params.startsAt,
     ends: params.endsAt,
     type: typeValue,
   });
 
-  const giftValueBRL = Number(params.value || 0);
-  let valueStartBRL = minPurchaseForGiftCard(giftValueBRL);
-  if (valueStartBRL == null) {
-    console.warn(`[tray.coupon.rules] WARN giftValueBRL=${giftValueBRL} fora da tabela -> value_start=30000.00`);
+  const giftValueBRL = Number(params.valueBRL || 0);
+  let valueStartBRL = Number(params.valueStartBRL);
+  if (!Number.isFinite(valueStartBRL)) {
+    console.warn(`[tray.coupon.rules] WARN valueStartBRL inválido -> value_start=30000.00`);
     valueStartBRL = 30000;
   }
 
@@ -515,7 +505,7 @@ async function createCouponWithType(params, typeValue) {
     type: typeValue,
   });
 
-  const { bodyStr, contentLength } = buildDiscountCouponFormPayload({
+  const { bodyStr, contentLength } = buildCouponFormPayload({
     code: String(params.code),
     description: String(params.description || `Cupom ${params.code}`),
     startsAt: String(params.startsAt),
@@ -527,7 +517,7 @@ async function createCouponWithType(params, typeValue) {
 
   console.log("[tray.coupon.create.req]", { url: maskAccessTokenInUrl(url, token), body: bodyStr });
 
-  const { r, body } = await trayHttp({
+  const urlEncoded = await trayHttp({
     method: "POST",
     url,
     token,
@@ -540,16 +530,64 @@ async function createCouponWithType(params, typeValue) {
     signal: params?.signal,
   });
 
+  const id1 = urlEncoded.body?.DiscountCoupon?.id ?? urlEncoded.body?.discount_coupon?.id ?? null;
+  if (urlEncoded.r.ok && id1) {
+    console.log("[tray.coupon.create.resp]", { status: urlEncoded.r.status, hasId: true, id: id1, bodyKeys: urlEncoded.body && typeof urlEncoded.body === "object" ? Object.keys(urlEncoded.body) : [] });
+    return { ok: true, status: urlEncoded.r.status, body: urlEncoded.body };
+  }
+
+  // Fallback JSON quando vier 400 "Não há dados enviados."
+  if (urlEncoded.r.status === 400 && hasNoDataSent(urlEncoded.body)) {
+    console.log("[tray.coupon.create] fallback=json attempt=2", { code: String(params.code) });
+    const jsonBody = {
+      DiscountCoupon: {
+        code: String(params.code),
+        description: String(params.description || `Cupom ${params.code}`),
+        starts_at: String(params.startsAt),
+        ends_at: String(params.endsAt),
+        value: Number(giftValueBRL || 0).toFixed(2),
+        type: typeValue,
+        value_start: Number(valueStartBRL).toFixed(2),
+        value_end: "",
+        usage_counter_limit: 1,
+        usage_counter_limit_customer: 1,
+        cumulative_discount: 1,
+      },
+    };
+    const jsonStr = JSON.stringify(jsonBody);
+    const clen = Buffer.byteLength(jsonStr);
+    const safePath2 = String(maskAccessTokenInUrl(url, token)).replace(/^https?:\/\/[^/]+/i, "");
+    console.log("[tray.http]", { method: "POST", url: safePath2, contentLength: clen });
+    const r2 = await fetchWithRetry(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=UTF-8", Accept: "application/json", "Content-Length": String(clen) },
+        body: jsonStr,
+        signal: params?.signal,
+      },
+      { label: "tray.coupon.create.json" }
+    );
+    const parsed2 = await readBodySafe(r2);
+    const j2 = parsed2?.body ?? null;
+    const id2 = j2?.DiscountCoupon?.id ?? j2?.discount_coupon?.id ?? null;
+    console.log("[tray.http.resp]", { method: "POST", status: r2.status, keys: j2 && typeof j2 === "object" ? Object.keys(j2) : [] });
+    console.log("[tray.coupon.create.resp]", { status: r2.status, hasId: !!id2, id: id2 || null, bodyKeys: j2 && typeof j2 === "object" ? Object.keys(j2) : [] });
+    if (!id2) console.log("[tray.coupon.create.resp.body]", j2 && typeof j2 === "object" ? j2 : { body: j2 });
+    return { ok: r2.ok && !!id2, status: r2.status, body: j2 };
+  }
+
+  const body = urlEncoded.body;
   const id = body?.DiscountCoupon?.id ?? body?.discount_coupon?.id ?? null;
-  const ok = r.ok && !!id;
-  console.log("[tray.coupon.create.resp]", { status: r.status, hasId: !!id, id: id || null, bodyKeys: body && typeof body === "object" ? Object.keys(body) : [] });
+  const ok = urlEncoded.r.ok && !!id;
+  console.log("[tray.coupon.create.resp]", { status: urlEncoded.r.status, hasId: !!id, id: id || null, bodyKeys: body && typeof body === "object" ? Object.keys(body) : [] });
   if (!ok) console.log("[tray.coupon.create.resp.body]", body && typeof body === "object" ? body : { body });
-  return { ok, status: r.status, body };
+  return { ok, status: urlEncoded.r.status, body };
 }
 
-export async function trayCreateCoupon({ code, value, startsAt, endsAt, description, signal } = {}) {
+export async function trayCreateCoupon({ code, valueBRL, valueStartBRL, startsAt, endsAt, description, signal } = {}) {
   // Type deve ser somente "$" ou "%". Mantemos "$" (desconto em reais) e removemos fallback "3".
-  const t = await createCouponWithType({ code, value, startsAt, endsAt, description, signal }, "$");
+  const t = await createCouponWithType({ code, valueBRL, valueStartBRL, startsAt, endsAt, description, signal }, "$");
   if (t.ok) {
     const id = t.body?.DiscountCoupon?.id ?? t.body?.discount_coupon?.id ?? null;
     dbg("[tray.create] ok com type '$' id:", id);
@@ -619,7 +657,7 @@ export async function trayUpdateCouponById(id, { startsAt, endsAt, valueBRL, min
     valueStartBRL = 30000;
   }
 
-  const { bodyStr, contentLength } = buildDiscountCouponFormPayload({
+  const { bodyStr, contentLength } = buildCouponFormPayload({
     code: "", // não é obrigatório no PUT, mas a Tray aceita; não enviaremos
     description: String(description || ""),
     startsAt: String(startsAt),
@@ -678,7 +716,7 @@ export async function trayUpdateCouponById(id, { startsAt, endsAt, valueBRL, min
     console.log("[tray.http]", { method: "PUT", url: safePath2, contentLength: clen });
     const r2 = await fetchWithRetry(url, {
       method: "PUT",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json; charset=UTF-8", Accept: "application/json", "Content-Length": String(clen) },
       body: jsonStr,
       signal,
     }, { label: "tray.coupon.update.json" });
