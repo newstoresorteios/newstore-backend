@@ -32,6 +32,7 @@ import adminRoutes from "./routes/admin.js";
 
 import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
+import trayRouter from "./routes/tray.js";
 
 import adminUsersRouter from "./routes/adminUsers.js";
 
@@ -49,8 +50,12 @@ import { autoReconcile } from './middleware/autoReconcile.js';
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
 import { ensureAppConfig } from "./services/config.js";
+import { validateTrayConfigAtStartup } from "./services/trayConfig.js";
 
 const app = express();
+
+// Validação de config Tray no boot (sem imprimir segredos)
+try { validateTrayConfigAtStartup(); } catch {}
 
 const PORT = process.env.PORT || 4000;
 
@@ -125,6 +130,10 @@ app.use("/api/purchase-limit", purchaseLimitRouter);
 
 // Cupons
 app.use("/api/coupons", couponsRouter);
+
+// Tray OAuth callback e health
+app.use("/tray", trayRouter);       // /tray/callback/auth
+app.use("/api/tray", trayRouter);   // /api/tray/health
 
 app.use("/api/admin/users", adminUsersRouter);
 

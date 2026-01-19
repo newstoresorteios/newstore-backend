@@ -1,35 +1,20 @@
 // backend/src/services/tray.js
-import { query } from "../db.js";
+import { getTrayEnvConfig, getTrayApiBase, setTrayApiBase, getTrayRefreshToken, setTrayRefreshToken, clearTrayRefreshToken, setTrayAccessToken, getTrayCachedAccessToken } from "./trayConfig.js";
 
-const API_BASE = (
-  process.env.TRAY_API_BASE ||
-  process.env.TRAY_API_ADDRESS ||
-  "https://www.newstorerj.com.br/web_api"
-).replace(/\/+$/, "");
-
-const CKEY    = process.env.TRAY_CONSUMER_KEY  || "";
-const CSECRET = process.env.TRAY_CONSUMER_SECRET || "";
-const AUTH_CODE = process.env.TRAY_CODE || ""; // use 1x; preferir TRAY_REFRESH_TOKEN em produção
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
-const VALID_DAYS = Number(process.env.TRAY_COUPON_VALID_DAYS || 180);
 
 function dbg(...a) { if (LOG_LEVEL !== "silent") console.log(...a); }
 function warn(...a) { console.warn(...a); }
 function err(...a) { console.error(...a); }
 
-let cache = { token: null, exp: 0 };
+let cache = { token: null, expMs: 0, expAccessAt: null, mode: null };
+let lastError = null;
+let codeInvalidUntilMs = 0;
 
 function form(obj) {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(obj)) p.append(k, v ?? "");
   return p.toString();
-}
-
-function fmtDate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
 }
 
 async function readBodySafe(r) {
@@ -48,71 +33,42 @@ async function readBodySafe(r) {
   }
 }
 
-function computeTtlMs(auth) {
-  // Preferir data absoluta (date_expiration_access_token) quando existir.
+function parseTrayDateToMs(s) {
+  // Tray costuma retornar "YYYY-MM-DD HH:mm:ss" (sem timezone).
+  // Interpretamos como UTC para ter TTL consistente em servidor.
+  const str = String(s || "").trim();
+  if (!str) return null;
+  const iso = str.includes("T") ? str : str.replace(" ", "T") + "Z";
+  const ms = new Date(iso).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function computeExpMs(auth) {
   const marginMs = 60_000;
-  const expStr = auth?.date_expiration_access_token || auth?.date_expiration || null;
-  if (expStr) {
-    const expMs = new Date(expStr).getTime();
-    if (Number.isFinite(expMs)) {
-      const ttl = expMs - Date.now() - marginMs;
-      return Math.max(0, ttl);
-    }
-  }
-  // Fallback: expires_in em segundos (se existir); senão 3000s com margem.
+  const expStr = auth?.date_expiration_access_token || null;
+  const expMs = parseTrayDateToMs(expStr);
+  if (expMs) return Math.max(0, expMs - marginMs);
+
   const sec = Number.isFinite(Number(auth?.expires_in)) ? Number(auth.expires_in) : 3000;
-  return Math.max(0, (sec * 1000) - marginMs);
+  return Date.now() + Math.max(0, (sec * 1000) - marginMs);
 }
 
-// ---- KV store para refresh_token (persiste entre deploys) ----
-async function ensureKvSchema() {
-  // Em alguns ambientes o kv_store pode não existir (deploy novo). Mantemos best-effort.
-  try {
-    await query(`
-      create table if not exists kv_store (
-        k text primary key,
-        v text,
-        updated_at timestamptz default now()
-      )
-    `);
-  } catch {}
+function isTokenInvalidErr(status, body) {
+  const ec = body?.error_code;
+  const causes = Array.isArray(body?.causes) ? body.causes.join(" | ") : "";
+  const msg = `${body?.message || ""} ${causes}`.toLowerCase();
+  if (status === 401 && (ec === 1099 || ec === 1000)) return true;
+  if (status === 401 && msg.includes("token inválido")) return true;
+  return false;
 }
 
-async function getSavedRefreshWithSource() {
-  if (process.env.TRAY_REFRESH_TOKEN) return { token: process.env.TRAY_REFRESH_TOKEN, source: "env" };
-  try {
-    await ensureKvSchema();
-    const r = await query(
-      `select v from kv_store where k='tray_refresh_token' limit 1`
-    );
-    const v = r.rows?.[0]?.v || null;
-    return v ? { token: v, source: "kv" } : { token: null, source: "none" };
-  } catch {
-    return { token: null, source: "none" };
-  }
-}
-async function saveRefresh(rt) {
-  if (!rt) return;
-  try {
-    await ensureKvSchema();
-    await query(
-      `insert into kv_store (k, v) values ('tray_refresh_token',$1)
-       on conflict (k) do update set v=excluded.v, updated_at=now()`,
-      [rt]
-    );
-    dbg("[tray.auth] refresh_token salvo no kv_store");
-  } catch (e) {
-    warn("[tray.auth] falha ao salvar refresh_token:", e?.message || e);
-  }
-}
-
-function authEnvFlags({ hasRefreshEnv, hasRefreshKV }) {
+function summarizeAuthBody(body) {
   return {
-    hasCKEY: !!CKEY,
-    hasCSECRET: !!CSECRET,
-    hasCode: !!AUTH_CODE,
-    hasRefreshEnv: !!hasRefreshEnv,
-    hasRefreshKV: !!hasRefreshKV,
+    error_code: body?.error_code ?? null,
+    message: body?.message ?? null,
+    causes: body?.causes ?? null,
+    date_expiration_access_token: body?.date_expiration_access_token ?? null,
+    date_expiration_refresh_token: body?.date_expiration_refresh_token ?? null,
   };
 }
 
@@ -144,84 +100,186 @@ async function fetchWithRetry(url, options = {}, meta = {}) {
   throw lastErr || new Error(`${label}_failed`);
 }
 
-// ---- token (tenta refresh; se não tiver, usa code 1x) ----
-export async function trayToken({ signal } = {}) {
-  if (!CKEY || !CSECRET) throw new Error("tray_env_missing_keys");
-  if (cache.token && Date.now() < cache.exp) return cache.token;
+async function trayTokenWithMeta({ signal, rid = null, forceBootstrap = false, overrideCode = null, overrideApiBase = null } = {}) {
+  const { consumerKey, consumerSecret, code: envCode } = getTrayEnvConfig();
+  const apiBase = overrideApiBase ? await setTrayApiBase(overrideApiBase) : await getTrayApiBase();
 
-  const saved = await getSavedRefreshWithSource();
-  const hasRefreshEnv = !!process.env.TRAY_REFRESH_TOKEN;
-  const hasRefreshKV = saved.source === "kv" && !!saved.token;
+  const hasCKEY = !!consumerKey;
+  const hasCSECRET = !!consumerSecret;
+  if (!hasCKEY || !hasCSECRET) {
+    const e = new Error("tray_env_missing_keys");
+    e.code = "tray_env_missing_keys";
+    lastError = e.message;
+    throw e;
+  }
+  if (consumerKey === consumerSecret) {
+    console.warn("[tray.auth] WARN consumer_key === consumer_secret (provável erro de config)");
+  }
 
-  // Sempre logar flags (sem segredos) para debug no Render
-  console.log("[tray.auth] env", authEnvFlags({ hasRefreshEnv, hasRefreshKV }));
+  const refresh = await getTrayRefreshToken();
+  const hasRefreshKV = refresh.source === "kv";
+  const hasRefreshEnv = refresh.source === "env";
+  const codeToUse = String(overrideCode || envCode || "").trim();
+  const hasCode = !!codeToUse;
 
-  if (saved?.token) {
-    dbg("[tray.auth] usando refresh_token salvo; API_BASE:", API_BASE);
-    // Doc: Refresh via GET /auth?refresh_token=...
-    const url = `${API_BASE}/auth?refresh_token=${encodeURIComponent(saved.token)}`;
+  console.log("[tray.auth] env", {
+    rid,
+    hasCKEY,
+    hasCSECRET,
+    hasCode,
+    hasRefreshEnv,
+    hasRefreshKV,
+    api_base: apiBase,
+  });
+
+  // 4.1 cache memory
+  if (cache.token && Date.now() < cache.expMs) {
+    return { token: cache.token, authMode: "cache", apiBase, expAccessAt: cache.expAccessAt, hasRefreshKV, lastError };
+  }
+
+  // 4.1.1 cache DB opcional
+  const cachedDb = await getTrayCachedAccessToken().catch(() => ({ token: null, expAccessAt: null }));
+  if (cachedDb?.token && cachedDb?.expAccessAt) {
+    const expMs = parseTrayDateToMs(cachedDb.expAccessAt);
+    if (expMs && Date.now() < (expMs - 60_000)) {
+      cache = { token: cachedDb.token, expMs: expMs - 60_000, expAccessAt: cachedDb.expAccessAt, mode: "cache" };
+      return { token: cachedDb.token, authMode: "cache", apiBase, expAccessAt: cachedDb.expAccessAt, hasRefreshKV, lastError };
+    }
+  }
+
+  // Evita loop infinito quando code está inválido/expirado
+  if (Date.now() < codeInvalidUntilMs) {
+    const e = new Error("tray_code_invalid_or_expired");
+    e.code = "tray_code_invalid_or_expired";
+    lastError = e.code;
+    throw e;
+  }
+
+  // 4.2 refresh (prioridade)
+  if (!forceBootstrap && refresh.token) {
+    const url = `${apiBase}/auth?refresh_token=${encodeURIComponent(refresh.token)}`;
+    console.log("[tray.auth] refresh start", { rid, url });
     const r = await fetchWithRetry(url, { method: "GET", signal }, { label: "tray.auth.refresh" });
     const parsed = await readBodySafe(r);
+    const body = parsed?.body || null;
 
-    const auth = parsed?.body || null;
-    if (!r.ok || !auth?.access_token) {
-      err("[tray.auth] refresh fail", { status: r.status, url, body: parsed?.body ?? null });
-      throw new Error("tray_auth_failed");
+    if (!r.ok || !body?.access_token) {
+      console.log("[tray.auth] refresh fail", { rid, status: r.status, body: summarizeAuthBody(body), needReauth: isTokenInvalidErr(r.status, body) });
+      lastError = `refresh_fail_${r.status}`;
+
+      // 401 => refresh inválido/expirado: limpa e tenta bootstrap (se tiver code)
+      if (isTokenInvalidErr(r.status, body)) {
+        await clearTrayRefreshToken().catch(() => {});
+        console.log("[tray.auth] refresh invalid/expired; need reauth", { rid });
+        // cai para bootstrap abaixo
+      } else {
+        const e = new Error("tray_auth_failed");
+        e.code = "tray_auth_failed";
+        e.status = r.status;
+        e.body = body;
+        throw e;
+      }
+    } else {
+      // ok
+      const expMs = computeExpMs(body);
+      const expAccessAt = body?.date_expiration_access_token || null;
+      const masked = String(body.access_token).slice(0, 8) + "…";
+      console.log("[tray.auth] refresh ok", { rid, token: masked, expAccess: expAccessAt, expRefresh: body?.date_expiration_refresh_token || null });
+      lastError = null;
+
+      if (body.refresh_token) await setTrayRefreshToken(body.refresh_token).catch(() => {});
+      await setTrayAccessToken(body.access_token, expAccessAt).catch(() => {});
+      cache = { token: body.access_token, expMs: expMs, expAccessAt, mode: "refresh" };
+      return { token: body.access_token, authMode: "refresh", apiBase, expAccessAt, hasRefreshKV: true, lastError };
     }
+  }
 
-    const ttlMs = computeTtlMs(auth);
-    const masked = (auth.access_token || "").slice(0, 8) + "…";
-    dbg("[tray.auth] refresh ok", {
-      status: r.status,
-      token: masked,
-      ttlMs,
-      date_expiration_access_token: auth?.date_expiration_access_token || null,
-    });
-
-    if (auth.refresh_token) await saveRefresh(auth.refresh_token);
-    cache = { token: auth.access_token, exp: Date.now() + ttlMs };
-    return cache.token;
-  } else if (AUTH_CODE) {
-    dbg("[tray.auth] sem refresh_token; usando AUTH_CODE 1x; API_BASE:", API_BASE);
-    const body = form({
-      consumer_key: CKEY,
-      consumer_secret: CSECRET,
-      code: AUTH_CODE,
-    });
-    // Doc: 1ª autenticação via POST /auth com consumer_key, consumer_secret, code
-    const url = `${API_BASE}/auth`;
+  // 4.3 bootstrap
+  if (hasCode) {
+    const url = `${apiBase}/auth`;
+    console.log("[tray.auth] bootstrap start", { rid, url });
+    const reqBody = form({ consumer_key: consumerKey, consumer_secret: consumerSecret, code: codeToUse });
     const r = await fetchWithRetry(url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-      body,
+      body: reqBody,
       signal,
     }, { label: "tray.auth.bootstrap" });
-
     const parsed = await readBodySafe(r);
-    const auth = parsed?.body || null;
-    if (!r.ok || !auth?.access_token) {
-      err("[tray.auth] bootstrap fail", { status: r.status, url, body: parsed?.body ?? null });
-      throw new Error("tray_auth_failed");
+    const body = parsed?.body || null;
+
+    if (!r.ok || !body?.access_token) {
+      console.log("[tray.auth] bootstrap fail", { rid, status: r.status, body: summarizeAuthBody(body) });
+      lastError = `bootstrap_fail_${r.status}`;
+
+      if (isTokenInvalidErr(r.status, body)) {
+        // CODE inválido/expirado -> instrução operacional e “cooldown”
+        console.log("[tray.auth] CODE invalid/expired -> reauthorize app in Tray and generate a new code", { rid });
+        console.log("AÇÃO: gere um novo TRAY_CODE na loja (Meus Apps → Acessar) ou reinstale/reauthorize o app; depois rode novamente.");
+        codeInvalidUntilMs = Date.now() + 10 * 60_000;
+        const e = new Error("tray_code_invalid_or_expired");
+        e.code = "tray_code_invalid_or_expired";
+        e.status = r.status;
+        e.body = body;
+        throw e;
+      }
+
+      const e = new Error("tray_auth_failed");
+      e.code = "tray_auth_failed";
+      e.status = r.status;
+      e.body = body;
+      throw e;
     }
 
-    const ttlMs = computeTtlMs(auth);
-    const masked = (auth.access_token || "").slice(0, 8) + "…";
-    dbg("[tray.auth] bootstrap ok", {
-      status: r.status,
+    const expMs = computeExpMs(body);
+    const expAccessAt = body?.date_expiration_access_token || null;
+    const masked = String(body.access_token).slice(0, 8) + "…";
+    console.log("[tray.auth] bootstrap ok", {
+      rid,
       token: masked,
-      ttlMs,
-      date_expiration_access_token: auth?.date_expiration_access_token || null,
+      expAccess: expAccessAt,
+      expRefresh: body?.date_expiration_refresh_token || null,
     });
+    lastError = null;
 
-    if (auth.refresh_token) await saveRefresh(auth.refresh_token);
-    cache = { token: auth.access_token, exp: Date.now() + ttlMs };
-    return cache.token;
+    if (body.refresh_token) await setTrayRefreshToken(body.refresh_token).catch(() => {});
+    await setTrayAccessToken(body.access_token, expAccessAt).catch(() => {});
+    cache = { token: body.access_token, expMs: expMs, expAccessAt, mode: "bootstrap" };
+    return { token: body.access_token, authMode: "bootstrap", apiBase, expAccessAt, hasRefreshKV: true, lastError };
   }
 
-  // Sempre logar (sem segredos)
-  console.log("[tray.auth] missing", authEnvFlags({ hasRefreshEnv, hasRefreshKV }));
-  err("[tray.auth] falta TRAY_REFRESH_TOKEN (persistido/env) e TRAY_CODE (bootstrap)");
-  throw new Error("tray_no_refresh_and_no_code");
+  const e = new Error("tray_no_refresh_and_no_code");
+  e.code = "tray_no_refresh_and_no_code";
+  lastError = e.code;
+  throw e;
+}
+
+// Mantém compatibilidade: retorna apenas o access_token
+export async function trayToken({ signal, rid } = {}) {
+  const out = await trayTokenWithMeta({ signal, rid });
+  return out.token;
+}
+
+export async function trayTokenHealth({ signal } = {}) {
+  try {
+    const out = await trayTokenWithMeta({ signal });
+    return { ok: true, ...out };
+  } catch (e) {
+    return {
+      ok: false,
+      authMode: cache?.mode || null,
+      apiBase: await getTrayApiBase().catch(() => null),
+      expAccessAt: cache?.expAccessAt || null,
+      hasRefreshKV: (await getTrayRefreshToken().catch(() => ({ source: "none" }))).source === "kv",
+      lastError: e?.code || e?.message || "error",
+    };
+  }
+}
+
+export async function trayBootstrap({ code, api_address, signal } = {}) {
+  const rid = Math.random().toString(36).slice(2, 8);
+  const apiBase = api_address ? await setTrayApiBase(api_address) : await getTrayApiBase();
+  return await trayTokenWithMeta({ signal, rid, forceBootstrap: true, overrideCode: code, overrideApiBase: apiBase });
 }
 
 function extractCouponsList(body) {
@@ -250,7 +308,8 @@ export async function trayFindCouponByCode(code, { maxPages = 5, signal } = {}) 
   if (!target) return { found: false, coupon: null };
 
   for (let page = 1; page <= maxPages; page++) {
-    const url = `${API_BASE}/discount_coupons/?access_token=${encodeURIComponent(token)}&page=${page}`;
+    const apiBase = await getTrayApiBase();
+    const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}&page=${page}`;
     const r = await fetchWithRetry(url, { method: "GET", signal }, { label: "tray.coupon.find" });
     const parsed = await readBodySafe(r);
     const body = parsed?.body || null;
@@ -281,7 +340,8 @@ async function createCouponWithType(params, typeValue) {
     token: masked,
   });
 
-  const url = `${API_BASE}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
+  const apiBase = await getTrayApiBase();
+  const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
 
   const body = new URLSearchParams();
   body.append("DiscountCoupon[code]", String(params.code));
@@ -353,9 +413,10 @@ export async function trayCreateCoupon({ code, value, startsAt, endsAt, descript
 export async function trayDeleteCoupon(id) {
   if (!id) return;
   const token = await trayToken();
+  const apiBase = await getTrayApiBase();
   dbg("[tray.delete] deletando cupom id:", id, "token:", (token || "").slice(0, 8) + "…");
   const r = await fetch(
-    `${API_BASE}/discount_coupons/${encodeURIComponent(id)}?access_token=${encodeURIComponent(token)}`,
+    `${apiBase}/discount_coupons/${encodeURIComponent(id)}?access_token=${encodeURIComponent(token)}`,
     { method: "DELETE" }
   );
   if (r.ok || r.status === 404) {
@@ -372,7 +433,8 @@ export async function trayDeleteCoupon(id) {
  */
 export async function trayHealthCheck() {
   const token = await trayToken();
-  const url = `${API_BASE}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
+  const apiBase = await getTrayApiBase();
+  const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
   const r = await fetch(url, { method: "GET" });
   const parsed = await readBodySafe(r);
   if (!r.ok) {

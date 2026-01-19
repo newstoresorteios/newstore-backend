@@ -143,6 +143,11 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
         await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "PENDING_AUTH", trayCouponId: null, syncedAt: null }).catch(() => {});
         return { ok: true, status: "PENDING_AUTH", action: "pending_auth", code };
       }
+      if (e?.code === "tray_code_invalid_or_expired" || String(e?.message || "").includes("tray_code_invalid_or_expired")) {
+        console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} action=pending_auth reason=code_invalid_or_expired`);
+        await upsertCouponTraySync({ userId: uid, code, status: "FAILED", lastError: "PENDING_AUTH_CODE_INVALID", trayCouponId: null, syncedAt: null }).catch(() => {});
+        return { ok: true, status: "PENDING_AUTH", action: "pending_auth", reason: "code_invalid_or_expired", code };
+      }
       throw e;
     }
 
