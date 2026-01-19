@@ -24,6 +24,38 @@ function form(obj) {
   return p.toString();
 }
 
+async function readBodySafe(r) {
+  // Tray costuma responder JSON; mas em erro pode vir HTML/texto.
+  const ct = (r.headers?.get?.("content-type") || "").toLowerCase();
+  if (ct.includes("application/json")) {
+    const j = await r.json().catch(() => null);
+    return { kind: "json", body: j };
+  }
+  const t = await r.text().catch(() => "");
+  try {
+    const j = JSON.parse(t);
+    return { kind: "json", body: j };
+  } catch {
+    return { kind: "text", body: t };
+  }
+}
+
+function computeTtlMs(auth) {
+  // Preferir data absoluta (date_expiration_access_token) quando existir.
+  const marginMs = 60_000;
+  const expStr = auth?.date_expiration_access_token || auth?.date_expiration || null;
+  if (expStr) {
+    const expMs = new Date(expStr).getTime();
+    if (Number.isFinite(expMs)) {
+      const ttl = expMs - Date.now() - marginMs;
+      return Math.max(0, ttl);
+    }
+  }
+  // Fallback: expires_in em segundos (se existir); senão 3000s com margem.
+  const sec = Number.isFinite(Number(auth?.expires_in)) ? Number(auth.expires_in) : 3000;
+  return Math.max(0, (sec * 1000) - marginMs);
+}
+
 // ---- KV store para refresh_token (persiste entre deploys) ----
 async function getSavedRefresh() {
   if (process.env.TRAY_REFRESH_TOKEN) return process.env.TRAY_REFRESH_TOKEN;
@@ -56,49 +88,69 @@ export async function trayToken() {
   if (cache.token && Date.now() < cache.exp) return cache.token;
 
   const savedRt = await getSavedRefresh();
-  let body;
   if (savedRt) {
     dbg("[tray.auth] usando refresh_token salvo; API_BASE:", API_BASE);
-    body = form({
-      consumer_key: CKEY,
-      consumer_secret: CSECRET,
-      refresh_token: savedRt,
-      grant_type: "refresh_token",
+    // Doc: Refresh via GET /auth?refresh_token=...
+    const url = `${API_BASE}/auth?refresh_token=${encodeURIComponent(savedRt)}`;
+    const r = await fetch(url, { method: "GET" });
+    const parsed = await readBodySafe(r);
+
+    const auth = parsed?.body || null;
+    if (!r.ok || !auth?.access_token) {
+      err("[tray.auth] refresh fail", { status: r.status, url, body: parsed?.body ?? null });
+      throw new Error("tray_auth_failed");
+    }
+
+    const ttlMs = computeTtlMs(auth);
+    const masked = (auth.access_token || "").slice(0, 8) + "…";
+    dbg("[tray.auth] refresh ok", {
+      status: r.status,
+      token: masked,
+      ttlMs,
+      date_expiration_access_token: auth?.date_expiration_access_token || null,
     });
+
+    if (auth.refresh_token) await saveRefresh(auth.refresh_token);
+    cache = { token: auth.access_token, exp: Date.now() + ttlMs };
+    return cache.token;
   } else if (AUTH_CODE) {
     dbg("[tray.auth] sem refresh_token; usando AUTH_CODE 1x; API_BASE:", API_BASE);
-    body = form({
+    const body = form({
       consumer_key: CKEY,
       consumer_secret: CSECRET,
       code: AUTH_CODE,
     });
-  } else {
-    err("[tray.auth] falta TRAY_REFRESH_TOKEN e TRAY_CODE");
-    throw new Error("tray_no_refresh_and_no_code");
+    // Doc: 1ª autenticação via POST /auth com consumer_key, consumer_secret, code
+    const url = `${API_BASE}/auth`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+      body,
+    });
+
+    const parsed = await readBodySafe(r);
+    const auth = parsed?.body || null;
+    if (!r.ok || !auth?.access_token) {
+      err("[tray.auth] bootstrap fail", { status: r.status, url, body: parsed?.body ?? null });
+      throw new Error("tray_auth_failed");
+    }
+
+    const ttlMs = computeTtlMs(auth);
+    const masked = (auth.access_token || "").slice(0, 8) + "…";
+    dbg("[tray.auth] bootstrap ok", {
+      status: r.status,
+      token: masked,
+      ttlMs,
+      date_expiration_access_token: auth?.date_expiration_access_token || null,
+    });
+
+    if (auth.refresh_token) await saveRefresh(auth.refresh_token);
+    cache = { token: auth.access_token, exp: Date.now() + ttlMs };
+    return cache.token;
   }
 
-  const r = await fetch(`${API_BASE}/auth`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-    body,
-  });
-
-  let j = null;
-  try { j = await r.json(); } catch {}
-
-  if (!r.ok || !j?.access_token) {
-    err("[tray.auth] fail", { status: r.status, body: j });
-    throw new Error("tray_auth_failed");
-  }
-
-  const masked = (j.access_token || "").slice(0, 8) + "…";
-  const ttlMs = ((j.expires_in ? j.expires_in - 60 : 3000) * 1000);
-  dbg("[tray.auth] ok status:", r.status, "token:", masked, "ttl(ms):", ttlMs);
-
-  if (j.refresh_token) await saveRefresh(j.refresh_token);
-
-  cache = { token: j.access_token, exp: Date.now() + ttlMs };
-  return cache.token;
+  err("[tray.auth] falta TRAY_REFRESH_TOKEN (persistido/env) e TRAY_CODE (bootstrap)");
+  throw new Error("tray_no_refresh_and_no_code");
 }
 
 async function createCouponWithType(params, typeValue) {
@@ -136,9 +188,13 @@ async function createCouponWithType(params, typeValue) {
     body: body.toString(),
   });
 
-  let j = null;
-  try { j = await r.json(); } catch {}
-  dbg("[tray.create] resp", { status: r.status, bodyKeys: j ? Object.keys(j) : [] });
+  const parsed = await readBodySafe(r);
+  const j = parsed?.body || null;
+  if (!r.ok) {
+    err("[tray.create] fail", { status: r.status, body: j });
+  } else {
+    dbg("[tray.create] resp", { status: r.status, bodyKeys: j ? Object.keys(j) : [] });
+  }
 
   return { ok: r.ok && !!j?.DiscountCoupon?.id, status: r.status, body: j };
 }
@@ -178,4 +234,21 @@ export async function trayDeleteCoupon(id) {
     const t = await r.text().catch(() => "");
     warn("[tray.delete] warn", { status: r.status, body: t });
   }
+}
+
+/**
+ * Healthcheck simples: autentica e tenta listar 1 cupom (para validar access_token).
+ * Não altera dados.
+ */
+export async function trayHealthCheck() {
+  const token = await trayToken();
+  const url = `${API_BASE}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
+  const r = await fetch(url, { method: "GET" });
+  const parsed = await readBodySafe(r);
+  if (!r.ok) {
+    err("[tray.health] fail", { status: r.status, body: parsed?.body ?? null });
+    return { ok: false, status: r.status, body: parsed?.body ?? null };
+  }
+  dbg("[tray.health] ok", { status: r.status });
+  return { ok: true, status: r.status, body: parsed?.body ?? null };
 }
