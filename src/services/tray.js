@@ -386,21 +386,38 @@ async function createCouponWithType(params, typeValue) {
   const apiBase = await getTrayApiBase();
   const url = `${apiBase}/discount_coupons/?access_token=${encodeURIComponent(token)}`;
 
-  const body = new URLSearchParams();
-  // Doc oficial: ["DiscountCoupon"]["field"]
-  body.append('["DiscountCoupon"]["code"]', String(params.code));
-  body.append('["DiscountCoupon"]["description"]', String(params.description || `Cupom ${params.code}`));
-  body.append('["DiscountCoupon"]["starts_at"]', String(params.startsAt)); // YYYY-MM-DD
-  body.append('["DiscountCoupon"]["ends_at"]',   String(params.endsAt));   // YYYY-MM-DD
-  body.append('["DiscountCoupon"]["value"]',     Number(params.value || 0).toFixed(2));
-  body.append('["DiscountCoupon"]["type"]',      typeValue);
+  const maskUrlToken = (u) => String(u).replace(/(access_token=)[^&]+/i, (_m, p1) => `${p1}${String(token).slice(0, 8)}…`);
 
-  // limites para o checkout reconhecer o valor (e não estourar o saldo)
-  const money = Number(params.value || 0).toFixed(2);
-  body.append('["DiscountCoupon"]["usage_sum_limit"]', money);
-  body.append('["DiscountCoupon"]["usage_counter_limit"]', "1");
-  body.append('["DiscountCoupon"]["usage_counter_limit_customer"]', "1");
-  body.append('["DiscountCoupon"]["cumulative_discount"]', "1");
+  const buildCouponBody = (style) => {
+    const p = new URLSearchParams();
+    const code = String(params.code);
+    const description = String(params.description || `Cupom ${params.code}`);
+    const startsAt = String(params.startsAt);
+    const endsAt = String(params.endsAt);
+    const value = Number(params.value || 0).toFixed(2);
+
+    // Doc: keys no formato ["DiscountCoupon"]["campo"]
+    const k = (field) => (style === "doc" ? `["DiscountCoupon"]["${field}"]` : `DiscountCoupon[${field}]`);
+
+    p.append(k("code"), code);
+    p.append(k("description"), description);
+    p.append(k("starts_at"), startsAt);
+    p.append(k("ends_at"), endsAt);
+    p.append(k("value"), value);
+    p.append(k("type"), typeValue); // somente "$" ou "%"
+
+    // Campos opcionais (enviar vazio = sem limite)
+    p.append(k("value_start"), "");
+    p.append(k("value_end"), "");
+
+    // Se quiser 1 uso por cliente, alinhar os dois:
+    p.append(k("usage_sum_limit"), "");
+    p.append(k("usage_counter_limit"), "1");
+    p.append(k("usage_counter_limit_customer"), "1");
+    p.append(k("cumulative_discount"), "1");
+
+    return p;
+  };
 
   dbg("[tray.coupon.create]", {
     code: String(params.code),
@@ -410,54 +427,90 @@ async function createCouponWithType(params, typeValue) {
     type: typeValue,
   });
 
-  const r = await fetchWithRetry(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-    body: body.toString(),
-    signal: params?.signal,
-  }, { label: "tray.coupon.create" });
+  const send = async (style) => {
+    const body = buildCouponBody(style);
+    const bodyStr = body.toString();
+    console.log("[tray.coupon.create.req]", {
+      url: maskUrlToken(url),
+      style,
+      body: bodyStr,
+    });
 
-  const parsed = await readBodySafe(r);
-  const j = parsed?.body || null;
-  const id = j?.DiscountCoupon?.id ?? j?.discount_coupon?.id ?? null;
-  const hasId = !!id;
-  const keys = j && typeof j === "object" ? Object.keys(j) : [];
-  console.log("[tray.coupon.create.resp]", { status: r.status, hasId, id: id || null, keys });
-  if (!hasId) {
-    // body resumido para auditoria (sem tokens)
-    console.log("[tray.coupon.create.resp.body]", j && typeof j === "object" ? j : { body: j });
+    const r = await fetchWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+      body: bodyStr,
+      signal: params?.signal,
+    }, { label: "tray.coupon.create" });
+
+    const parsed = await readBodySafe(r);
+    const j = parsed?.body || null;
+    const id = j?.DiscountCoupon?.id ?? j?.discount_coupon?.id ?? null;
+    const hasId = !!id;
+    const keys = j && typeof j === "object" ? Object.keys(j) : [];
+    console.log("[tray.coupon.create.resp]", { status: r.status, style, hasId, id: id || null, keys });
+    if (!hasId) {
+      console.log("[tray.coupon.create.resp.body]", j && typeof j === "object" ? j : { body: j });
+    }
+    return { r, j, id, hasId };
+  };
+
+  // Tentativa principal: doc-style. Se a Tray responder "Não há dados enviados.", tentamos o legacy-style.
+  const first = await send("doc");
+  if (first.r.ok && first.hasId) {
+    return { ok: true, status: first.r.status, body: first.j };
   }
-  if (!r.ok) err("[tray.create] fail", { status: r.status, body: j });
 
-  return { ok: r.ok && hasId, status: r.status, body: j };
+  const causes = Array.isArray(first.j?.causes) ? first.j.causes.join(" | ") : "";
+  const noData = String(causes || "").toLowerCase().includes("não há dados enviados");
+  if (!first.r.ok && first.r.status === 400 && noData) {
+    console.log("[tray.coupon.create.retry]", { reason: "no_data_sent", trying: "legacy" });
+    const second = await send("legacy");
+    if (second.r.ok && second.hasId) {
+      return { ok: true, status: second.r.status, body: second.j };
+    }
+    if (!second.r.ok) err("[tray.create] fail", { status: second.r.status, body: second.j });
+    return { ok: false, status: second.r.status, body: second.j };
+  }
+
+  if (!first.r.ok) err("[tray.create] fail", { status: first.r.status, body: first.j });
+  return { ok: false, status: first.r.status, body: first.j };
 }
 
 export async function trayCreateCoupon({ code, value, startsAt, endsAt, description, signal } = {}) {
-  // 1ª tentativa: type="$"
-  const t1 = await createCouponWithType({ code, value, startsAt, endsAt, description, signal }, "$");
-  if (t1.ok) {
-    const id = t1.body.DiscountCoupon.id;
+  // Type deve ser somente "$" ou "%". Mantemos "$" (desconto em reais) e removemos fallback "3".
+  const t = await createCouponWithType({ code, value, startsAt, endsAt, description, signal }, "$");
+  if (t.ok) {
+    const id = t.body?.DiscountCoupon?.id ?? t.body?.discount_coupon?.id ?? null;
     dbg("[tray.create] ok com type '$' id:", id);
-    return { id, raw: t1.body };
+    return { id, raw: t.body };
   }
 
-  // 2ª tentativa: type="3"
-  const t2 = await createCouponWithType({ code, value, startsAt, endsAt, description, signal }, "3");
-  if (t2.ok) {
-    const id = t2.body.DiscountCoupon.id;
-    dbg("[tray.create] ok com type '3' id:", id);
-    return { id, raw: t2.body };
-  }
-
-  err("[tray.create] fail (ambas as tentativas)", { first: t1, second: t2 });
+  err("[tray.create] fail", { status: t?.status ?? null, body: t?.body ?? null });
   const e = new Error("tray_create_coupon_failed");
-  e.first = t1;
-  e.second = t2;
-  e.status = t2?.status ?? t1?.status ?? null;
-  e.body = t2?.body ?? t1?.body ?? null;
+  e.status = t?.status ?? null;
+  e.body = t?.body ?? null;
   throw e;
 }
 
+export async function trayGetCouponById(id, { signal } = {}) {
+  if (!id) throw new Error("tray_coupon_id_missing");
+  const token = await trayToken({ signal });
+  const apiBase = await getTrayApiBase();
+  const url = `${apiBase}/discount_coupons/${encodeURIComponent(id)}/?access_token=${encodeURIComponent(token)}`;
+  const urlMasked = String(url).replace(/(access_token=)[^&]+/i, (_m, p1) => `${p1}${String(token).slice(0, 8)}…`);
+  console.log("[tray.coupon.confirm.req]", { url: urlMasked, id: String(id) });
+
+  const r = await fetchWithRetry(url, { method: "GET", signal }, { label: "tray.coupon.confirm" });
+  const parsed = await readBodySafe(r);
+  const j = parsed?.body || null;
+  const gotId = j?.DiscountCoupon?.id ?? j?.discount_coupon?.id ?? null;
+  const ok = r.ok && !!gotId;
+  const keys = j && typeof j === "object" ? Object.keys(j) : [];
+  console.log("[tray.coupon.confirm]", { id: String(id), ok, status: r.status, hasId: !!gotId, keys });
+  if (!ok) console.log("[tray.coupon.confirm.body]", j && typeof j === "object" ? j : { body: j });
+  return { ok, status: r.status, body: j };
+}
 export async function trayDeleteCoupon(id) {
   if (!id) return;
   const token = await trayToken();

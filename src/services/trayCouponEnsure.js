@@ -6,7 +6,7 @@
 // - Idempotente por code (find antes de create)
 
 import { query } from "../db.js";
-import { trayToken, trayFindCouponByCode, trayCreateCoupon } from "./tray.js";
+import { trayToken, trayFindCouponByCode, trayCreateCoupon, trayGetCouponById } from "./tray.js";
 
 const VALID_DAYS = Number(process.env.TRAY_COUPON_VALID_DAYS || 180);
 
@@ -128,7 +128,7 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
   } catch {}
 
   const shortTimeoutMs = Math.max(1000, Number(timeoutMs || 5000)); // token/find
-  const createTimeoutMs = 20_000; // (2) obrigatório: POST cupom 20s
+  const createTimeoutMs = 30_000; // (5) obrigatório: POST cupom 30s
   const pollMaxMs = 25_000; // (3) obrigatório: polling até 25s
 
   const withAbort = async (ms, fn) => {
@@ -218,6 +218,9 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     const trayId = created?.id ?? null;
     if (trayId) {
       console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=created trayId=${trayId || ""}`);
+      // (6) confirmar via GET /discount_coupons/:id
+      await withAbort(shortTimeoutMs, (signal) => trayGetCouponById(trayId, { signal })).catch(() => null);
+      console.log(`[tray.coupon.confirm] user=${uid} rid=${rid} id=${trayId} ok=true`);
       await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
       return { ok: true, status: "SYNCED", action: "created", code, trayId };
     }

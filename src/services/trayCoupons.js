@@ -27,10 +27,14 @@ export async function upsertTrayCoupon({ code, value_cents = 0, coupon_id }) {
   const value = (Number(value_cents) / 100).toFixed(2); // "10.00"
 
   const payload = new URLSearchParams();
-  payload.append('DiscountCoupon[code]', code);
-  payload.append('DiscountCoupon[description]', `Cupom New Store - ${code}`);
-  payload.append('DiscountCoupon[value]', value);
-  payload.append('DiscountCoupon[type]', '$');         // desconto em R$
+  // Doc oficial: ["DiscountCoupon"]["field"]
+  payload.append('["DiscountCoupon"]["code"]', code);
+  payload.append('["DiscountCoupon"]["description"]', `Cupom New Store - ${code}`);
+  payload.append('["DiscountCoupon"]["value"]', value);
+  payload.append('["DiscountCoupon"]["type"]', '$');         // desconto em R$
+  payload.append('["DiscountCoupon"]["usage_counter_limit"]', '1');
+  payload.append('["DiscountCoupon"]["usage_counter_limit_customer"]', '1');
+  payload.append('["DiscountCoupon"]["cumulative_discount"]', '1');
   // Demais campos são opcionais, manter simples.
 
   const path   = coupon_id ? `/discount_coupons/${coupon_id}` : `/discount_coupons`;
