@@ -530,7 +530,7 @@ async function createCouponWithType(params, typeValue) {
     signal: params?.signal,
   });
 
-  const id1 = urlEncoded.body?.DiscountCoupon?.id ?? urlEncoded.body?.discount_coupon?.id ?? null;
+  const id1 = urlEncoded.body?.id ?? urlEncoded.body?.DiscountCoupon?.id ?? urlEncoded.body?.discount_coupon?.id ?? null;
   if (urlEncoded.r.ok && id1) {
     console.log("[tray.coupon.create.resp]", { status: urlEncoded.r.status, hasId: true, id: id1, bodyKeys: urlEncoded.body && typeof urlEncoded.body === "object" ? Object.keys(urlEncoded.body) : [] });
     return { ok: true, status: urlEncoded.r.status, body: urlEncoded.body };
@@ -570,7 +570,7 @@ async function createCouponWithType(params, typeValue) {
     );
     const parsed2 = await readBodySafe(r2);
     const j2 = parsed2?.body ?? null;
-    const id2 = j2?.DiscountCoupon?.id ?? j2?.discount_coupon?.id ?? null;
+    const id2 = j2?.id ?? j2?.DiscountCoupon?.id ?? j2?.discount_coupon?.id ?? null;
     console.log("[tray.http.resp]", { method: "POST", status: r2.status, keys: j2 && typeof j2 === "object" ? Object.keys(j2) : [] });
     console.log("[tray.coupon.create.resp]", { status: r2.status, hasId: !!id2, id: id2 || null, bodyKeys: j2 && typeof j2 === "object" ? Object.keys(j2) : [] });
     if (!id2) console.log("[tray.coupon.create.resp.body]", j2 && typeof j2 === "object" ? j2 : { body: j2 });
@@ -578,7 +578,7 @@ async function createCouponWithType(params, typeValue) {
   }
 
   const body = urlEncoded.body;
-  const id = body?.DiscountCoupon?.id ?? body?.discount_coupon?.id ?? null;
+  const id = body?.id ?? body?.DiscountCoupon?.id ?? body?.discount_coupon?.id ?? null;
   const ok = urlEncoded.r.ok && !!id;
   console.log("[tray.coupon.create.resp]", { status: urlEncoded.r.status, hasId: !!id, id: id || null, bodyKeys: body && typeof body === "object" ? Object.keys(body) : [] });
   if (!ok) console.log("[tray.coupon.create.resp.body]", body && typeof body === "object" ? body : { body });
@@ -589,7 +589,7 @@ export async function trayCreateCoupon({ code, valueBRL, valueStartBRL, startsAt
   // Type deve ser somente "$" ou "%". Mantemos "$" (desconto em reais) e removemos fallback "3".
   const t = await createCouponWithType({ code, valueBRL, valueStartBRL, startsAt, endsAt, description, signal }, "$");
   if (t.ok) {
-    const id = t.body?.DiscountCoupon?.id ?? t.body?.discount_coupon?.id ?? null;
+    const id = t.body?.id ?? t.body?.DiscountCoupon?.id ?? t.body?.discount_coupon?.id ?? null;
     dbg("[tray.create] ok com type '$' id:", id);
     return { id, raw: t.body };
   }
@@ -689,7 +689,7 @@ export async function trayUpdateCouponById(id, { startsAt, endsAt, valueBRL, min
     signal,
   });
 
-  const id1 = urlEncoded.body?.DiscountCoupon?.id ?? urlEncoded.body?.discount_coupon?.id ?? null;
+  const id1 = urlEncoded.body?.id ?? urlEncoded.body?.DiscountCoupon?.id ?? urlEncoded.body?.discount_coupon?.id ?? null;
   if (urlEncoded.r.ok && id1) {
     return { ok: true, status: urlEncoded.r.status, body: urlEncoded.body, id: id1 };
   }
@@ -722,14 +722,14 @@ export async function trayUpdateCouponById(id, { startsAt, endsAt, valueBRL, min
     }, { label: "tray.coupon.update.json" });
     const parsed2 = await readBodySafe(r2);
     const j2 = parsed2?.body ?? null;
-    const id2 = j2?.DiscountCoupon?.id ?? j2?.discount_coupon?.id ?? null;
+    const id2 = j2?.id ?? j2?.DiscountCoupon?.id ?? j2?.discount_coupon?.id ?? null;
     console.log("[tray.http.resp]", { method: "PUT", status: r2.status, keys: j2 && typeof j2 === "object" ? Object.keys(j2) : [] });
     console.log("[tray.coupon.update.resp]", { status: r2.status, hasId: !!id2, id: id2 || null });
     if (!id2) console.log("[tray.coupon.update.resp.body]", j2 && typeof j2 === "object" ? j2 : { body: j2 });
     return { ok: r2.ok && !!id2, status: r2.status, body: j2, id: id2 || null };
   }
 
-  const idFail = urlEncoded.body?.DiscountCoupon?.id ?? urlEncoded.body?.discount_coupon?.id ?? null;
+  const idFail = urlEncoded.body?.id ?? urlEncoded.body?.DiscountCoupon?.id ?? urlEncoded.body?.discount_coupon?.id ?? null;
   console.log("[tray.coupon.update.resp]", { status: urlEncoded.r.status, hasId: !!idFail, id: idFail || null });
   if (!idFail) console.log("[tray.coupon.update.resp.body]", urlEncoded.body && typeof urlEncoded.body === "object" ? urlEncoded.body : { body: urlEncoded.body });
   return { ok: false, status: urlEncoded.r.status, body: urlEncoded.body, id: idFail || null };

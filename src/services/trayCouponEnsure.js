@@ -17,9 +17,100 @@ function fmtDate(d) {
   return `${y}-${m}-${day}`;
 }
 
-function makeUserGiftCardCouponCode(userId) {
+// Gera um cupom determinístico por usuário (mesma lógica usada no login /auth e /api/coupons/sync)
+function makeUserCouponCode(userId) {
   const id = Number(userId || 0);
-  return `NSU-${String(id).padStart(4, "0")}-GC`;
+  const base = `NSU-${String(id).padStart(4, "0")}`;
+  const salt = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const tail = salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
+  return `${base}-${tail}`;
+}
+
+async function loadCouponSystemRow(userId) {
+  const uid = Number(userId);
+  // Pedido do requisito: primeiro tenta public.coupon_tray_system (se existir).
+  try {
+    const r = await query(
+      `SELECT coupon_code,
+              tray_coupon_id,
+              COALESCE(coupon_value_cents,0)::int AS coupon_value_cents
+         FROM public.coupon_tray_system
+        WHERE id = $1
+        LIMIT 1`,
+      [uid]
+    );
+    if (r.rows?.length) return { source: "coupon_tray_system", row: r.rows[0] };
+  } catch {}
+
+  // Fallback compatível com o repo atual: users
+  const r2 = await query(
+    `SELECT coupon_code,
+            tray_coupon_id,
+            COALESCE(coupon_value_cents,0)::int AS coupon_value_cents
+       FROM users
+      WHERE id=$1
+      LIMIT 1`,
+    [uid]
+  );
+  if (!r2.rows?.length) return { source: "none", row: null };
+  return { source: "users", row: r2.rows[0] };
+}
+
+async function persistCouponSystemFields({ userId, code = null, trayCouponId = null }) {
+  const uid = Number(userId);
+  const c = code != null ? String(code) : null;
+  const t = trayCouponId != null ? String(trayCouponId) : null;
+
+  // Atualiza primeiro coupon_tray_system (se existir), senão cai pro users.
+  try {
+    if (c && t) {
+      await query(
+        `UPDATE public.coupon_tray_system
+            SET coupon_code = COALESCE(coupon_code, $2),
+                tray_coupon_id = $3,
+                coupon_updated_at = NOW()
+          WHERE id = $1`,
+        [uid, c, t]
+      );
+      return;
+    }
+    if (t) {
+      await query(
+        `UPDATE public.coupon_tray_system
+            SET tray_coupon_id = $2,
+                coupon_updated_at = NOW()
+          WHERE id = $1`,
+        [uid, t]
+      );
+      return;
+    }
+    if (c) {
+      await query(
+        `UPDATE public.coupon_tray_system
+            SET coupon_code = COALESCE(coupon_code, $2),
+                coupon_updated_at = COALESCE(coupon_updated_at, NOW())
+          WHERE id = $1`,
+        [uid, c]
+      );
+      return;
+    }
+  } catch {}
+
+  // users fallback
+  try {
+    if (c && t) {
+      await query(`UPDATE users SET coupon_code=COALESCE(coupon_code,$2), tray_coupon_id=$3, coupon_updated_at=NOW() WHERE id=$1`, [uid, c, t]);
+      return;
+    }
+    if (t) {
+      await query(`UPDATE users SET tray_coupon_id=$2, coupon_updated_at=NOW() WHERE id=$1`, [uid, t]);
+      return;
+    }
+    if (c) {
+      await query(`UPDATE users SET coupon_code=COALESCE(coupon_code,$2), coupon_updated_at=COALESCE(coupon_updated_at,NOW()) WHERE id=$1`, [uid, c]);
+      return;
+    }
+  } catch {}
 }
 
 async function ensureCouponTraySyncTable() {
@@ -132,27 +223,37 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
 
   console.log(`[tray.coupon.ensure] start user=${uid} rid=${rid}`);
 
-  // Carrega cupom na nossa base (mesma regra do coupons.sync: users.coupon_code e coupon_value_cents)
+  // Carrega cupom na nossa base (prioridade: coupon_tray_system; fallback: users)
   let code = null;
   let valueCents = 0;
+  let dbTrayCouponId = null;
+  let dbSource = "unknown";
   try {
-    const r = await query(
-      `select id, coupon_code, COALESCE(coupon_value_cents,0)::int as coupon_value_cents
-         from users where id=$1 limit 1`,
-      [uid]
-    );
-    if (!r.rows.length) {
+    const loaded = await loadCouponSystemRow(uid);
+    dbSource = loaded.source;
+    const row = loaded.row;
+    if (!row) {
       console.log(`[tray.coupon.ensure] user_not_found user=${uid} rid=${rid}`);
       return { ok: false, status: "USER_NOT_FOUND" };
     }
-    // Código fixo do Cartão Presente (conforme requisito)
-    code = makeUserGiftCardCouponCode(uid);
-    valueCents = Number(r.rows[0].coupon_value_cents || 0);
+    const dbCode = row.coupon_code != null ? String(row.coupon_code).trim() : "";
+    dbTrayCouponId = row.tray_coupon_id != null ? String(row.tray_coupon_id) : null;
+    valueCents = Number(row.coupon_value_cents || 0);
 
-    if (!r.rows[0].coupon_code) {
-      try {
-        await query(`update users set coupon_code=$2, coupon_updated_at=now() where id=$1 and coupon_code is null`, [uid, code]);
-      } catch {}
+    console.log("[tray.coupon.ensure] db coupon", {
+      user: uid,
+      source: dbSource,
+      coupon_code: dbCode || null,
+      tray_coupon_id: dbTrayCouponId || null,
+      coupon_value_cents: valueCents,
+    });
+
+    // Regra: respeitar coupon_code persistido; só gera se estiver vazio.
+    if (dbCode) {
+      code = dbCode;
+    } else {
+      code = makeUserCouponCode(uid);
+      await persistCouponSystemFields({ userId: uid, code }).catch(() => {});
     }
   } catch (e) {
     console.log(`[tray.coupon.ensure] user_load_failed user=${uid} rid=${rid} msg=${e?.message || e}`);
@@ -205,7 +306,7 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
 
   // Status tracking (best-effort)
   try {
-    await upsertCouponTraySync({ userId: uid, code, status: "PENDING", lastError: null, trayCouponId: null, syncedAt: null });
+    await upsertCouponTraySync({ userId: uid, code, status: "PENDING", lastError: null, trayCouponId: dbTrayCouponId, syncedAt: null });
   } catch {}
 
   const shortTimeoutMs = Math.max(1000, Number(timeoutMs || 5000)); // token/find
@@ -329,6 +430,7 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
 
       if (!needsUpdate) {
         console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=exists trayId=${trayId || ""}`);
+        if (trayId) await persistCouponSystemFields({ userId: uid, code, trayCouponId: trayId }).catch(() => {});
         await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
         return { ok: true, status: "SYNCED", action: "exists", code, trayId };
       }
@@ -372,6 +474,7 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
       });
       if (updated?.ok || conf.ok) {
         console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=updated trayId=${trayId || ""}`);
+        if (trayId) await persistCouponSystemFields({ userId: uid, code, trayCouponId: trayId }).catch(() => {});
         await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
         return { ok: true, status: "SYNCED", action: "updated", code, trayId };
       }
@@ -416,6 +519,7 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
     const trayId = created?.id ?? null;
     if (trayId) {
       console.log(`[tray.coupon.ensure] user=${uid} rid=${rid} code=${code} action=created trayId=${trayId || ""}`);
+      console.log("[tray.coupon.create] success", { user: uid, code, tray_coupon_id: String(trayId) });
       const conf = await confirmAndValidate(trayId, {
         startsAt,
         endsAt,
@@ -423,6 +527,7 @@ export async function ensureTrayCouponForUser(userId, { timeoutMs = 5000 } = {})
         valueStartBRL: minPurchase,
       });
       if (conf.ok) {
+        await persistCouponSystemFields({ userId: uid, code, trayCouponId: trayId }).catch(() => {});
         await upsertCouponTraySync({ userId: uid, code, status: "SYNCED", lastError: null, trayCouponId: trayId, syncedAt: new Date().toISOString() }).catch(() => {});
         return { ok: true, status: "SYNCED", action: "created", code, trayId };
       }
