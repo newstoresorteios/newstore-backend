@@ -375,16 +375,92 @@ async function cancelReservation(client, { draw_id, reservationId }) {
   }
 }
 
-async function finalizePaidReservation(client, { draw_id, reservationId, user_id, numbers, amount_cents, provider, billId, chargeId }) {
+function buildAutopayPaymentId({ provider, billId, chargeId, draw_id, user_id }) {
+  const p = String(provider || "").toLowerCase();
+  if (p === "vindi") {
+    if (billId != null && String(billId).trim()) return `autopay:vindi:bill:${String(billId).trim()}`;
+    if (chargeId != null && String(chargeId).trim()) return `autopay:vindi:charge:${String(chargeId).trim()}`;
+  }
+  // fallback (não deveria acontecer, mas evita id null)
+  return `autopay:draw:${String(draw_id)}:user:${String(user_id)}:ts:${Date.now()}`;
+}
+
+async function finalizePaidReservation(client, { draw_id, reservationId, user_id, numbers, amount_cents, provider, billId, chargeId, vindiPayload = null }) {
   await client.query("BEGIN");
   try {
+    const paymentId = buildAutopayPaymentId({ provider, billId, chargeId, draw_id, user_id });
+    log("finalizePaidReservation.start", {
+      draw_id,
+      reservationId,
+      user_id,
+      provider,
+      paymentId,
+      billId: billId != null ? String(billId) : null,
+      chargeId: chargeId != null ? String(chargeId) : null,
+      amount_cents,
+      numbers_len: Array.isArray(numbers) ? numbers.length : null,
+    });
+
+    const vindiPayloadJson = vindiPayload ? JSON.stringify(vindiPayload) : null;
+
+    // payments.id é NOT NULL (tipo text). Para autopay Vindi, usamos id determinístico e UPSERT para idempotência.
     const pay = await client.query(
-      `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at, provider, vindi_bill_id, vindi_charge_id, vindi_status, paid_at)
-       values ($1,$2,$3::int2[],$4,'approved', now(), $5, $6, $7, 'paid', now())
+      `insert into public.payments (
+          id,
+          user_id,
+          draw_id,
+          numbers,
+          amount_cents,
+          status,
+          created_at,
+          provider,
+          vindi_bill_id,
+          vindi_charge_id,
+          vindi_status,
+          paid_at,
+          vindi_payload_json
+        )
+       values (
+          $1,
+          $2,
+          $3,
+          $4::int2[],
+          $5,
+          'approved',
+          now(),
+          $6,
+          $7,
+          $8,
+          'paid',
+          now(),
+          $9::jsonb
+       )
+       on conflict (id) do update
+          set user_id = excluded.user_id,
+              draw_id = excluded.draw_id,
+              numbers = excluded.numbers,
+              amount_cents = excluded.amount_cents,
+              status = 'approved',
+              provider = excluded.provider,
+              vindi_bill_id = excluded.vindi_bill_id,
+              vindi_charge_id = excluded.vindi_charge_id,
+              vindi_status = excluded.vindi_status,
+              paid_at = excluded.paid_at,
+              vindi_payload_json = coalesce(excluded.vindi_payload_json, public.payments.vindi_payload_json)
        returning id`,
-      [user_id, draw_id, numbers, amount_cents, provider, billId, chargeId]
+      [
+        paymentId,
+        user_id,
+        draw_id,
+        numbers,
+        amount_cents,
+        provider,
+        billId != null ? String(billId) : null,
+        chargeId != null ? String(chargeId) : null,
+        vindiPayloadJson,
+      ]
     );
-    const paymentId = pay.rows[0].id;
+    log("finalizePaidReservation.payment_upsert_ok", { paymentId: pay.rows?.[0]?.id || paymentId });
 
     await client.query(
       `update public.reservations
@@ -960,6 +1036,15 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           provider,
           billId,
           chargeId,
+          vindiPayload: {
+            create_bill: bill?.raw ?? null,
+            billId: billId != null ? String(billId) : null,
+            chargeId: chargeId != null ? String(chargeId) : null,
+            billStatus: bill?.billStatus ?? null,
+            chargeStatus: bill?.chargeStatus ?? null,
+            lastTransactionStatus: bill?.lastTransactionStatus ?? null,
+            gatewayMessage: bill?.gatewayMessage ?? null,
+          },
         });
 
         // eslint-disable-next-line no-await-in-loop
