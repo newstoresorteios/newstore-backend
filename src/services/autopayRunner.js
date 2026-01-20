@@ -751,6 +751,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
       // 6.2) Cobrança Vindi avulsa (fora da TX do banco)
       let charge;
       let provider = "vindi";
+      let bill = null;
       let billId = null;
       let chargeId = null;
       let providerRequest = null;
@@ -780,7 +781,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         };
         
         // eslint-disable-next-line no-await-in-loop
-        const bill = await createBill({
+        bill = await createBill({
           customerId: p.vindi_customer_id,
           amount_cents_total: amount_cents,
           quantity: reservedNumbers.length,
@@ -1074,7 +1075,15 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
       } catch (e) {
         chargedFail++;
         const emsg = String(e?.message || e);
-        err("finalize paid failed (refund+cancel)", { user_id, reservationId, msg: emsg });
+        err("finalize paid failed (refund+cancel)", {
+          user_id,
+          reservationId,
+          name: e?.name || null,
+          msg: emsg,
+          stack: e?.stack || null,
+          billId: billId != null ? String(billId) : null,
+          chargeId: chargeId != null ? String(chargeId) : null,
+        });
 
         // Provider cleanup best-effort (refund só se pago; senão cancela bill)
         if (billId || chargeId) {
