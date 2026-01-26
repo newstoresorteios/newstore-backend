@@ -4,6 +4,7 @@ import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { trayCreateCoupon, trayDeleteCoupon } from "../services/tray.js";
 import { ensureTrayCouponForUser } from "../services/trayCouponEnsure.js";
+import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 
 const router = Router();
 const VALID_DAYS = Number(process.env.TRAY_COUPON_VALID_DAYS || 180);
@@ -92,53 +93,57 @@ router.post("/sync", requireAuth, async (req, res) => {
 
     const code = (cur.coupon_code && String(cur.coupon_code).trim()) || codeForUser(uid);
     let trayId = cur.tray_coupon_id || null;
+    const beforeCents = cur.coupon_value_cents || 0;
 
-    const hadSyncBefore = !!cur.last_payment_sync_at; // ← usado para limitar o fallback
+    // --- reconcile credit (idempotente): credita payments aprovados ainda não creditados
+    const hasCreditedFlag = await hasColumn("payments", "coupon_credited");
+    let reconciledPayments = 0;
+    if (hasCreditedFlag) {
+      const { rows: pend } = await query(
+        `SELECT id,
+                COALESCE(provider,'mercadopago') AS provider
+           FROM payments
+          WHERE user_id = $1
+            AND lower(status) IN ('approved','paid','pago')
+            AND coupon_credited = false
+          ORDER BY id ASC
+          LIMIT 500`,
+        [uid]
+      );
+
+      for (const p of pend) {
+        // eslint-disable-next-line no-await-in-loop
+        await creditCouponOnApprovedPayment(String(p.id), {
+          channel: String(p.provider || "").toLowerCase() === "vindi" ? "VINDI" : "PIX",
+          source: "reconcile_sync",
+          runTraceId: `coupons.sync#${rid}`,
+          meta: { unit_cents: 5500 },
+        });
+        reconciledPayments++;
+      }
+    }
+
+    // Atualiza campos auxiliares (sem somar saldo por timestamp)
     const tExpr = await buildTimeExpr();
 
-    // === Transação com lock para evitar duplicidade de incremento ===
     await query("BEGIN");
-
-    // delta desde o último sync (sem updated_at)
-    const sql = `
-      WITH me AS (
-        SELECT id, COALESCE(last_payment_sync_at, to_timestamp(0)) AS last_sync
-          FROM users
-         WHERE id = $1
-         FOR UPDATE
-      ),
-      recent AS (
-        SELECT COALESCE(SUM(p.amount_cents),0)::int AS delta,
-               NULLIF(MAX(${tExpr}), to_timestamp(0)) AS max_t
-          FROM payments p, me
-         WHERE p.user_id = $1
-           AND lower(p.status) IN ('approved','paid','pago')
-           AND (${tExpr}) > me.last_sync
-      ),
-      upd AS (
-        UPDATE users u
-           SET coupon_value_cents   = u.coupon_value_cents + r.delta,
-               last_payment_sync_at = COALESCE(r.max_t, u.last_payment_sync_at),
-               coupon_code          = COALESCE(u.coupon_code, $2),
-               coupon_updated_at    = NOW()
-          FROM recent r
-         WHERE u.id = $1
-           AND r.delta > 0
-        RETURNING u.coupon_value_cents AS final_cents,
-                  r.delta AS delta_cents,
-                  COALESCE(r.max_t, u.last_payment_sync_at) AS new_sync
+    const auxSql = `
+      WITH mx AS (
+        SELECT NULLIF(MAX(${tExpr}), to_timestamp(0)) AS max_t
+          FROM payments
+         WHERE user_id = $1
+           AND lower(status) IN ('approved','paid','pago')
       )
-      SELECT
-        COALESCE((SELECT delta_cents FROM upd), 0) AS delta_cents,
-        (SELECT new_sync FROM upd) AS new_sync,
-        (SELECT coupon_value_cents FROM users WHERE id=$1) AS final_cents;
+      UPDATE users
+         SET coupon_code = COALESCE(coupon_code, $2),
+             last_payment_sync_at = COALESCE(GREATEST(last_payment_sync_at, (SELECT max_t FROM mx)), last_payment_sync_at, (SELECT max_t FROM mx)),
+             coupon_updated_at = NOW()
+       WHERE id = $1
+       RETURNING last_payment_sync_at;
     `;
-    const { rows } = await query(sql, [uid, code]);
+    const aux = await query(auxSql, [uid, code]);
     await query("COMMIT");
-
-    const delta = rows?.[0]?.delta_cents || 0;
-    let finalCents = rows?.[0]?.final_cents ?? cur.coupon_value_cents;
-    const newSync = rows?.[0]?.new_sync || cur.last_payment_sync_at;
+    const newSync = aux?.rows?.[0]?.last_payment_sync_at || cur.last_payment_sync_at;
 
     // 🔧 garante coupon_code mesmo com delta=0 (sem alterar lógica de valores)
     if (!cur.coupon_code) {
@@ -155,36 +160,24 @@ router.post("/sync", requireAuth, async (req, res) => {
       } catch {}
     }
 
+    // Recarrega saldo final após reconcile
+    const afterQ = await query(
+      `SELECT COALESCE(coupon_value_cents,0)::int AS coupon_value_cents,
+              tray_coupon_id
+         FROM users
+        WHERE id=$1
+        LIMIT 1`,
+      [uid]
+    );
+    let finalCents = afterQ.rows?.[0]?.coupon_value_cents ?? beforeCents;
+    trayId = afterQ.rows?.[0]?.tray_coupon_id || trayId;
+
     console.log(
-      `[coupons.sync#${rid}] user=${uid} lastSync=${cur.last_payment_sync_at || null} delta=${delta} newSync=${newSync} coupon_after=${finalCents}`
+      `[coupons.sync#${rid}] user=${uid} reconciled=${reconciledPayments} coupon_before=${beforeCents} coupon_after=${finalCents} newSync=${newSync || null}`
     );
 
-    // --- Fallback controlado: só na PRIMEIRA sincronização (sem last_payment_sync_at)
-    if (!hadSyncBefore) {
-      const totalQ = await query(
-        `SELECT COALESCE(SUM(amount_cents),0)::int AS total
-           FROM payments
-          WHERE user_id=$1 AND lower(status) IN ('approved','paid','pago')`,
-        [uid]
-      );
-      const totalApproved = totalQ.rows?.[0]?.total || 0;
-      if (totalApproved > finalCents) {
-        await query(
-          `UPDATE users
-              SET coupon_value_cents = $2,
-                  coupon_updated_at  = NOW(),
-                  coupon_code        = COALESCE(coupon_code, $3),
-                  last_payment_sync_at = COALESCE($4, last_payment_sync_at)
-            WHERE id=$1`,
-          [uid, totalApproved, code, newSync]
-        );
-        finalCents = totalApproved;
-        console.log(`[coupons.sync#${rid}] first-sync correction up to total=${totalApproved}`);
-      }
-    }
-
     // Recria cupom na Tray apenas se mudou o valor ou não existe ainda
-    const mustRecreateTray = !trayId || finalCents !== cur.coupon_value_cents;
+    const mustRecreateTray = !trayId || finalCents !== beforeCents;
     if (mustRecreateTray) {
       if (trayId) {
         try {

@@ -3,6 +3,7 @@
 import express from "express";
 import { getPool } from "../db.js";
 import { parseWebhook, getBill, getCharge } from "../services/vindi.js";
+import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 
 const router = express.Router();
 
@@ -164,6 +165,17 @@ router.post("/vindi/webhook", express.json(), async (req, res) => {
           [payment.id]
         );
       }
+    }
+
+    // Crédito de saldo (idempotente) — somente quando approved (não altera fluxos existentes)
+    if (String(newStatus).toLowerCase() === "approved") {
+      await creditCouponOnApprovedPayment(String(payment.id), {
+        channel: "VINDI",
+        source: "vindi_webhook",
+        runTraceId: null,
+        meta: { unit_cents: 5500 },
+        pgClient: client,
+      });
     }
 
     // Reconcilição: se necessário, atualiza números/reservas

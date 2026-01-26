@@ -3,6 +3,7 @@ import { getPool } from "../db.js";
 // MP desabilitado para autopay (mantido apenas para compatibilidade de imports, não usado)
 // import { mpChargeCard } from "./mercadopago.js";
 import { createBill, chargeBill, refundCharge, getBill, cancelBill } from "./vindi.js";
+import { creditCouponOnApprovedPayment } from "./couponBalance.js";
 import crypto from "node:crypto";
 
 /* ------------------------------------------------------- *
@@ -1055,6 +1056,16 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           provider_bill_id: billId,
           provider_charge_id: chargeId,
           error_message: null,
+        });
+
+        // Crédito de saldo (idempotente) após payment ficar approved
+        // eslint-disable-next-line no-await-in-loop
+        await creditCouponOnApprovedPayment(fin.paymentId, {
+          channel: "VINDI",
+          source: "reconcile_sync",
+          runTraceId,
+          meta: { unit_cents: 5500, autopay: true },
+          pgClient: client,
         });
 
         chargedOk++;

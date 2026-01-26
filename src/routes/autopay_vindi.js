@@ -4,6 +4,7 @@ import express from "express";
 import crypto from "node:crypto";
 import { query, getPool } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
+import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 import {
   ensureCustomer,
   createPaymentProfile,
@@ -1255,6 +1256,17 @@ router.post("/vindi/webhook", async (req, res) => {
                WHERE vindi_bill_id = $2`,
               [billStatus, billId]
             );
+
+            // Crédito de saldo (idempotente) quando virar approved
+            if (String(billStatus).toLowerCase() === "paid" && paymentResult?.rows?.[0]?.id) {
+              await creditCouponOnApprovedPayment(String(paymentResult.rows[0].id), {
+                channel: "VINDI",
+                source: "vindi_webhook",
+                runTraceId: requestId,
+                meta: { unit_cents: 5500, autopay: true },
+                pgClient: client,
+              });
+            }
           }
 
           await client.query("COMMIT");

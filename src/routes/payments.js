@@ -5,6 +5,7 @@ import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { getTicketPriceCents } from '../services/config.js';
+import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
 
 const router = Router();
 
@@ -158,6 +159,12 @@ async function _reconcilePendingPaymentsCore(minutes) {
         if (pr.rows.length) {
           const { draw_id, numbers } = pr.rows[0];
           await settleApprovedPayment(id, draw_id, numbers);
+          await creditCouponOnApprovedPayment(id, {
+            channel: 'PIX',
+            source: 'reconcile_sync',
+            runTraceId: null,
+            meta: { unit_cents: 5500 },
+          });
           //await finalizeDrawIfComplete(draw_id);
           approved++;
         }
@@ -323,6 +330,12 @@ router.get('/:id/status', requireAuth, async (req, res) => {
         const { draw_id, numbers } = pr.rows[0];
 
         await settleApprovedPayment(id, draw_id, numbers);
+        await creditCouponOnApprovedPayment(id, {
+          channel: 'PIX',
+          source: 'pix_status_poll',
+          runTraceId: null,
+          meta: { unit_cents: 5500 },
+        });
         //await finalizeDrawIfComplete(draw_id);
       }
     }
@@ -366,6 +379,12 @@ router.post('/webhook', async (req, res) => {
         const { draw_id, numbers } = pr.rows[0];
 
         await settleApprovedPayment(id, draw_id, numbers);
+        await creditCouponOnApprovedPayment(id, {
+          channel: 'PIX',
+          source: 'mercadopago_webhook',
+          runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
+          meta: { unit_cents: 5500 },
+        });
         //await finalizeDrawIfComplete(draw_id);
       }
     }
@@ -452,6 +471,12 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
       if (pr.rows.length) {
         const { draw_id, numbers } = pr.rows[0];
         await settleApprovedPayment(id, draw_id, numbers);
+        await creditCouponOnApprovedPayment(id, {
+          channel: 'PIX',
+          source: 'mercadopago_webhook',
+          runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
+          meta: { unit_cents: 5500 },
+        });
         //await finalizeDrawIfComplete(draw_id);
       }
     }
