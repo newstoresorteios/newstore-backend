@@ -2,12 +2,10 @@
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
-import { trayCreateCoupon, trayDeleteCoupon } from "../services/tray.js";
 import { ensureTrayCouponForUser } from "../services/trayCouponEnsure.js";
 import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 
 const router = Router();
-const VALID_DAYS = Number(process.env.TRAY_COUPON_VALID_DAYS || 180);
 
 function codeForUser(userId) {
   const id = Number(userId || 0);
@@ -15,13 +13,6 @@ function codeForUser(userId) {
   const salt = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const tail = salt[(id * 7) % salt.length] + salt[(id * 13) % salt.length];
   return `${base}-${tail}`;
-}
-
-function fmtDate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
 }
 
 // ---------- helpers de schema/tempo ----------
@@ -176,35 +167,27 @@ router.post("/sync", requireAuth, async (req, res) => {
       `[coupons.sync#${rid}] user=${uid} reconciled=${reconciledPayments} coupon_before=${beforeCents} coupon_after=${finalCents} newSync=${newSync || null}`
     );
 
-    // Recria cupom na Tray apenas se mudou o valor ou não existe ainda
-    const mustRecreateTray = !trayId || finalCents !== beforeCents;
-    if (mustRecreateTray) {
-      if (trayId) {
-        try {
-          console.log(`[coupons.sync#${rid}] deleting old Tray coupon id=${trayId}`);
-          await trayDeleteCoupon(trayId);
-        } catch (e) {
-          console.warn(`[coupons.sync#${rid}] delete warn:`, e?.message || e);
-        }
-      }
-      const startsAt = fmtDate(new Date());
-      const endsAt = fmtDate(new Date(Date.now() + VALID_DAYS * 86400000));
-      console.log(`[tray.coupon.sync#${rid}] user=${uid} creating`, { code, value: finalCents / 100, startsAt, endsAt });
-      try {
-        // Usa o ensure best-effort (idempotente por code) e atualiza id
-        const ensured = await ensureTrayCouponForUser(uid);
-        trayId = ensured?.id ? String(ensured.id) : trayId;
+    // Regra: NÃO deletar/recriar cupom na Tray (mantém o "mesmo cupom do cliente").
+    // Sempre chama ensure e deixa ela atualizar por tray_coupon_id ou por code.
+    let ensured = null;
+    try {
+      ensured = await ensureTrayCouponForUser(uid);
+      const ensuredTrayId = ensured?.trayId != null ? String(ensured.trayId) : null;
+      if (ensuredTrayId && String(trayId || "") !== ensuredTrayId) {
+        trayId = ensuredTrayId;
+        // Atualiza o id apenas se mudou (evita writes desnecessários)
         await query(
           `UPDATE users
               SET tray_coupon_id = $2,
                   coupon_updated_at = NOW()
-            WHERE id = $1`,
+            WHERE id = $1
+              AND (tray_coupon_id IS DISTINCT FROM $2)`,
           [uid, trayId]
         );
-      } catch (e) {
-        // ok: mantemos valor no banco mesmo que a Tray falhe
-        console.warn(`[tray.coupon.sync#${rid}] tray ensure warn:`, e?.message || e);
       }
+    } catch (e) {
+      // ok: mantemos valor no banco mesmo que a Tray falhe
+      console.warn(`[tray.coupon.sync#${rid}] tray ensure warn:`, e?.message || e);
     }
 
     return res.json({
@@ -213,7 +196,7 @@ router.post("/sync", requireAuth, async (req, res) => {
       value: finalCents / 100,
       cents: finalCents,
       id: trayId,
-      synced: mustRecreateTray,
+      synced: ensured?.status === "SYNCED",
       last_payment_sync_at: newSync || null,
     });
   } catch (e) {

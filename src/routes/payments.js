@@ -20,6 +20,11 @@ const PIX_EXP_MIN = Math.max(
   Number(process.env.PIX_EXP_MIN || process.env.PIX_EXP_MINUTES || 30)
 );
 
+function isDebugCouponEnabled() {
+  const v = String(process.env.DEBUG_COUPON || "").toLowerCase().trim();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
@@ -159,12 +164,16 @@ async function _reconcilePendingPaymentsCore(minutes) {
         if (pr.rows.length) {
           const { draw_id, numbers } = pr.rows[0];
           await settleApprovedPayment(id, draw_id, numbers);
-          await creditCouponOnApprovedPayment(id, {
+          const creditRes = await creditCouponOnApprovedPayment(id, {
             channel: 'PIX',
             source: 'reconcile_sync',
             runTraceId: null,
             meta: { unit_cents: 5500 },
+            unitCents: 5500,
           });
+          if (isDebugCouponEnabled()) {
+            console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
+          }
           //await finalizeDrawIfComplete(draw_id);
           approved++;
         }
@@ -330,12 +339,16 @@ router.get('/:id/status', requireAuth, async (req, res) => {
         const { draw_id, numbers } = pr.rows[0];
 
         await settleApprovedPayment(id, draw_id, numbers);
-        await creditCouponOnApprovedPayment(id, {
+        const creditRes = await creditCouponOnApprovedPayment(id, {
           channel: 'PIX',
           source: 'pix_status_poll',
           runTraceId: null,
           meta: { unit_cents: 5500 },
+          unitCents: 5500,
         });
+        if (isDebugCouponEnabled()) {
+          console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
+        }
         //await finalizeDrawIfComplete(draw_id);
       }
     }
@@ -379,12 +392,16 @@ router.post('/webhook', async (req, res) => {
         const { draw_id, numbers } = pr.rows[0];
 
         await settleApprovedPayment(id, draw_id, numbers);
-        await creditCouponOnApprovedPayment(id, {
+        const creditRes = await creditCouponOnApprovedPayment(id, {
           channel: 'PIX',
           source: 'mercadopago_webhook',
           runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
           meta: { unit_cents: 5500 },
+          unitCents: 5500,
         });
+        if (isDebugCouponEnabled()) {
+          console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
+        }
         //await finalizeDrawIfComplete(draw_id);
       }
     }
@@ -471,12 +488,16 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
       if (pr.rows.length) {
         const { draw_id, numbers } = pr.rows[0];
         await settleApprovedPayment(id, draw_id, numbers);
-        await creditCouponOnApprovedPayment(id, {
+        const creditRes = await creditCouponOnApprovedPayment(id, {
           channel: 'PIX',
           source: 'mercadopago_webhook',
           runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
           meta: { unit_cents: 5500 },
+          unitCents: 5500,
         });
+        if (isDebugCouponEnabled()) {
+          console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
+        }
         //await finalizeDrawIfComplete(draw_id);
       }
     }
