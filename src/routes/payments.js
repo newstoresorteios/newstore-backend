@@ -25,6 +25,11 @@ function isDebugCouponEnabled() {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+function isDebugMpEnabled() {
+  const v = String(process.env.DEBUG_MP || "").toLowerCase().trim();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
@@ -262,8 +267,23 @@ router.post('/pix', requireAuth, async (req, res) => {
       .map((n) => n.toString().padStart(2, '0'))
       .join(', ')}`;
 
-    const baseUrl = (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+    const publicUrl = process.env.PUBLIC_URL ? String(process.env.PUBLIC_URL).replace(/\/$/, '') : '';
+    let baseUrl = publicUrl;
+    if (!baseUrl) {
+      const protoRaw = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+      const proto = String(protoRaw).split(',')[0].trim() || 'https';
+      const host = req.get('host');
+      let fallback = `${proto}://${host}`.replace(/\/$/, '');
+      if (process.env.NODE_ENV === 'production' && !fallback.startsWith('https://')) {
+        // apenas no fallback (se PUBLIC_URL estiver correto, respeitamos)
+        fallback = fallback.replace(/^http:\/\//, 'https://');
+      }
+      baseUrl = fallback;
+    }
     const notification_url = `${baseUrl}/api/payments/webhook`;
+    if (isDebugMpEnabled()) {
+      console.log('[mp.pix] notification_url=', notification_url);
+    }
 
     // E-mail do pagador
     const payerEmail = rs.user_email || req.user?.email || 'comprador@example.com';
@@ -284,6 +304,9 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     const body = mpResp?.body || mpResp;
     const { id, status, point_of_interaction } = body || {};
+    if (isDebugMpEnabled()) {
+      console.log('[mp.pix] created payment', { id: id != null ? String(id) : null, status: status || null });
+    }
     const td = point_of_interaction?.transaction_data || {};
 
     // Normaliza QR/copia-e-cola

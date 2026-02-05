@@ -53,6 +53,9 @@ import { ensureAppConfig } from "./services/config.js";
 import { validateTrayConfigAtStartup } from "./services/trayConfig.js";
 
 const app = express();
+// Importante para rodar atrás de proxy (Render/Nginx/Cloudflare/etc):
+// garante req.protocol e x-forwarded-* corretos para webhooks (ex.: Mercado Pago).
+app.set("trust proxy", 1);
 
 // Validação de config Tray no boot (sem imprimir segredos)
 try { validateTrayConfigAtStartup(); } catch {}

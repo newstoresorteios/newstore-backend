@@ -31,7 +31,7 @@ function safeJsonMeta(meta) {
  * @param {string|null} options.runTraceId
  * @param {object|null} options.meta
  * @param {number|null} options.unitCents
- * @returns {Promise<{ok:boolean, credited_rows:number, history_rows:number, action:string, invalid_amount?:boolean, computed_delta_cents?:number|null, computed_qty?:number|null, computed_unit_cents?:number|null}>}
+ * @returns {Promise<{ok:boolean, credited_rows:number, history_rows:number, action:string, reason?:string|null, invalid_amount?:boolean, delta_cents?:number|null, qty?:number|null, unit_cents?:number|null, computed_delta_cents?:number|null, computed_qty?:number|null, computed_unit_cents?:number|null, already_in_ledger?:boolean}>}
  */
 export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
   const pid = paymentId != null ? String(paymentId) : "";
@@ -60,7 +60,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
 
   // 1 SQL atômico (CTE):
   // - trava crédito com payments.coupon_credited=false + status=approved
-  // - valida amount_cents > 0 para não creditar errado
+  // - calcula delta por qty*n (qty = array_length(numbers,1))
+  // - NO-OP seguro quando qty<=0 (reason=no_numbers)
   // - soma users.coupon_value_cents
   // - insere ledger (ON CONFLICT DO NOTHING)
   const sql = `
@@ -80,7 +81,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         CASE
           WHEN COALESCE(array_length(pi.numbers, 1), 0) > 0
             THEN (COALESCE(array_length(pi.numbers, 1), 0) * $5::int)
-          ELSE COALESCE(pi.amount_cents, 0)
+          ELSE 0
         END::int AS delta_cents
       FROM pi
     ),
@@ -90,11 +91,17 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
              coupon_credited_at = now()
         FROM calc
        WHERE pay.id = calc.id
-         AND calc.status_l = 'approved'
-         AND lower(pay.status) = 'approved'
+         AND calc.status_l IN ('approved','paid','pago')
+         AND lower(pay.status) IN ('approved','paid','pago')
          AND pay.coupon_credited = false
          AND calc.coupon_credited = false
          AND calc.delta_cents > 0
+         AND NOT EXISTS (
+           SELECT 1
+           FROM public.coupon_balance_history h
+           WHERE h.payment_id = calc.id
+             AND h.event_type = 'CREDIT_PURCHASE'
+         )
        RETURNING
          pay.id,
          calc.user_id,
@@ -102,7 +109,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
          calc.reservation_id,
          calc.qty,
          calc.unit_cents,
-         calc.delta_cents
+         calc.delta_cents,
+         calc.status_l AS payment_status
     ),
     u AS (
       UPDATE public.users usr
@@ -119,7 +127,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
          p.qty,
          p.unit_cents,
          p.draw_id,
-         p.reservation_id
+         p.reservation_id,
+         p.payment_status
     ),
     h AS (
       INSERT INTO public.coupon_balance_history
@@ -133,7 +142,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         u.balance_after_cents,
         'CREDIT_PURCHASE',
         $2,
-        'approved',
+        u.payment_status,
         u.draw_id,
         u.reservation_id,
         $3,
@@ -153,17 +162,25 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       (SELECT delta_cents::int FROM calc LIMIT 1) AS computed_delta_cents,
       (SELECT qty::int FROM calc LIMIT 1) AS computed_qty,
       (SELECT unit_cents::int FROM calc LIMIT 1) AS computed_unit_cents,
-      (SELECT COALESCE((calc.status_l = 'approved' AND calc.coupon_credited = false AND calc.delta_cents <= 0), false) FROM calc) AS invalid_amount
+      (SELECT COALESCE(EXISTS(
+        SELECT 1
+        FROM public.coupon_balance_history h
+        WHERE h.payment_id = pi.id
+          AND h.event_type = 'CREDIT_PURCHASE'
+      ), false) FROM pi) AS already_in_ledger,
+      (SELECT COALESCE((calc.status_l IN ('approved','paid','pago') AND calc.coupon_credited = false AND calc.qty <= 0), false) FROM calc) AS no_numbers
   `;
 
   try {
     const { rows } = await q(sql, [pid, channel, runTraceId, metaJson, unitCents]);
     const credited_rows = rows?.[0]?.credited_rows ?? 0;
     const history_rows = rows?.[0]?.history_rows ?? 0;
-    const invalid_amount = !!rows?.[0]?.invalid_amount;
     const computed_delta_cents = rows?.[0]?.computed_delta_cents ?? null;
     const computed_qty = rows?.[0]?.computed_qty ?? null;
     const computed_unit_cents = rows?.[0]?.computed_unit_cents ?? null;
+    const already_in_ledger = !!rows?.[0]?.already_in_ledger;
+    const no_numbers = !!rows?.[0]?.no_numbers;
+    const reason = no_numbers ? "no_numbers" : null;
 
     if (isDebugEnabled()) {
       // logs enxutos, sem poluir produção
@@ -176,31 +193,25 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         `history_rows=${history_rows}`,
         `qty=${computed_qty ?? ""}`,
         `unit=${computed_unit_cents ?? ""}`,
-        `delta=${computed_delta_cents ?? ""}`
+        `delta=${computed_delta_cents ?? ""}`,
+        `reason=${reason ?? ""}`,
+        `already_in_ledger=${already_in_ledger ? "1" : "0"}`
       );
-    }
-
-    if (invalid_amount) {
-      return {
-        ok: false,
-        credited_rows,
-        history_rows,
-        action: "invalid_amount",
-        invalid_amount: true,
-        computed_delta_cents,
-        computed_qty,
-        computed_unit_cents,
-      };
     }
 
     return {
       ok: true,
       credited_rows,
       history_rows,
-      action: credited_rows === 1 ? "credited" : "noop",
+      action: reason || (credited_rows === 1 ? "credited" : "noop"),
+      reason,
+      delta_cents: computed_delta_cents,
+      qty: computed_qty,
+      unit_cents: computed_unit_cents,
       computed_delta_cents,
       computed_qty,
       computed_unit_cents,
+      already_in_ledger,
     };
   } catch (e) {
     // Segurança operacional: não quebrar fluxo existente caso migration ainda não tenha rodado
@@ -216,9 +227,14 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         credited_rows: 0,
         history_rows: 0,
         action: "not_supported",
+        reason: null,
+        delta_cents: null,
+        qty: null,
+        unit_cents: unitCents,
         computed_delta_cents: null,
         computed_qty: null,
         computed_unit_cents: unitCents,
+        already_in_ledger: false,
       };
     }
 
@@ -231,9 +247,14 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       credited_rows: 0,
       history_rows: 0,
       action: "error",
+      reason: null,
+      delta_cents: null,
+      qty: null,
+      unit_cents: unitCents,
       computed_delta_cents: null,
       computed_qty: null,
       computed_unit_cents: unitCents,
+      already_in_ledger: false,
     };
   }
 }
