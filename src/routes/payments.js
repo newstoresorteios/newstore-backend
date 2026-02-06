@@ -179,6 +179,17 @@ async function _reconcilePendingPaymentsCore(minutes) {
           if (isDebugCouponEnabled()) {
             console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
           }
+          if (creditRes?.ok === false || ['error', 'not_supported', 'invalid_amount'].includes(String(creditRes?.action || ''))) {
+            console.warn("[coupon.credit][PIX] WARN", {
+              paymentId: id,
+              action: creditRes?.action || null,
+              reason: creditRes?.reason || null,
+              user_id: creditRes?.user_id ?? null,
+              status: creditRes?.status ?? null,
+              errCode: creditRes?.errCode ?? null,
+              errMsg: creditRes?.errMsg ?? null,
+            });
+          }
           //await finalizeDrawIfComplete(draw_id);
           approved++;
         }
@@ -372,6 +383,17 @@ router.get('/:id/status', requireAuth, async (req, res) => {
         if (isDebugCouponEnabled()) {
           console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
         }
+        if (creditRes?.ok === false || ['error', 'not_supported', 'invalid_amount'].includes(String(creditRes?.action || ''))) {
+          console.warn("[coupon.credit][PIX] WARN", {
+            paymentId: id,
+            action: creditRes?.action || null,
+            reason: creditRes?.reason || null,
+            user_id: creditRes?.user_id ?? null,
+            status: creditRes?.status ?? null,
+            errCode: creditRes?.errCode ?? null,
+            errMsg: creditRes?.errMsg ?? null,
+          });
+        }
         //await finalizeDrawIfComplete(draw_id);
       }
     }
@@ -424,6 +446,17 @@ router.post('/webhook', async (req, res) => {
         });
         if (isDebugCouponEnabled()) {
           console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
+        }
+        if (creditRes?.ok === false || ['error', 'not_supported', 'invalid_amount'].includes(String(creditRes?.action || ''))) {
+          console.warn("[coupon.credit][PIX] WARN", {
+            paymentId: id,
+            action: creditRes?.action || null,
+            reason: creditRes?.reason || null,
+            user_id: creditRes?.user_id ?? null,
+            status: creditRes?.status ?? null,
+            errCode: creditRes?.errCode ?? null,
+            errMsg: creditRes?.errMsg ?? null,
+          });
         }
         //await finalizeDrawIfComplete(draw_id);
       }
@@ -520,6 +553,17 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
         });
         if (isDebugCouponEnabled()) {
           console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
+        }
+        if (creditRes?.ok === false || ['error', 'not_supported', 'invalid_amount'].includes(String(creditRes?.action || ''))) {
+          console.warn("[coupon.credit][PIX] WARN", {
+            paymentId: id,
+            action: creditRes?.action || null,
+            reason: creditRes?.reason || null,
+            user_id: creditRes?.user_id ?? null,
+            status: creditRes?.status ?? null,
+            errCode: creditRes?.errCode ?? null,
+            errMsg: creditRes?.errMsg ?? null,
+          });
         }
         //await finalizeDrawIfComplete(draw_id);
       }

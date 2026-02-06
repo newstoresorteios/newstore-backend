@@ -31,7 +31,23 @@ function safeJsonMeta(meta) {
  * @param {string|null} options.runTraceId
  * @param {object|null} options.meta
  * @param {number|null} options.unitCents
- * @returns {Promise<{ok:boolean, credited_rows:number, history_rows:number, action:string, reason?:string|null, invalid_amount?:boolean, delta_cents?:number|null, qty?:number|null, unit_cents?:number|null, computed_delta_cents?:number|null, computed_qty?:number|null, computed_unit_cents?:number|null, already_in_ledger?:boolean}>}
+ * @returns {Promise<{
+ *  ok:boolean,
+ *  action:'credited'|'noop'|'invalid_amount'|'not_supported'|'error'|'invalid_payment_id',
+ *  reason?:string|null,
+ *  history_rows:number,
+ *  user_rows:number,
+ *  payment_rows:number,
+ *  user_id?:number|null,
+ *  status?:string|null,
+ *  delta_cents?:number|null,
+ *  qty?:number|null,
+ *  unit_cents?:number|null,
+ *  already_in_ledger?:boolean,
+ *  already_credited?:boolean,
+ *  errCode?:string|null,
+ *  errMsg?:string|null
+ * }>}
  */
 export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
   const pid = paymentId != null ? String(paymentId) : "";
@@ -55,132 +71,171 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
   const q = options?.pgClient?.query ? options.pgClient.query.bind(options.pgClient) : defaultQuery;
 
   if (!pid) {
-    return { ok: false, credited_rows: 0, history_rows: 0, action: "invalid_payment_id" };
+    return {
+      ok: false,
+      action: "invalid_payment_id",
+      reason: "missing_payment_id",
+      history_rows: 0,
+      user_rows: 0,
+      payment_rows: 0,
+      user_id: null,
+      status: null,
+      delta_cents: null,
+      qty: null,
+      unit_cents: unitCents,
+      already_in_ledger: false,
+      already_credited: false,
+      errCode: null,
+      errMsg: null,
+    };
   }
 
   // 1 SQL atômico (CTE):
-  // - trava crédito com payments.coupon_credited=false + status=approved
-  // - calcula delta por qty*n (qty = array_length(numbers,1))
-  // - NO-OP seguro quando qty<=0 (reason=no_numbers)
-  // - soma users.coupon_value_cents
-  // - insere ledger (ON CONFLICT DO NOTHING)
+  // - GATE de idempotência: coupon_balance_history UNIQUE(payment_id,event_type)
+  // - Lock no usuário (FOR UPDATE) para balance_before correto
+  // - NUNCA marca payments.coupon_credited=true sem:
+  //   (a) ter inserido ledger nesta execução, OU
+  //   (b) já existir ledger CREDIT_PURCHASE para este payment
+  // - Não depende de colunas opcionais em payments (ex.: reservation_id)
   const sql = `
     WITH pi AS (
-      SELECT id, user_id, amount_cents, draw_id, reservation_id, numbers,
-             lower(status) AS status_l,
-             coupon_credited
-        FROM public.payments
-       WHERE id = $1
-       LIMIT 1
+      SELECT
+        id,
+        user_id,
+        numbers,
+        lower(status) AS status_l,
+        coupon_credited
+      FROM public.payments
+      WHERE id = $1
+      LIMIT 1
     ),
     calc AS (
       SELECT
         pi.*,
         COALESCE(array_length(pi.numbers, 1), 0)::int AS qty,
         $5::int AS unit_cents,
-        CASE
-          WHEN COALESCE(array_length(pi.numbers, 1), 0) > 0
-            THEN (COALESCE(array_length(pi.numbers, 1), 0) * $5::int)
-          ELSE 0
-        END::int AS delta_cents
+        (COALESCE(array_length(pi.numbers, 1), 0) * $5::int)::int AS delta_cents
       FROM pi
     ),
-    p AS (
-      UPDATE public.payments pay
-         SET coupon_credited = true,
-             coupon_credited_at = now()
-        FROM calc
-       WHERE pay.id = calc.id
-         AND calc.status_l IN ('approved','paid','pago')
-         AND lower(pay.status) IN ('approved','paid','pago')
-         AND pay.coupon_credited = false
-         AND calc.coupon_credited = false
-         AND calc.delta_cents > 0
-         AND NOT EXISTS (
-           SELECT 1
-           FROM public.coupon_balance_history h
-           WHERE h.payment_id = calc.id
-             AND h.event_type = 'CREDIT_PURCHASE'
-         )
-       RETURNING
-         pay.id,
-         calc.user_id,
-         calc.draw_id,
-         calc.reservation_id,
-         calc.qty,
-         calc.unit_cents,
-         calc.delta_cents,
-         calc.status_l AS payment_status
-    ),
-    u AS (
-      UPDATE public.users usr
-         SET coupon_value_cents = usr.coupon_value_cents + p.delta_cents,
-             coupon_updated_at  = now()
-        FROM p
-       WHERE usr.id = p.user_id
-       RETURNING
-         usr.id AS user_id,
-         (usr.coupon_value_cents - p.delta_cents) AS balance_before_cents,
-         usr.coupon_value_cents AS balance_after_cents,
-         p.id AS payment_id,
-         p.delta_cents,
-         p.qty,
-         p.unit_cents,
-         p.draw_id,
-         p.reservation_id,
-         p.payment_status
+    ul AS (
+      SELECT
+        u.id AS user_id,
+        COALESCE(u.coupon_value_cents, 0)::int AS balance_before_cents
+      FROM public.users u
+      JOIN calc c ON c.user_id = u.id
+      FOR UPDATE
     ),
     h AS (
       INSERT INTO public.coupon_balance_history
         (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
          event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
       SELECT
-        u.user_id,
-        u.payment_id,
-        u.delta_cents,
-        u.balance_before_cents,
-        u.balance_after_cents,
+        ul.user_id,
+        c.id,
+        c.delta_cents,
+        ul.balance_before_cents,
+        (ul.balance_before_cents + c.delta_cents),
         'CREDIT_PURCHASE',
         $2,
-        u.payment_status,
-        u.draw_id,
-        u.reservation_id,
+        c.status_l,
+        NULL::int4,
+        NULL::text,
         $3,
         ($4::jsonb || jsonb_build_object(
-          'unit_cents', u.unit_cents,
-          'qty', u.qty,
+          'unit_cents', c.unit_cents,
+          'qty', c.qty,
           'source', ($4::jsonb->>'source'),
           'channel', $2
         ))
-      FROM u
+      FROM calc c
+      JOIN ul ON true
+      WHERE c.status_l IN ('approved','paid','pago')
+        AND COALESCE(c.coupon_credited, false) = false
+        AND c.qty > 0
+        AND c.delta_cents > 0
       ON CONFLICT DO NOTHING
-      RETURNING id
+      RETURNING user_id, payment_id, delta_cents
+    ),
+    u_upd AS (
+      UPDATE public.users usr
+         SET coupon_value_cents = usr.coupon_value_cents + h.delta_cents,
+             coupon_updated_at  = now()
+        FROM h
+       WHERE usr.id = h.user_id
+       RETURNING usr.id AS user_id
+    ),
+    p_upd AS (
+      UPDATE public.payments pay
+         SET coupon_credited = true,
+             coupon_credited_at = now()
+        FROM calc c
+       WHERE pay.id = c.id
+         AND lower(pay.status) IN ('approved','paid','pago')
+         AND COALESCE(pay.coupon_credited, false) = false
+         AND (
+           EXISTS (SELECT 1 FROM h)
+           OR EXISTS (
+             SELECT 1
+             FROM public.coupon_balance_history hh
+             WHERE hh.payment_id = c.id
+               AND hh.event_type = 'CREDIT_PURCHASE'
+           )
+         )
+      RETURNING pay.id
     )
     SELECT
-      (SELECT count(*)::int FROM p) AS credited_rows,
       (SELECT count(*)::int FROM h) AS history_rows,
-      (SELECT delta_cents::int FROM calc LIMIT 1) AS computed_delta_cents,
-      (SELECT qty::int FROM calc LIMIT 1) AS computed_qty,
-      (SELECT unit_cents::int FROM calc LIMIT 1) AS computed_unit_cents,
+      (SELECT count(*)::int FROM u_upd) AS user_rows,
+      (SELECT count(*)::int FROM p_upd) AS payment_rows,
+      (SELECT c.user_id::int FROM calc c LIMIT 1) AS user_id,
+      (SELECT c.status_l::text FROM calc c LIMIT 1) AS status_l,
+      (SELECT c.qty::int FROM calc c LIMIT 1) AS qty,
+      (SELECT c.unit_cents::int FROM calc c LIMIT 1) AS unit_cents,
+      (SELECT c.delta_cents::int FROM calc c LIMIT 1) AS delta_cents,
       (SELECT COALESCE(EXISTS(
         SELECT 1
-        FROM public.coupon_balance_history h
-        WHERE h.payment_id = pi.id
-          AND h.event_type = 'CREDIT_PURCHASE'
+        FROM public.coupon_balance_history hh
+        WHERE hh.payment_id = pi.id
+          AND hh.event_type = 'CREDIT_PURCHASE'
       ), false) FROM pi) AS already_in_ledger,
-      (SELECT COALESCE((calc.status_l IN ('approved','paid','pago') AND calc.coupon_credited = false AND calc.qty <= 0), false) FROM calc) AS no_numbers
+      (SELECT COALESCE(pi.coupon_credited, false) FROM pi) AS already_credited
   `;
 
   try {
     const { rows } = await q(sql, [pid, channel, runTraceId, metaJson, unitCents]);
-    const credited_rows = rows?.[0]?.credited_rows ?? 0;
     const history_rows = rows?.[0]?.history_rows ?? 0;
-    const computed_delta_cents = rows?.[0]?.computed_delta_cents ?? null;
-    const computed_qty = rows?.[0]?.computed_qty ?? null;
-    const computed_unit_cents = rows?.[0]?.computed_unit_cents ?? null;
+    const user_rows = rows?.[0]?.user_rows ?? 0;
+    const payment_rows = rows?.[0]?.payment_rows ?? 0;
+    const user_id = rows?.[0]?.user_id ?? null;
+    const status = rows?.[0]?.status_l ?? null;
+    const qty = rows?.[0]?.qty ?? null;
+    const unit_cents = rows?.[0]?.unit_cents ?? null;
+    const delta_cents = rows?.[0]?.delta_cents ?? null;
     const already_in_ledger = !!rows?.[0]?.already_in_ledger;
-    const no_numbers = !!rows?.[0]?.no_numbers;
-    const reason = no_numbers ? "no_numbers" : null;
+    const already_credited = !!rows?.[0]?.already_credited;
+
+    const isFinal = status != null && ["approved", "paid", "pago"].includes(String(status));
+    const noNumbers = isFinal && (Number(qty || 0) <= 0);
+
+    let action = "noop";
+    let reason = null;
+
+    if (history_rows === 1 && user_rows === 1) {
+      action = "credited";
+      reason = null;
+    } else if (!isFinal) {
+      action = "noop";
+      reason = "not_final";
+    } else if (noNumbers) {
+      action = "noop";
+      reason = "no_numbers";
+    } else if (already_in_ledger) {
+      action = "noop";
+      reason = "already_in_ledger";
+    } else if (already_credited) {
+      action = "noop";
+      reason = "already_credited";
+    }
 
     if (isDebugEnabled()) {
       // logs enxutos, sem poluir produção
@@ -189,72 +244,71 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         "[coupon.credit]",
         `payment=${pid}`,
         `channel=${channel}`,
-        `credited_rows=${credited_rows}`,
         `history_rows=${history_rows}`,
-        `qty=${computed_qty ?? ""}`,
-        `unit=${computed_unit_cents ?? ""}`,
-        `delta=${computed_delta_cents ?? ""}`,
-        `reason=${reason ?? ""}`,
-        `already_in_ledger=${already_in_ledger ? "1" : "0"}`
+        `user_rows=${user_rows}`,
+        `payment_rows=${payment_rows}`,
+        `user_id=${user_id ?? ""}`,
+        `status=${status ?? ""}`,
+        `qty=${qty ?? ""}`,
+        `unit=${unit_cents ?? ""}`,
+        `delta=${delta_cents ?? ""}`,
+        `action=${action}`,
+        `reason=${reason ?? ""}`
       );
     }
 
     return {
       ok: true,
-      credited_rows,
-      history_rows,
-      action: reason || (credited_rows === 1 ? "credited" : "noop"),
+      action,
       reason,
-      delta_cents: computed_delta_cents,
-      qty: computed_qty,
-      unit_cents: computed_unit_cents,
-      computed_delta_cents,
-      computed_qty,
-      computed_unit_cents,
+      history_rows,
+      user_rows,
+      payment_rows,
+      user_id,
+      status,
+      delta_cents,
+      qty,
+      unit_cents,
       already_in_ledger,
+      already_credited,
+      errCode: null,
+      errMsg: null,
     };
   } catch (e) {
     // Segurança operacional: não quebrar fluxo existente caso migration ainda não tenha rodado
     const code = e?.code || null;
-    if (code === "42P01" || code === "42703") {
-      // table/column missing
-      if (isDebugEnabled()) {
-        // eslint-disable-next-line no-console
-        console.warn("[coupon.credit] not_supported", { payment: pid, code, msg: e?.message });
-      }
-      return {
-        ok: false,
-        credited_rows: 0,
-        history_rows: 0,
-        action: "not_supported",
-        reason: null,
-        delta_cents: null,
-        qty: null,
-        unit_cents: unitCents,
-        computed_delta_cents: null,
-        computed_qty: null,
-        computed_unit_cents: unitCents,
-        already_in_ledger: false,
-      };
-    }
+    const msg = e?.message || String(e);
+    const action = code === "42P01" || code === "42703" || code === "42804" ? "not_supported" : "error";
 
-    if (isDebugEnabled()) {
-      // eslint-disable-next-line no-console
-      console.warn("[coupon.credit] error", { payment: pid, code, msg: e?.message });
-    }
+    // WARN mínimo (sempre) para rastrear em produção sem flood
+    // eslint-disable-next-line no-console
+    console.warn("[coupon.credit] WARN", {
+      action,
+      paymentId: pid,
+      userId: null,
+      channel,
+      source: options?.source || null,
+      runTraceId: runTraceId || null,
+      errCode: code,
+      errMsg: msg,
+    });
+
     return {
       ok: false,
-      credited_rows: 0,
-      history_rows: 0,
-      action: "error",
+      action,
       reason: null,
+      history_rows: 0,
+      user_rows: 0,
+      payment_rows: 0,
+      user_id: null,
+      status: null,
       delta_cents: null,
       qty: null,
       unit_cents: unitCents,
-      computed_delta_cents: null,
-      computed_qty: null,
-      computed_unit_cents: unitCents,
       already_in_ledger: false,
+      already_credited: false,
+      errCode: code,
+      errMsg: msg,
     };
   }
 }

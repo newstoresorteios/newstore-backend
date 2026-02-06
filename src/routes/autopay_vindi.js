@@ -1259,13 +1259,24 @@ router.post("/vindi/webhook", async (req, res) => {
 
             // Crédito de saldo (idempotente) quando virar approved
             if (String(billStatus).toLowerCase() === "paid" && paymentResult?.rows?.[0]?.id) {
-              await creditCouponOnApprovedPayment(String(paymentResult.rows[0].id), {
+              const creditRes = await creditCouponOnApprovedPayment(String(paymentResult.rows[0].id), {
                 channel: "VINDI",
                 source: "vindi_webhook",
                 runTraceId: requestId,
                 meta: { unit_cents: 5500, autopay: true },
                 pgClient: client,
               });
+              if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {
+                console.warn("[autopay/vindi/webhook][coupon.credit] WARN", {
+                  paymentId: String(paymentResult.rows[0].id),
+                  action: creditRes?.action || null,
+                  reason: creditRes?.reason || null,
+                  user_id: creditRes?.user_id ?? null,
+                  status: creditRes?.status ?? null,
+                  errCode: creditRes?.errCode ?? null,
+                  errMsg: creditRes?.errMsg ?? null,
+                });
+              }
             }
           }
 

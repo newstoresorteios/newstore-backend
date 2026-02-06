@@ -169,13 +169,24 @@ router.post("/vindi/webhook", express.json(), async (req, res) => {
 
     // Crédito de saldo (idempotente) — somente quando approved (não altera fluxos existentes)
     if (String(newStatus).toLowerCase() === "approved") {
-      await creditCouponOnApprovedPayment(String(payment.id), {
+      const creditRes = await creditCouponOnApprovedPayment(String(payment.id), {
         channel: "VINDI",
         source: "vindi_webhook",
         runTraceId: null,
         meta: { unit_cents: 5500 },
         pgClient: client,
       });
+      if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {
+        console.warn("[vindi/webhook][coupon.credit] WARN", {
+          paymentId: String(payment.id),
+          action: creditRes?.action || null,
+          reason: creditRes?.reason || null,
+          user_id: creditRes?.user_id ?? null,
+          status: creditRes?.status ?? null,
+          errCode: creditRes?.errCode ?? null,
+          errMsg: creditRes?.errMsg ?? null,
+        });
+      }
     }
 
     // Reconcilição: se necessário, atualiza números/reservas

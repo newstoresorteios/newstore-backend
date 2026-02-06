@@ -1060,13 +1060,24 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
 
         // Crédito de saldo (idempotente) após payment ficar approved
         // eslint-disable-next-line no-await-in-loop
-        await creditCouponOnApprovedPayment(fin.paymentId, {
+        const creditRes = await creditCouponOnApprovedPayment(fin.paymentId, {
           channel: "VINDI",
           source: "reconcile_sync",
           runTraceId,
           meta: { unit_cents: 5500, autopay: true },
           pgClient: client,
         });
+        if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {
+          warn("coupon credit failed", {
+            paymentId: fin.paymentId,
+            action: creditRes?.action || null,
+            reason: creditRes?.reason || null,
+            user_id: creditRes?.user_id ?? null,
+            status: creditRes?.status ?? null,
+            errCode: creditRes?.errCode ?? null,
+            errMsg: creditRes?.errMsg ?? null,
+          });
+        }
 
         chargedOk++;
         log("numbers sold", {

@@ -88,7 +88,10 @@ router.post("/sync", requireAuth, async (req, res) => {
 
     // --- reconcile credit (idempotente): credita payments aprovados ainda não creditados
     const hasCreditedFlag = await hasColumn("payments", "coupon_credited");
-    let reconciledPayments = 0;
+    let reconciledFound = 0;
+    let creditedCount = 0;
+    let noopCount = 0;
+    let errorCount = 0;
     if (hasCreditedFlag) {
       const { rows: pend } = await query(
         `SELECT id,
@@ -101,16 +104,31 @@ router.post("/sync", requireAuth, async (req, res) => {
           LIMIT 500`,
         [uid]
       );
+      reconciledFound = pend.length;
 
       for (const p of pend) {
         // eslint-disable-next-line no-await-in-loop
-        await creditCouponOnApprovedPayment(String(p.id), {
+        const creditRes = await creditCouponOnApprovedPayment(String(p.id), {
           channel: String(p.provider || "").toLowerCase() === "vindi" ? "VINDI" : "PIX",
           source: "reconcile_sync",
           runTraceId: `coupons.sync#${rid}`,
           meta: { unit_cents: 5500 },
         });
-        reconciledPayments++;
+        if (creditRes?.action === "credited") creditedCount++;
+        else if (creditRes?.action === "noop") noopCount++;
+        else errorCount++;
+
+        if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {
+          console.warn(`[coupons.sync#${rid}] coupon credit WARN`, {
+            user: uid,
+            paymentId: String(p.id),
+            action: creditRes?.action || null,
+            reason: creditRes?.reason || null,
+            status: creditRes?.status ?? null,
+            errCode: creditRes?.errCode ?? null,
+            errMsg: creditRes?.errMsg ?? null,
+          });
+        }
       }
     }
 
@@ -164,7 +182,7 @@ router.post("/sync", requireAuth, async (req, res) => {
     trayId = afterQ.rows?.[0]?.tray_coupon_id || trayId;
 
     console.log(
-      `[coupons.sync#${rid}] user=${uid} reconciled=${reconciledPayments} coupon_before=${beforeCents} coupon_after=${finalCents} newSync=${newSync || null}`
+      `[coupons.sync#${rid}] user=${uid} found=${reconciledFound} credited=${creditedCount} noop=${noopCount} errors=${errorCount} coupon_before=${beforeCents} coupon_after=${finalCents} newSync=${newSync || null}`
     );
 
     // Regra: NÃO deletar/recriar cupom na Tray (mantém o "mesmo cupom do cliente").
