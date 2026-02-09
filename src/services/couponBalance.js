@@ -90,17 +90,19 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     };
   }
 
-  // 1 SQL atômico (CTE) com parâmetros tipados (evita 42P08) e concorrência-safe:
+  // 1 SQL atômico (CTE) com parâmetros tipados (evita 42P08), hard-idempotent e concorrência-safe.
+  //
+  // IMPORTANTE (anti-duplicação definitiva):
+  // - O gate é o LEDGER (UNIQUE(payment_id,event_type)): só soma saldo se o INSERT no histórico ocorrer.
+  // - Mesmo com webhook+poll+reconcile simultâneos, apenas 1 execução insere o ledger -> apenas 1 soma saldo.
+  // - payments.coupon_credited é marcado true quando (a) creditou agora OU (b) já existe ledger.
+  //
+  // Params:
   // $1 payment_id (text)
   // $2 unit (int4)
   // $3 channel (text)
   // $4 run_trace_id (text)
   // $5 meta (jsonb)
-  //
-  // Gates (hard idempotent):
-  // - UPDATE payments só acontece se pay.coupon_credited=false (estado REAL da linha)
-  // - E se NÃO existir ledger CREDIT_PURCHASE para o payment
-  // Assim, nenhuma corrida consegue somar saldo 2x, mesmo com webhook+poll+reconcile.
   const sql = `
     WITH pi AS (
       SELECT
@@ -115,116 +117,102 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       WHERE id = $1::text
       LIMIT 1
     ),
-    already AS (
-      SELECT 1
-        FROM public.coupon_balance_history h
-       WHERE h.payment_id = $1::text
-         AND h.event_type = 'CREDIT_PURCHASE'
-       LIMIT 1
+    calc AS (
+      SELECT
+        pi.*,
+        COALESCE(array_length(pi.numbers, 1), 0)::int AS qty,
+        $2::int4 AS unit_cents,
+        (
+          CASE
+            WHEN COALESCE(array_length(pi.numbers, 1), 0) > 0 THEN (COALESCE(array_length(pi.numbers, 1), 0) * $2::int4)
+            ELSE COALESCE(pi.amount_cents, 0)
+          END
+        )::int AS delta_cents
+      FROM pi
     ),
-    p AS (
-      UPDATE public.payments pay
-         SET coupon_credited = true,
-             coupon_credited_at = now()
-        FROM pi
-       WHERE pay.id = pi.id
-         AND lower(pay.status) = 'approved'
-         AND pay.coupon_credited = false
-         AND (
-           CASE
-             WHEN COALESCE(array_length(pi.numbers,1),0) > 0
-               THEN (COALESCE(array_length(pi.numbers,1),0) * $2::int4)
-             ELSE COALESCE(pi.amount_cents,0)
-           END
-         ) > 0
-         AND NOT EXISTS (SELECT 1 FROM already)
-       RETURNING
-         pay.id,
-         pi.user_id,
-         pi.draw_id,
-         COALESCE(array_length(pi.numbers,1),0)::int AS qty,
-         (
-           CASE
-             WHEN COALESCE(array_length(pi.numbers,1),0) > 0
-               THEN (COALESCE(array_length(pi.numbers,1),0) * $2::int4)
-             ELSE COALESCE(pi.amount_cents,0)
-           END
-         )::int AS delta_cents,
-         lower(pay.status) AS payment_status
-    ),
-    u AS (
-      UPDATE public.users usr
-         SET coupon_value_cents = usr.coupon_value_cents + p.delta_cents,
-             coupon_updated_at  = now()
-        FROM p
-       WHERE usr.id = p.user_id
-       RETURNING
-         usr.id AS user_id,
-         (usr.coupon_value_cents - p.delta_cents) AS balance_before_cents,
-         usr.coupon_value_cents AS balance_after_cents,
-         p.id AS payment_id,
-         p.delta_cents,
-         p.draw_id,
-         p.qty,
-         p.payment_status
+    ul AS (
+      SELECT
+        u.id AS user_id,
+        COALESCE(u.coupon_value_cents, 0)::int AS balance_before_cents
+      FROM public.users u
+      JOIN calc c ON c.user_id = u.id
+      FOR UPDATE
     ),
     h AS (
       INSERT INTO public.coupon_balance_history
         (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
          event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
       SELECT
-        u.user_id,
-        u.payment_id,
-        u.delta_cents,
-        u.balance_before_cents,
-        u.balance_after_cents,
+        ul.user_id,
+        c.id,
+        c.delta_cents,
+        ul.balance_before_cents,
+        (ul.balance_before_cents + c.delta_cents),
         'CREDIT_PURCHASE',
         $3::text,
-        u.payment_status,
-        u.draw_id,
+        'approved',
+        c.draw_id,
         NULL::text,
         $4::text,
         (
           COALESCE($5::jsonb, '{}'::jsonb)
-          || jsonb_build_object('unit_cents', $2::int4, 'qty', u.qty, 'channel', $3::text)
+          || jsonb_build_object('unit_cents', c.unit_cents, 'qty', c.qty, 'channel', $3::text)
         )
-      FROM u
+      FROM calc c
+      JOIN ul ON true
+      WHERE c.status_l = 'approved'
+        AND COALESCE(c.coupon_credited, false) = false
+        AND c.delta_cents > 0
       ON CONFLICT DO NOTHING
-      RETURNING id
+      RETURNING user_id, payment_id, delta_cents
     ),
-    p2 AS (
+    u_upd AS (
+      UPDATE public.users usr
+         SET coupon_value_cents = usr.coupon_value_cents + h.delta_cents,
+             coupon_updated_at  = now()
+        FROM h
+       WHERE usr.id = h.user_id
+       RETURNING usr.id AS user_id
+    ),
+    p_upd AS (
       UPDATE public.payments pay
          SET coupon_credited = true,
              coupon_credited_at = now()
-        FROM pi
-       WHERE pay.id = pi.id
+        FROM calc c
+       WHERE pay.id = c.id
          AND lower(pay.status) = 'approved'
          AND pay.coupon_credited = false
-         AND EXISTS (SELECT 1 FROM already)
+         AND (
+           EXISTS (SELECT 1 FROM h)
+           OR EXISTS (
+             SELECT 1
+             FROM public.coupon_balance_history hh
+             WHERE hh.payment_id = c.id
+               AND hh.event_type = 'CREDIT_PURCHASE'
+           )
+         )
        RETURNING pay.id
     )
     SELECT
-      (SELECT count(*)::int FROM p) AS credited_rows,
       (SELECT count(*)::int FROM h) AS history_rows,
-      (SELECT count(*)::int FROM u) AS user_rows,
-      ((SELECT count(*)::int FROM p) + (SELECT count(*)::int FROM p2)) AS payment_rows,
-      (SELECT pi.user_id::int FROM pi) AS user_id,
-      (SELECT pi.status_l::text FROM pi) AS status_l,
-      (SELECT COALESCE(array_length(pi.numbers,1),0)::int FROM pi) AS qty,
-      $2::int4 AS unit_cents,
-      (SELECT (
-        CASE
-          WHEN COALESCE(array_length(pi.numbers,1),0) > 0 THEN (COALESCE(array_length(pi.numbers,1),0) * $2::int4)
-          ELSE COALESCE(pi.amount_cents,0)
-        END
-      )::int FROM pi) AS delta_cents,
-      (SELECT EXISTS(SELECT 1 FROM already)) AS already_in_ledger,
-      (SELECT COALESCE(pi.coupon_credited, false) FROM pi) AS already_credited
+      (SELECT count(*)::int FROM u_upd) AS user_rows,
+      (SELECT count(*)::int FROM p_upd) AS payment_rows,
+      (SELECT c.user_id::int FROM calc c LIMIT 1) AS user_id,
+      (SELECT c.status_l::text FROM calc c LIMIT 1) AS status_l,
+      (SELECT c.qty::int FROM calc c LIMIT 1) AS qty,
+      (SELECT c.unit_cents::int FROM calc c LIMIT 1) AS unit_cents,
+      (SELECT c.delta_cents::int FROM calc c LIMIT 1) AS delta_cents,
+      (SELECT COALESCE(EXISTS(
+        SELECT 1
+        FROM public.coupon_balance_history hh
+        WHERE hh.payment_id = $1::text
+          AND hh.event_type = 'CREDIT_PURCHASE'
+      ), false)) AS already_in_ledger,
+      (SELECT COALESCE(c.coupon_credited, false) FROM calc c LIMIT 1) AS already_credited
   `;
 
   try {
     const { rows } = await q(sql, [pid, unit, channel, runTraceId, metaJson]);
-    const credited_rows = rows?.[0]?.credited_rows ?? 0;
     const history_rows = rows?.[0]?.history_rows ?? 0;
     const user_rows = rows?.[0]?.user_rows ?? 0;
     const payment_rows = rows?.[0]?.payment_rows ?? 0;
@@ -243,7 +231,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     let action = "noop";
     let reason = null;
 
-    if (credited_rows === 1 && history_rows === 1 && user_rows === 1) {
+    if (history_rows === 1 && user_rows === 1) {
       action = "credited";
       reason = null;
     } else if (!isFinal) {
@@ -267,7 +255,6 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         "[coupon.credit]",
         `payment=${pid}`,
         `channel=${channel}`,
-        `credited_rows=${credited_rows}`,
         `history_rows=${history_rows}`,
         `user_rows=${user_rows}`,
         `payment_rows=${payment_rows}`,
