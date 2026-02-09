@@ -90,17 +90,17 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     };
   }
 
-  // 1 SQL atômico (CTE) com parâmetros tipados (evita 42P08):
+  // 1 SQL atômico (CTE) com parâmetros tipados (evita 42P08) e concorrência-safe:
   // $1 payment_id (text)
   // $2 unit (int4)
   // $3 channel (text)
   // $4 run_trace_id (text)
   // $5 meta (jsonb)
   //
-  // Regras:
-  // - delta = qty(numbers) * unit; fallback: amount_cents se qty<=0 (se >0)
-  // - Idempotência: payments.coupon_credited + UNIQUE(payment_id,event_type) + guardrail NOT EXISTS no ledger
-  // - Não depende de colunas opcionais (reservation_id no histórico = NULL)
+  // Gates (hard idempotent):
+  // - UPDATE payments só acontece se pay.coupon_credited=false (estado REAL da linha)
+  // - E se NÃO existir ledger CREDIT_PURCHASE para o payment
+  // Assim, nenhuma corrida consegue somar saldo 2x, mesmo com webhook+poll+reconcile.
   const sql = `
     WITH pi AS (
       SELECT
@@ -112,8 +112,15 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         lower(status) AS status_l,
         coupon_credited
       FROM public.payments
-      WHERE id = $1
+      WHERE id = $1::text
       LIMIT 1
+    ),
+    already AS (
+      SELECT 1
+        FROM public.coupon_balance_history h
+       WHERE h.payment_id = $1::text
+         AND h.event_type = 'CREDIT_PURCHASE'
+       LIMIT 1
     ),
     p AS (
       UPDATE public.payments pay
@@ -121,10 +128,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
              coupon_credited_at = now()
         FROM pi
        WHERE pay.id = pi.id
-         AND pi.status_l IN ('approved','paid','pago')
-         AND lower(pay.status) IN ('approved','paid','pago')
-         AND COALESCE(pi.coupon_credited, false) = false
-         AND COALESCE(pay.coupon_credited, false) = false
+         AND lower(pay.status) = 'approved'
+         AND pay.coupon_credited = false
          AND (
            CASE
              WHEN COALESCE(array_length(pi.numbers,1),0) > 0
@@ -132,12 +137,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
              ELSE COALESCE(pi.amount_cents,0)
            END
          ) > 0
-         AND NOT EXISTS (
-           SELECT 1
-           FROM public.coupon_balance_history h
-           WHERE h.payment_id = pi.id
-             AND h.event_type = 'CREDIT_PURCHASE'
-         )
+         AND NOT EXISTS (SELECT 1 FROM already)
        RETURNING
          pay.id,
          pi.user_id,
@@ -150,7 +150,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
              ELSE COALESCE(pi.amount_cents,0)
            END
          )::int AS delta_cents,
-         pi.status_l AS payment_status
+         lower(pay.status) AS payment_status
     ),
     u AS (
       UPDATE public.users usr
@@ -198,15 +198,9 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
              coupon_credited_at = now()
         FROM pi
        WHERE pay.id = pi.id
-         AND pi.status_l IN ('approved','paid','pago')
-         AND lower(pay.status) IN ('approved','paid','pago')
-         AND COALESCE(pay.coupon_credited, false) = false
-         AND EXISTS (
-           SELECT 1
-           FROM public.coupon_balance_history hh
-           WHERE hh.payment_id = pi.id
-             AND hh.event_type = 'CREDIT_PURCHASE'
-         )
+         AND lower(pay.status) = 'approved'
+         AND pay.coupon_credited = false
+         AND EXISTS (SELECT 1 FROM already)
        RETURNING pay.id
     )
     SELECT
@@ -224,12 +218,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
           ELSE COALESCE(pi.amount_cents,0)
         END
       )::int FROM pi) AS delta_cents,
-      (SELECT COALESCE(EXISTS(
-        SELECT 1
-        FROM public.coupon_balance_history hh
-        WHERE hh.payment_id = pi.id
-          AND hh.event_type = 'CREDIT_PURCHASE'
-      ), false) FROM pi) AS already_in_ledger,
+      (SELECT EXISTS(SELECT 1 FROM already)) AS already_in_ledger,
       (SELECT COALESCE(pi.coupon_credited, false) FROM pi) AS already_credited
   `;
 
