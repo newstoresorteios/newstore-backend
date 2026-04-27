@@ -12,6 +12,7 @@ import {
   mpSaveCard,
   mpChargeCard,
 } from "../services/mercadopago.js";
+import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 
 const router = express.Router();
 
@@ -457,7 +458,7 @@ router.post(
         } catch (e) {
           // loga e segue para o próximo perfil (sem dados sensíveis)
           await client.query(
-            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
+            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error_message)
              values ($1,$2,$3,$4,'error',$5)`,
             [p.id, user_id, draw_id, free, String(e?.message || e)]
           );
@@ -467,7 +468,7 @@ router.post(
 
         if (!charge || String(charge.status).toLowerCase() !== "approved") {
           await client.query(
-            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error)
+            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error_message)
              values ($1,$2,$3,$4,'error','not_approved')`,
             [p.id, user_id, draw_id, free]
           );
@@ -476,11 +477,23 @@ router.post(
         }
 
         // grava payment/reservation (espelha /assign-numbers)
+        // payments.id no projeto atual é text (não-null) — usa o id do MP para manter compatibilidade
+        const paymentId = String(charge.paymentId || "");
+        if (!paymentId) {
+          await client.query(
+            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error_message)
+             values ($1,$2,$3,$4,'error','missing_payment_id')`,
+            [p.id, user_id, draw_id, free]
+          );
+          results.push({ user_id, status: "error", error: "missing_payment_id" });
+          continue;
+        }
+
         const pay = await client.query(
-          `insert into public.payments (user_id, draw_id, numbers, amount_cents, status, created_at)
-           values ($1,$2,$3::int2[],$4,'approved', now())
+          `insert into public.payments (id, user_id, draw_id, numbers, amount_cents, status, created_at, provider)
+           values ($1,$2,$3,$4::int2[],$5,'approved', now(), 'mercadopago')
            returning id`,
-          [user_id, draw_id, free, amount_cents]
+          [paymentId, user_id, draw_id, free, amount_cents]
         );
         const resv = await client.query(
           `insert into public.reservations (id, user_id, draw_id, numbers, status, created_at, expires_at)
@@ -503,6 +516,28 @@ router.post(
             resv.rows[0].id,
           ]
         );
+
+        // Integridade de saldo: pagamento 'approved' deve creditar via ledger (idempotente)
+        // (se for chamado múltiplas vezes, o UNIQUE do ledger evita duplicação)
+        // eslint-disable-next-line no-await-in-loop
+        const creditRes = await creditCouponOnApprovedPayment(String(pay.rows[0].id), {
+          channel: "CARD",
+          source: "autopay_legacy_mp",
+          runTraceId: null,
+          meta: { pricing_source: "public.app_config.ticket_price_cents", autopay: true, provider: "mercadopago" },
+          pgClient: client,
+        });
+        if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {
+          console.warn("[autopay-run][coupon.credit] WARN", {
+            paymentId: String(pay.rows[0].id),
+            action: creditRes?.action || null,
+            reason: creditRes?.reason || null,
+            user_id: creditRes?.user_id ?? null,
+            status: creditRes?.status ?? null,
+            errCode: creditRes?.errCode ?? null,
+            errMsg: creditRes?.errMsg ?? null,
+          });
+        }
 
         results.push({ user_id, status: "ok", numbers: free, amount_cents });
       }

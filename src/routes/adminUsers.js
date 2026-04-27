@@ -3,8 +3,12 @@
 
 import express from "express";
 import { query, getPool } from "../db.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
+
+// Proteção obrigatória: admin-only
+router.use(requireAuth, requireAdmin);
 
 /* =============== helpers =============== */
 
@@ -24,6 +28,15 @@ const toInt = (v, def = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? (n | 0) : def;
 };
+
+function safeJsonMeta(meta) {
+  try {
+    if (!meta || typeof meta !== "object") return "{}";
+    return JSON.stringify(meta);
+  } catch {
+    return "{}";
+  }
+}
 
 // Normaliza "numbers": aceita array ou CSV e retorna int[] 0..99 (mantém 00 como 0)
 function parseNumbers(input) {
@@ -133,6 +146,8 @@ router.get("/:id", async (req, res, next) => {
  * body: { name, email, phone, is_admin, coupon_code?, coupon_value_cents? }
  */
 router.post("/", async (req, res, next) => {
+  const pool = await getPool();
+  const client = await pool.connect();
   try {
     const {
       name = "",
@@ -143,29 +158,68 @@ router.post("/", async (req, res, next) => {
       coupon_value_cents = 0,
     } = req.body || {};
 
+    const initialBalanceCents = toInt(coupon_value_cents, 0);
     const vals = [
       normStr(name, 255),
       normStr(email, 255),
       normStr(phone, 40),
       !!is_admin,
       normStr(coupon_code, 64),
-      toInt(coupon_value_cents, 0),
+      initialBalanceCents,
     ];
 
     // Senha padrão "newstore" (hash em bcrypt via pgcrypto)
     const DEFAULT_PASSWORD = "newstore";
 
-    const { rows } = await query(
+    await client.query("BEGIN");
+    const { rows } = await client.query(
       `INSERT INTO public.users
          (name, email, phone, is_admin, coupon_code, coupon_value_cents, pass_hash)
        VALUES ($1,$2,$3,$4,$5,$6, crypt($7, gen_salt('bf')))
        RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       [...vals, DEFAULT_PASSWORD]
     );
-    res.status(201).json(mapUser(rows[0]));
+
+    const created = rows[0];
+    const userId = Number(created?.id);
+
+    // Ledger obrigatório: saldo inicial != 0 deve ter histórico correspondente
+    if (initialBalanceCents !== 0 && Number.isInteger(userId) && userId > 0) {
+      const metaJson = safeJsonMeta({
+        previous_balance_cents: 0,
+        requested_balance_cents: initialBalanceCents,
+        delta_cents: initialBalanceCents,
+        source: "adminUsers.create",
+        admin_user_id: req.user?.id ?? null,
+      });
+      await client.query(
+        `INSERT INTO public.coupon_balance_history
+          (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
+           event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
+         VALUES
+          ($1, NULL, $2, $3, $4,
+           'ADMIN_BALANCE_ADJUSTMENT', 'ADMIN', NULL, NULL, NULL, $5, $6::jsonb)`,
+        [
+          userId,
+          initialBalanceCents,
+          0,
+          initialBalanceCents,
+          req.headers["x-request-id"] ? String(req.headers["x-request-id"]) : null,
+          metaJson,
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.status(201).json(mapUser(created));
   } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
     if (e.code === "23505") return res.status(409).json({ error: "duplicated" });
     next(e);
+  } finally {
+    client.release();
   }
 });
 
@@ -174,35 +228,94 @@ router.post("/", async (req, res, next) => {
  * body: { name?, email?, phone?, is_admin?, coupon_code?, coupon_value_cents? }
  */
 router.put("/:id", async (req, res, next) => {
+  const pool = await getPool();
+  const client = await pool.connect();
   try {
     const id = Number(req.params.id);
     const { name, email, phone, is_admin, coupon_code, coupon_value_cents } = req.body || {};
 
-    const { rows } = await query(
+    const wantsBalance = coupon_value_cents != null;
+    const requestedBalanceCents = wantsBalance ? toInt(coupon_value_cents, 0) : null;
+
+    await client.query("BEGIN");
+
+    // Lock para garantir ledger + update atômicos
+    const cur = await client.query(
+      `SELECT id, coupon_value_cents
+         FROM public.users
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if (!cur.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "not_found" });
+    }
+    const previousBalanceCents = Number(cur.rows[0]?.coupon_value_cents || 0) | 0;
+    const shouldUpdateBalance = wantsBalance && requestedBalanceCents !== previousBalanceCents;
+
+    const upd = await client.query(
       `UPDATE public.users
-          SET name                 = COALESCE($2, name),
-              email                = COALESCE($3, email),
-              phone                = COALESCE($4, phone),
-              is_admin             = COALESCE($5, is_admin),
-              coupon_code          = COALESCE($6, coupon_code),
-              coupon_value_cents   = COALESCE($7, coupon_value_cents)
+          SET name               = COALESCE($2, name),
+              email              = COALESCE($3, email),
+              phone              = COALESCE($4, phone),
+              is_admin           = COALESCE($5, is_admin),
+              coupon_code        = COALESCE($6, coupon_code),
+              coupon_value_cents = COALESCE($7, coupon_value_cents)
         WHERE id = $1
         RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
       [
         id,
-        name  != null ? normStr(name, 255)  : null,
+        name != null ? normStr(name, 255) : null,
         email != null ? normStr(email, 255) : null,
-        phone != null ? normStr(phone, 40)  : null,
+        phone != null ? normStr(phone, 40) : null,
         typeof is_admin === "boolean" ? !!is_admin : null,
-        coupon_code         != null ? normStr(coupon_code, 64) : null,
-        coupon_value_cents  != null ? toInt(coupon_value_cents, 0) : null,
+        coupon_code != null ? normStr(coupon_code, 64) : null,
+        shouldUpdateBalance ? requestedBalanceCents : null,
       ]
     );
-    if (!rows.length) return res.status(404).json({ error: "not_found" });
-    res.json(mapUser(rows[0]));
+
+    const afterBalanceCents = Number(upd.rows?.[0]?.coupon_value_cents || 0) | 0;
+    const deltaCents = afterBalanceCents - previousBalanceCents;
+
+    // Regra obrigatória: qualquer ajuste de saldo pelo admin precisa gerar ledger
+    if (shouldUpdateBalance && deltaCents !== 0) {
+      const metaJson = safeJsonMeta({
+        previous_balance_cents: previousBalanceCents,
+        requested_balance_cents: afterBalanceCents,
+        delta_cents: deltaCents,
+        source: "adminUsers.update",
+        admin_user_id: req.user?.id ?? null,
+      });
+
+      await client.query(
+        `INSERT INTO public.coupon_balance_history
+          (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
+           event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
+         VALUES
+          ($1, NULL, $2, $3, $4,
+           'ADMIN_BALANCE_ADJUSTMENT', 'ADMIN', NULL, NULL, NULL, $5, $6::jsonb)`,
+        [
+          id,
+          deltaCents,
+          previousBalanceCents,
+          afterBalanceCents,
+          req.headers["x-request-id"] ? String(req.headers["x-request-id"]) : null,
+          metaJson,
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json(mapUser(upd.rows[0]));
   } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
     if (e.code === "23505") return res.status(409).json({ error: "duplicated" });
     next(e);
+  } finally {
+    client.release();
   }
 });
 
