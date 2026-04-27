@@ -1064,7 +1064,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           channel: "VINDI",
           source: "reconcile_sync",
           runTraceId,
-          meta: { unit_cents: 5500, autopay: true },
+          meta: { pricing_source: "public.app_config.ticket_price_cents", autopay: true },
           pgClient: client,
         });
         if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {

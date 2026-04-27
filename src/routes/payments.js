@@ -173,8 +173,7 @@ async function _reconcilePendingPaymentsCore(minutes) {
             channel: 'PIX',
             source: 'reconcile_sync',
             runTraceId: null,
-            meta: { unit_cents: 5500 },
-            unitCents: 5500,
+            meta: { pricing_source: "public.app_config.ticket_price_cents" },
           });
           if (isDebugCouponEnabled()) {
             console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
@@ -377,8 +376,7 @@ router.get('/:id/status', requireAuth, async (req, res) => {
           channel: 'PIX',
           source: 'pix_status_poll',
           runTraceId: null,
-          meta: { unit_cents: 5500 },
-          unitCents: 5500,
+          meta: { pricing_source: "public.app_config.ticket_price_cents" },
         });
         if (isDebugCouponEnabled()) {
           console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
@@ -441,8 +439,7 @@ router.post('/webhook', async (req, res) => {
           channel: 'PIX',
           source: 'mercadopago_webhook',
           runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
-          meta: { unit_cents: 5500 },
-          unitCents: 5500,
+          meta: { pricing_source: "public.app_config.ticket_price_cents" },
         });
         if (isDebugCouponEnabled()) {
           console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });
@@ -548,8 +545,7 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
           channel: 'PIX',
           source: 'mercadopago_webhook',
           runTraceId: req.headers['x-request-id'] ? String(req.headers['x-request-id']) : null,
-          meta: { unit_cents: 5500 },
-          unitCents: 5500,
+          meta: { pricing_source: "public.app_config.ticket_price_cents" },
         });
         if (isDebugCouponEnabled()) {
           console.log("[coupon.credit][PIX]", { paymentId: id, result: creditRes });

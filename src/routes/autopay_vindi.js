@@ -1190,9 +1190,10 @@ router.post("/vindi/webhook", async (req, res) => {
 
         // Busca autopay_runs relacionados a esta bill/charge
         let runQuery = null;
+        let paymentResult = null;
         if (billId) {
           // Busca por vindi_bill_id no payments
-          const paymentResult = await client.query(
+          paymentResult = await client.query(
             `SELECT id, user_id, draw_id, vindi_bill_id, vindi_charge_id 
              FROM public.payments 
              WHERE vindi_bill_id = $1 
@@ -1236,7 +1237,7 @@ router.post("/vindi/webhook", async (req, res) => {
           await client.query(
             `UPDATE public.autopay_runs
              SET status = $1,
-                 error = CASE WHEN $1 = 'error' THEN $2 ELSE error END,
+                 error_message = CASE WHEN $1 = 'error' THEN $2 ELSE error_message END,
                  updated_at = now()
              WHERE id = $3`,
             [newStatus, `Vindi: ${billStatus || chargeStatus}`, run.id]
@@ -1263,7 +1264,7 @@ router.post("/vindi/webhook", async (req, res) => {
                 channel: "VINDI",
                 source: "vindi_webhook",
                 runTraceId: requestId,
-                meta: { unit_cents: 5500, autopay: true },
+                meta: { pricing_source: "public.app_config.ticket_price_cents", autopay: true },
                 pgClient: client,
               });
               if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {

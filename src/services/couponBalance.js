@@ -12,6 +12,24 @@ function isDebugEnabled() {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+async function getTicketPriceCentsFromAppConfig(q) {
+  const r = await q(
+    `SELECT value
+       FROM public.app_config
+      WHERE key = $1
+      LIMIT 1`,
+    ["ticket_price_cents"]
+  );
+
+  const n = Number(r.rows?.[0]?.value);
+
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error("Invalid or missing app_config.ticket_price_cents");
+  }
+
+  return Math.trunc(n);
+}
+
 function safeJsonMeta(meta) {
   try {
     if (!meta || typeof meta !== "object") return "{}";
@@ -54,19 +72,6 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
   const channel = options?.channel != null ? String(options.channel) : null;
   const runTraceId = options?.runTraceId != null ? String(options.runTraceId) : null;
 
-  const unitCents = Number(
-    options?.unitCents ??
-      options?.meta?.unit_cents ??
-      process.env.COUPON_UNIT_CENTS ??
-      5500
-  );
-  const unit = Number.isFinite(unitCents) && unitCents > 0 ? Math.trunc(unitCents) : 5500;
-
-  const metaJson = safeJsonMeta({
-    ...(options?.meta && typeof options.meta === "object" ? options.meta : null),
-    source: options?.source || null,
-  });
-
   // Permite reuso de transação (ex.: webhook Vindi) sem alterar contrato de endpoints.
   const q = options?.pgClient?.query ? options.pgClient.query.bind(options.pgClient) : defaultQuery;
 
@@ -82,13 +87,62 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       status: null,
       delta_cents: null,
       qty: null,
-      unit_cents: unit,
+      unit_cents: null,
       already_in_ledger: false,
       already_credited: false,
       errCode: null,
       errMsg: null,
     };
   }
+
+  const legacyCallerUnitCents = options?.unitCents ?? options?.meta?.unit_cents ?? null;
+
+  let unit = null;
+  try {
+    unit = await getTicketPriceCentsFromAppConfig(q);
+  } catch (e) {
+    const msg = e?.message || String(e);
+    // eslint-disable-next-line no-console
+    console.warn("[coupon.credit] pricing ERROR", {
+      paymentId: pid,
+      pricing_source: "public.app_config.ticket_price_cents",
+      legacyCallerUnitCents,
+      errMsg: msg,
+    });
+    return {
+      ok: false,
+      action: "error",
+      reason: "invalid_or_missing_ticket_price_cents",
+      history_rows: 0,
+      user_rows: 0,
+      payment_rows: 0,
+      user_id: null,
+      status: null,
+      delta_cents: null,
+      qty: null,
+      unit_cents: null,
+      already_in_ledger: false,
+      already_credited: false,
+      errCode: null,
+      errMsg: msg,
+    };
+  }
+
+  // eslint-disable-next-line no-console
+  console.log("[coupon.credit] pricing", {
+    paymentId: pid,
+    pricing_source: "public.app_config.ticket_price_cents",
+    unit_cents: unit,
+    legacyCallerUnitCents,
+  });
+
+  const metaJson = safeJsonMeta({
+    ...(options?.meta && typeof options.meta === "object" ? options.meta : null),
+    source: options?.source || null,
+    pricing_source: "public.app_config.ticket_price_cents",
+    unit_cents: unit,
+    legacy_caller_unit_cents: legacyCallerUnitCents,
+  });
 
   // 1 SQL atômico (CTE) com parâmetros tipados (evita 42P08), hard-idempotent e concorrência-safe.
   //
@@ -150,7 +204,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         (ul.balance_before_cents + c.delta_cents),
         'CREDIT_PURCHASE',
         $3::text,
-        'approved',
+        c.status_l,
         c.draw_id,
         NULL::text,
         $4::text,
@@ -160,7 +214,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         )
       FROM calc c
       JOIN ul ON true
-      WHERE c.status_l = 'approved'
+      WHERE c.status_l IN ('approved','paid','pago')
         AND COALESCE(c.coupon_credited, false) = false
         AND c.delta_cents > 0
       ON CONFLICT DO NOTHING
@@ -180,7 +234,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
              coupon_credited_at = now()
         FROM calc c
        WHERE pay.id = c.id
-         AND lower(pay.status) = 'approved'
+         AND lower(pay.status) IN ('approved','paid','pago')
          AND pay.coupon_credited = false
          AND (
            EXISTS (SELECT 1 FROM h)
@@ -300,7 +354,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       channel,
       source: options?.source || null,
       runTraceId: runTraceId || null,
-      unit_cents: unit,
+      unit_cents: unit ?? null,
       errCode: code,
       errMsg: msg,
     });
@@ -316,7 +370,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       status: null,
       delta_cents: null,
       qty: null,
-      unit_cents: unit,
+      unit_cents: unit ?? null,
       already_in_ledger: false,
       already_credited: false,
       errCode: code,

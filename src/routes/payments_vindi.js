@@ -173,7 +173,7 @@ router.post("/vindi/webhook", express.json(), async (req, res) => {
         channel: "VINDI",
         source: "vindi_webhook",
         runTraceId: null,
-        meta: { unit_cents: 5500 },
+        meta: { pricing_source: "public.app_config.ticket_price_cents" },
         pgClient: client,
       });
       if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {

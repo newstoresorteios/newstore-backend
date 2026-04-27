@@ -112,7 +112,7 @@ router.post("/sync", requireAuth, async (req, res) => {
           channel: String(p.provider || "").toLowerCase() === "vindi" ? "VINDI" : "PIX",
           source: "reconcile_sync",
           runTraceId: `coupons.sync#${rid}`,
-          meta: { unit_cents: 5500 },
+          meta: { pricing_source: "public.app_config.ticket_price_cents" },
         });
         if (creditRes?.action === "credited") creditedCount++;
         else if (creditRes?.action === "noop") noopCount++;
