@@ -93,13 +93,26 @@ router.post("/sync", requireAuth, async (req, res) => {
     let noopCount = 0;
     let errorCount = 0;
     if (hasCreditedFlag) {
+      const hasMeta = await hasColumn("payments", "meta");
+      const hasPayload = await hasColumn("payments", "payload");
+      const hasVindiPayloadJson = await hasColumn("payments", "vindi_payload_json");
+      const noCouponExprParts = [];
+      if (hasMeta) noCouponExprParts.push("COALESCE((p.meta->>'no_coupon_credit')::boolean, false)");
+      if (hasPayload) noCouponExprParts.push("COALESCE((p.payload->>'no_coupon_credit')::boolean, false)");
+      if (hasVindiPayloadJson) noCouponExprParts.push("COALESCE((p.vindi_payload_json->>'no_coupon_credit')::boolean, false)");
+      const noCouponExpr = noCouponExprParts.length ? `(${noCouponExprParts.join(" OR ")})` : "false";
+
       const { rows: pend } = await query(
         `SELECT id,
-                COALESCE(provider,'mercadopago') AS provider
-           FROM payments
-          WHERE user_id = $1
-            AND lower(status) IN ('approved','paid','pago')
-            AND coupon_credited = false
+                COALESCE(provider,'mercadopago') AS provider,
+                COALESCE(amount_cents,0)::int AS amount_cents,
+                ${noCouponExpr} AS no_coupon_credit
+           FROM payments p
+          WHERE p.user_id = $1
+            AND lower(p.status) IN ('approved','paid','pago')
+            AND COALESCE(lower(p.provider),'') <> 'admin_assign_no_coupon'
+            AND ${noCouponExpr} = false
+            AND p.coupon_credited = false
           ORDER BY id ASC
           LIMIT 500`,
         [uid]
@@ -107,12 +120,24 @@ router.post("/sync", requireAuth, async (req, res) => {
       reconciledFound = pend.length;
 
       for (const p of pend) {
+        const providerL = String(p.provider || "").toLowerCase();
+        const channel = providerL === "vindi"
+          ? "VINDI"
+          : providerL === "admin_assign"
+            ? "ADMIN"
+            : "PIX";
         // eslint-disable-next-line no-await-in-loop
         const creditRes = await creditCouponOnApprovedPayment(String(p.id), {
-          channel: String(p.provider || "").toLowerCase() === "vindi" ? "VINDI" : "PIX",
+          channel,
           source: "reconcile_sync",
           runTraceId: `coupons.sync#${rid}`,
           meta: { pricing_source: "public.app_config.ticket_price_cents" },
+        });
+        console.log("[coupons.sync] credit result", {
+          paymentId: p.id,
+          amount_cents: p.amount_cents,
+          result: creditRes?.action,
+          reason: creditRes?.reason || null,
         });
         if (creditRes?.action === "credited") creditedCount++;
         else if (creditRes?.action === "noop") noopCount++;

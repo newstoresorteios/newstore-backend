@@ -46,26 +46,18 @@ function parseNumbers(input) {
 }
 
 async function getTicketPriceCents(client) {
-  // tenta pegar de kv_store/app_config; fallback R$ 3,00
-  try {
-    const r1 = await client.query(
-      `select value from public.kv_store where key in ('ticket_price_cents','price_cents') limit 1`
-    );
-    if (r1.rowCount) {
-      const v = Number(r1.rows[0].value);
-      if (Number.isFinite(v) && v > 0) return v | 0;
-    }
-  } catch {}
-  try {
-    const r2 = await client.query(
-      `select price_cents from public.app_config order by id desc limit 1`
-    );
-    if (r2.rowCount) {
-      const v = Number(r2.rows[0].price_cents);
-      if (Number.isFinite(v) && v > 0) return v | 0;
-    }
-  } catch {}
-  return 300; // fallback
+  const r = await client.query(
+    `SELECT value
+       FROM public.app_config
+      WHERE key = $1
+      LIMIT 1`,
+    ["ticket_price_cents"]
+  );
+  const n = Number(r.rows?.[0]?.value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error("Invalid or missing app_config.ticket_price_cents");
+  }
+  return Math.trunc(n);
 }
 
 async function isNumberFree(client, draw_id, n) {
@@ -369,190 +361,11 @@ router.post(
   "/admin/draws/:id/autopay-run",
   requireAuth,
   requireAdmin,
-  async (req, res) => {
-    // Sem token do MP não dá para cobrar
-    if (!MP_TOKEN) {
-      console.error("[autopay-run] missing MP_ACCESS_TOKEN on server");
-      return res.status(503).json({ error: "mp_not_configured" });
-    }
-
-    const pool = await getPool();
-    const client = await pool.connect();
-    const draw_id = Number(req.params.id);
-    if (!Number.isInteger(draw_id)) {
-      client.release();
-      return res.status(400).json({ error: "bad_draw_id" });
-    }
-
-    try {
-      await client.query("BEGIN");
-
-      // status do sorteio (somente abertos)
-      const d = await client.query(
-        `select id, status from public.draws where id=$1`,
-        [draw_id]
-      );
-      if (!d.rowCount) throw new Error("draw_not_found");
-      const st = String(d.rows[0].status || "").toLowerCase();
-      if (!["open", "aberto"].includes(st)) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ error: "draw_not_open" });
-      }
-
-      // perfis ativos com cartão salvo
-      const { rows: profiles } = await client.query(
-        `select ap.*, array(
-           select n from public.autopay_numbers an where an.autopay_id=ap.id order by n
-         ) numbers
-         from public.autopay_profiles ap
-         where ap.active = true
-           and ap.mp_customer_id is not null
-           and ap.mp_card_id is not null`
-      );
-
-      const price_cents = await getTicketPriceCents(client);
-      const results = [];
-
-      for (const p of profiles) {
-        const user_id = p.user_id;
-        const wants = (p.numbers || [])
-          .map(Number)
-          .filter((n) => n >= 0 && n <= 99);
-
-        if (!wants.length) {
-          results.push({ user_id, status: "skipped", reason: "no_numbers" });
-          continue;
-        }
-
-        // filtra apenas os ainda livres
-        const free = [];
-        for (const n of wants) {
-          // eslint-disable-next-line no-await-in-loop
-          const ok = await isNumberFree(client, draw_id, n);
-          if (ok) free.push(n);
-        }
-        if (!free.length) {
-          results.push({
-            user_id,
-            status: "skipped",
-            reason: "none_available",
-          });
-          continue;
-        }
-
-        const amount_cents = free.length * price_cents;
-
-        // cobra no cartão do MP
-        let charge;
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          charge = await mpChargeCard({
-            customerId: p.mp_customer_id,
-            cardId: p.mp_card_id,
-            amount_cents,
-            description: `Sorteio ${draw_id} – números: ${free
-              .map((n) => String(n).padStart(2, "0"))
-              .join(", ")}`,
-            metadata: { user_id, draw_id, numbers: free },
-          });
-        } catch (e) {
-          // loga e segue para o próximo perfil (sem dados sensíveis)
-          await client.query(
-            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error_message)
-             values ($1,$2,$3,$4,'error',$5)`,
-            [p.id, user_id, draw_id, free, String(e?.message || e)]
-          );
-          results.push({ user_id, status: "error", error: "charge_failed" });
-          continue;
-        }
-
-        if (!charge || String(charge.status).toLowerCase() !== "approved") {
-          await client.query(
-            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error_message)
-             values ($1,$2,$3,$4,'error','not_approved')`,
-            [p.id, user_id, draw_id, free]
-          );
-          results.push({ user_id, status: "error", error: "not_approved" });
-          continue;
-        }
-
-        // grava payment/reservation (espelha /assign-numbers)
-        // payments.id no projeto atual é text (não-null) — usa o id do MP para manter compatibilidade
-        const paymentId = String(charge.paymentId || "");
-        if (!paymentId) {
-          await client.query(
-            `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,status,error_message)
-             values ($1,$2,$3,$4,'error','missing_payment_id')`,
-            [p.id, user_id, draw_id, free]
-          );
-          results.push({ user_id, status: "error", error: "missing_payment_id" });
-          continue;
-        }
-
-        const pay = await client.query(
-          `insert into public.payments (id, user_id, draw_id, numbers, amount_cents, status, created_at, provider)
-           values ($1,$2,$3,$4::int2[],$5,'approved', now(), 'mercadopago')
-           returning id`,
-          [paymentId, user_id, draw_id, free, amount_cents]
-        );
-        const resv = await client.query(
-          `insert into public.reservations (id, user_id, draw_id, numbers, status, created_at, expires_at)
-           values (gen_random_uuid(), $1, $2, $3::int2[], 'paid', now(), now())
-           returning id`,
-          [user_id, draw_id, free]
-        );
-
-        await client.query(
-          `insert into public.autopay_runs (autopay_id,user_id,draw_id,tried_numbers,bought_numbers,amount_cents,status,payment_id,reservation_id)
-           values ($1,$2,$3,$4,$5,$6,'ok',$7,$8)`,
-          [
-            p.id,
-            user_id,
-            draw_id,
-            free,
-            free,
-            amount_cents,
-            pay.rows[0].id,
-            resv.rows[0].id,
-          ]
-        );
-
-        // Integridade de saldo: pagamento 'approved' deve creditar via ledger (idempotente)
-        // (se for chamado múltiplas vezes, o UNIQUE do ledger evita duplicação)
-        // eslint-disable-next-line no-await-in-loop
-        const creditRes = await creditCouponOnApprovedPayment(String(pay.rows[0].id), {
-          channel: "CARD",
-          source: "autopay_legacy_mp",
-          runTraceId: null,
-          meta: { pricing_source: "public.app_config.ticket_price_cents", autopay: true, provider: "mercadopago" },
-          pgClient: client,
-        });
-        if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {
-          console.warn("[autopay-run][coupon.credit] WARN", {
-            paymentId: String(pay.rows[0].id),
-            action: creditRes?.action || null,
-            reason: creditRes?.reason || null,
-            user_id: creditRes?.user_id ?? null,
-            status: creditRes?.status ?? null,
-            errCode: creditRes?.errCode ?? null,
-            errMsg: creditRes?.errMsg ?? null,
-          });
-        }
-
-        results.push({ user_id, status: "ok", numbers: free, amount_cents });
-      }
-
-      await client.query("COMMIT");
-      res.json({ ok: true, draw_id, results, price_cents });
-    } catch (e) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {}
-      console.error("[autopay-run] error:", e?.message || e);
-      res.status(500).json({ error: "run_failed" });
-    } finally {
-      client.release();
-    }
+  async (_req, res) => {
+    return res.status(410).json({
+      error: "legacy_mp_autopay_disabled",
+      message: "Mercado Pago autopay is disabled. Use Vindi autopay runner.",
+    });
   }
 );
 

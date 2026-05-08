@@ -4,6 +4,7 @@
 import express from "express";
 import { query, getPool } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 
 const router = express.Router();
 
@@ -35,6 +36,37 @@ function safeJsonMeta(meta) {
     return JSON.stringify(meta);
   } catch {
     return "{}";
+  }
+}
+
+async function getTicketPriceCentsFromAppConfig(q) {
+  const r = await q(
+    `SELECT value
+       FROM public.app_config
+      WHERE key = $1
+      LIMIT 1`,
+    ["ticket_price_cents"]
+  );
+  const n = Number(r.rows?.[0]?.value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error("Invalid or missing app_config.ticket_price_cents");
+  }
+  return Math.trunc(n);
+}
+
+async function hasCouponEventOccurredAtColumn(q) {
+  try {
+    const r = await q(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema='public'
+          AND table_name='coupon_balance_history'
+          AND column_name='event_occurred_at'
+        LIMIT 1`
+    );
+    return !!r.rows?.length;
+  } catch {
+    return false;
   }
 }
 
@@ -159,6 +191,9 @@ router.post("/", async (req, res, next) => {
     } = req.body || {};
 
     const initialBalanceCents = toInt(coupon_value_cents, 0);
+    if (initialBalanceCents < 0) {
+      return res.status(400).json({ error: "invalid_coupon_balance" });
+    }
     const vals = [
       normStr(name, 255),
       normStr(email, 255),
@@ -182,6 +217,9 @@ router.post("/", async (req, res, next) => {
 
     const created = rows[0];
     const userId = Number(created?.id);
+    const hasEventOccurredAt = await hasCouponEventOccurredAtColumn(client.query.bind(client));
+    const eventOccurredAtCols = hasEventOccurredAt ? ", event_occurred_at" : "";
+    const eventOccurredAtVals = hasEventOccurredAt ? ", now()" : "";
 
     // Ledger obrigatório: saldo inicial != 0 deve ter histórico correspondente
     if (initialBalanceCents !== 0 && Number.isInteger(userId) && userId > 0) {
@@ -195,10 +233,10 @@ router.post("/", async (req, res, next) => {
       await client.query(
         `INSERT INTO public.coupon_balance_history
           (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
-           event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
+           event_type, channel, status, draw_id, reservation_id, run_trace_id, meta${eventOccurredAtCols})
          VALUES
           ($1, NULL, $2, $3, $4,
-           'ADMIN_BALANCE_ADJUSTMENT', 'ADMIN', NULL, NULL, NULL, $5, $6::jsonb)`,
+           'ADMIN_BALANCE_ADJUSTMENT', 'ADMIN', 'approved', NULL, NULL, $5, $6::jsonb${eventOccurredAtVals})`,
         [
           userId,
           initialBalanceCents,
@@ -236,6 +274,9 @@ router.put("/:id", async (req, res, next) => {
 
     const wantsBalance = coupon_value_cents != null;
     const requestedBalanceCents = wantsBalance ? toInt(coupon_value_cents, 0) : null;
+    if (wantsBalance && requestedBalanceCents < 0) {
+      return res.status(400).json({ error: "invalid_coupon_balance" });
+    }
 
     await client.query("BEGIN");
 
@@ -253,6 +294,9 @@ router.put("/:id", async (req, res, next) => {
     }
     const previousBalanceCents = Number(cur.rows[0]?.coupon_value_cents || 0) | 0;
     const shouldUpdateBalance = wantsBalance && requestedBalanceCents !== previousBalanceCents;
+    const hasEventOccurredAt = await hasCouponEventOccurredAtColumn(client.query.bind(client));
+    const eventOccurredAtCols = hasEventOccurredAt ? ", event_occurred_at" : "";
+    const eventOccurredAtVals = hasEventOccurredAt ? ", now()" : "";
 
     const upd = await client.query(
       `UPDATE public.users
@@ -291,10 +335,10 @@ router.put("/:id", async (req, res, next) => {
       await client.query(
         `INSERT INTO public.coupon_balance_history
           (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
-           event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
+           event_type, channel, status, draw_id, reservation_id, run_trace_id, meta${eventOccurredAtCols})
          VALUES
           ($1, NULL, $2, $3, $4,
-           'ADMIN_BALANCE_ADJUSTMENT', 'ADMIN', NULL, NULL, NULL, $5, $6::jsonb)`,
+           'ADMIN_BALANCE_ADJUSTMENT', 'ADMIN', 'approved', NULL, NULL, $5, $6::jsonb${eventOccurredAtVals})`,
         [
           id,
           deltaCents,
@@ -335,7 +379,12 @@ router.delete("/:id", async (req, res, next) => {
 /* =============== ATRIBUIR NÚMEROS =============== */
 /**
  * POST /api/admin/users/:id/assign-numbers
- * body: { draw_id: number, numbers: number[] | "csv", amount_cents?: number }
+ * body: {
+ *  draw_id: number,
+ *  numbers: number[] | "csv",
+ *  credit_coupon?: boolean, // default true
+ *  no_coupon_credit_reason?: string | null
+ * }
  * - Checa conflitos em payments aprovados e reservas ativas
  * - Se ok, cria:
  *    - payments(status='approved')
@@ -348,9 +397,10 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
     const user_id = Number(req.params.id);
     const draw_id = Number(req.body?.draw_id);
     const numbers = parseNumbers(req.body?.numbers);
-    const amount_cents = Number.isFinite(+req.body?.amount_cents)
-      ? Math.max(0, +req.body.amount_cents)
-      : 0;
+    const creditCoupon = req.body?.credit_coupon !== undefined ? !!req.body.credit_coupon : true;
+    const noCouponCreditReason = req.body?.no_coupon_credit_reason
+      ? String(req.body.no_coupon_credit_reason).slice(0, 240)
+      : null;
 
     if (!Number.isInteger(user_id) || !Number.isInteger(draw_id) || numbers.length === 0) {
       return res.status(400).json({ error: "bad_request" });
@@ -416,31 +466,79 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
       });
     }
 
-    // --------- INSERTS ---------
-    // payments.id é NOT NULL (tipo text); usamos epoch ms (13 dígitos) como nos seus dados atuais
-    const payId = Date.now().toString();
+    const unit = await getTicketPriceCentsFromAppConfig(client.query.bind(client));
+    const amount_cents = numbers.length * unit;
+    const payId = `adminassign:${draw_id}:${user_id}:${Date.now()}`;
+    const provider = creditCoupon ? "admin_assign" : "admin_assign_no_coupon";
+    const nowIso = new Date().toISOString();
+    const paymentMeta = safeJsonMeta({
+      source: "adminUsers.assignNumbers",
+      assignment_source: "adminUsers.assignNumbers",
+      admin_user_id: req.user?.id ?? null,
+      credit_coupon: creditCoupon,
+      no_coupon_credit: !creditCoupon,
+      reason: !creditCoupon ? (noCouponCreditReason || "admin_manual_assignment_without_coupon") : null,
+      pricing_source: "payments.amount_cents",
+      unit_cents: unit,
+      qty: numbers.length,
+    });
 
     const pay = await client.query(
       `INSERT INTO public.payments
-         (id, user_id, draw_id, numbers, amount_cents, status, created_at)
-       VALUES ($1, $2, $3, $4::int4[], $5, 'approved', NOW())
+         (id, user_id, draw_id, numbers, amount_cents, status, created_at, paid_at, provider, coupon_credited, coupon_credited_at, vindi_payload_json)
+       VALUES (
+         $1, $2, $3, $4::int4[], $5, 'approved', NOW(), NOW(), $6,
+         CASE WHEN $7::boolean THEN false ELSE true END,
+         CASE WHEN $7::boolean THEN NULL ELSE NOW() END,
+         $8::jsonb
+       )
        RETURNING id, user_id, draw_id, numbers, amount_cents, status, created_at`,
-      [payId, user_id, draw_id, numbers, amount_cents]
+      [payId, user_id, draw_id, numbers, amount_cents, provider, creditCoupon, paymentMeta]
     );
 
     // reserva paga; PK uuid gerada pelo banco
     const resv = await client.query(
       `INSERT INTO public.reservations
-         (id, user_id, draw_id, numbers, status, created_at, expires_at)
-       VALUES (gen_random_uuid(), $1, $2, $3::int4[], 'paid', NOW(), NOW() + INTERVAL '30 minutes')
+         (id, user_id, draw_id, numbers, payment_id, status, created_at, expires_at)
+       VALUES (gen_random_uuid(), $1, $2, $3::int4[], $4, 'paid', NOW(), NOW() + INTERVAL '30 minutes')
        RETURNING id`,
-      [user_id, draw_id, numbers]
+      [user_id, draw_id, numbers, payId]
     );
+
+    await client.query(
+      `UPDATE public.numbers
+          SET status = 'sold',
+              reservation_id = NULL
+        WHERE draw_id = $1
+          AND n = ANY($2::int2[])`,
+      [draw_id, numbers]
+    );
+
+    if (creditCoupon) {
+      const creditRes = await creditCouponOnApprovedPayment(String(payId), {
+        channel: "ADMIN",
+        source: "admin_assign_numbers",
+        runTraceId: req.headers["x-request-id"] ? String(req.headers["x-request-id"]) : null,
+        pgClient: client,
+        meta: {
+          pricing_source: "payments.amount_cents",
+          assignment_source: "adminUsers.assignNumbers",
+          admin_user_id: req.user?.id ?? null,
+          credit_coupon: true,
+          requested_at: nowIso,
+        },
+      });
+      if (creditRes?.ok === false || ["error", "not_supported", "invalid_amount"].includes(String(creditRes?.action || ""))) {
+        throw new Error(`admin_assign_coupon_credit_failed:${creditRes?.action || "unknown"}`);
+      }
+    }
 
     await client.query("COMMIT");
     res.status(201).json({
       payment: pay.rows[0],
       reservation_id: resv.rows[0]?.id || null,
+      credit_coupon: creditCoupon,
+      no_coupon_credit_reason: !creditCoupon ? (noCouponCreditReason || "admin_manual_assignment_without_coupon") : null,
     });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}

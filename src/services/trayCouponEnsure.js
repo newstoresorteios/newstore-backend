@@ -28,7 +28,21 @@ function makeUserCouponCode(userId) {
 
 async function loadCouponSystemRow(userId) {
   const uid = Number(userId);
-  // Pedido do requisito: primeiro tenta public.coupon_tray_system (se existir).
+  // Fonte financeira primária: users.coupon_value_cents.
+  // coupon_tray_system é apenas estado de sincronização externa (code/id), nunca a fonte do saldo.
+  const userRowResult = await query(
+    `SELECT coupon_code,
+            tray_coupon_id,
+            COALESCE(coupon_value_cents,0)::int AS coupon_value_cents
+       FROM users
+      WHERE id=$1
+      LIMIT 1`,
+    [uid]
+  );
+  if (!userRowResult.rows?.length) return { source: "none", row: null };
+  const userRow = userRowResult.rows[0];
+
+  // Se coupon_tray_system existir, só complementa code/id ausentes.
   try {
     const r = await query(
       `SELECT coupon_code,
@@ -39,21 +53,21 @@ async function loadCouponSystemRow(userId) {
         LIMIT 1`,
       [uid]
     );
-    if (r.rows?.length) return { source: "coupon_tray_system", row: r.rows[0] };
+    if (r.rows?.length) {
+      const trayRow = r.rows[0];
+      return {
+        source: "users+coupon_tray_system",
+        row: {
+          coupon_code: userRow.coupon_code || trayRow.coupon_code || null,
+          tray_coupon_id: userRow.tray_coupon_id || trayRow.tray_coupon_id || null,
+          // mantém SEMPRE o saldo do users como fonte de verdade
+          coupon_value_cents: Number(userRow.coupon_value_cents || 0),
+        },
+      };
+    }
   } catch {}
 
-  // Fallback compatível com o repo atual: users
-  const r2 = await query(
-    `SELECT coupon_code,
-            tray_coupon_id,
-            COALESCE(coupon_value_cents,0)::int AS coupon_value_cents
-       FROM users
-      WHERE id=$1
-      LIMIT 1`,
-    [uid]
-  );
-  if (!r2.rows?.length) return { source: "none", row: null };
-  return { source: "users", row: r2.rows[0] };
+  return { source: "users", row: userRow };
 }
 
 async function persistCouponSystemFields({ userId, code = null, trayCouponId = null }) {

@@ -1,12 +1,6 @@
 // src/middleware/auth.js
 import jwt from 'jsonwebtoken';
-
-
-const JWT_SECRET =
-  process.env.JWT_SECRET ||
-  process.env.JWT_SECRET_KEY ||
-  process.env.SUPABASE_JWT_SECRET ||
-  'change-me-in-env';
+import { JWT_SECRET } from "../config/auth.js";
 
 // você pode manter AUTH_COOKIE_NAME, mas também aceitaremos nomes comuns
 const COOKIE_NAMES = [

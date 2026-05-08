@@ -101,25 +101,18 @@ router.get("/:id(\\d+)", async (req, res) => {
  * Utils compartilhadas (mesmas da rota de autopay)
  * ------------------------------------------------------------------ */
 async function getTicketPriceCents(client) {
-  try {
-    const r1 = await client.query(
-      `select value from public.kv_store where key in ('ticket_price_cents','price_cents') limit 1`
-    );
-    if (r1.rowCount) {
-      const v = Number(r1.rows[0].value);
-      if (Number.isFinite(v) && v > 0) return v | 0;
-    }
-  } catch {}
-  try {
-    const r2 = await client.query(
-      `select price_cents from public.app_config order by id desc limit 1`
-    );
-    if (r2.rowCount) {
-      const v = Number(r2.rows[0].price_cents);
-      if (Number.isFinite(v) && v > 0) return v | 0;
-    }
-  } catch {}
-  return 300;
+  const r = await client.query(
+    `SELECT value
+       FROM public.app_config
+      WHERE key = $1
+      LIMIT 1`,
+    ["ticket_price_cents"]
+  );
+  const n = Number(r.rows?.[0]?.value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error("Invalid or missing app_config.ticket_price_cents");
+  }
+  return Math.trunc(n);
 }
 
 async function isNumberFree(client, draw_id, n) {
@@ -359,66 +352,18 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
 
 // POST /api/admin/draws/new
 router.post("/new", requireAuth, requireAdmin, async (req, res) => {
-  const pool = await getPool();
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const d = await client.query(
-      `insert into public.draws (status, opened_at, product_name, product_link)
-       values ('open', now(), $1, $2)
-       returning id`,
-      [req.body?.product_name || null, req.body?.product_link || null]
-    );
-    const draw_id = d.rows[0].id;
-
-    const { results, price_cents } = await runAutopayForDraw(client, draw_id);
-
-    await client.query("COMMIT");
-    console.log("[admin/draws] novo draw id =", draw_id);
-    return res.json({ ok: true, draw_id, autopay: { results, price_cents } });
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    console.error("[admin/draws/new] error", e?.message || e);
-    return res.status(500).json({ error: "open_failed" });
-  } finally {
-    client.release();
-  }
+  return res.status(410).json({
+    error: "legacy_admin_draws_disabled",
+    message: "Legacy admin draws route is disabled. Use /api/admin/draws endpoints.",
+  });
 });
 
 // POST /api/admin/draws/:id/open
 router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
-  const pool = await getPool();
-  const client = await pool.connect();
-  const draw_id = Number(req.params.id);
-  if (!Number.isInteger(draw_id)) {
-    client.release();
-    return res.status(400).json({ error: "bad_draw_id" });
-  }
-  try {
-    await client.query("BEGIN");
-
-    await client.query(
-      `update public.draws
-          set status='open',
-              opened_at = coalesce(opened_at, now()),
-              closed_at = null,
-              realized_at = null
-        where id=$1`,
-      [draw_id]
-    );
-
-    const { results, price_cents } = await runAutopayForDraw(client, draw_id);
-
-    await client.query("COMMIT");
-    return res.json({ ok: true, draw_id, autopay: { results, price_cents } });
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    console.error("[admin/draws/:id/open] error", e?.message || e);
-    return res.status(500).json({ error: "open_failed" });
-  } finally {
-    client.release();
-  }
+  return res.status(410).json({
+    error: "legacy_admin_draws_disabled",
+    message: "Legacy admin draws route is disabled. Use /api/admin/draws endpoints.",
+  });
 });
 
 export default router;

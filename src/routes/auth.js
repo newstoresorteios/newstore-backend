@@ -7,13 +7,9 @@ import nodemailer from 'nodemailer';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { ensureTrayCouponForUser } from '../services/trayCouponEnsure.js';
+import { JWT_SECRET } from "../config/auth.js";
 
 const router = express.Router();
-
-const JWT_SECRET =
-  process.env.JWT_SECRET ||
-  process.env.SUPABASE_JWT_SECRET ||
-  'change-me-in-env';
 
 const TOKEN_TTL   = process.env.JWT_TTL || '7d';
 const COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'ns_auth';

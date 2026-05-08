@@ -39,6 +39,22 @@ function safeJsonMeta(meta) {
   }
 }
 
+async function hasEventOccurredAtColumn(q) {
+  try {
+    const r = await q(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'coupon_balance_history'
+          AND column_name = 'event_occurred_at'
+        LIMIT 1`
+    );
+    return !!r.rows?.length;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Credita saldo do usuário quando um payment estiver approved.
  *
@@ -139,10 +155,20 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
   const metaJson = safeJsonMeta({
     ...(options?.meta && typeof options.meta === "object" ? options.meta : null),
     source: options?.source || null,
-    pricing_source: "public.app_config.ticket_price_cents",
-    unit_cents: unit,
+    pricing_source: "payments.amount_cents",
+    fallback_pricing_source: "public.app_config.ticket_price_cents",
+    app_config_unit_cents: unit,
+    payment_amount_cents: null,
+    numbers_qty: null,
+    expected_by_current_app_config_cents: null,
     legacy_caller_unit_cents: legacyCallerUnitCents,
   });
+
+  const hasEventOccurredAt = await hasEventOccurredAtColumn(q);
+  const eventOccurredAtColumnSql = hasEventOccurredAt ? ", event_occurred_at" : "";
+  const eventOccurredAtSelectSql = hasEventOccurredAt
+    ? ", COALESCE(c.paid_at, c.created_at, now())"
+    : "";
 
   // 1 SQL atômico (CTE) com parâmetros tipados (evita 42P08), hard-idempotent e concorrência-safe.
   //
@@ -163,6 +189,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         id,
         user_id,
         amount_cents,
+        paid_at,
+        created_at,
         numbers,
         draw_id,
         lower(status) AS status_l,
@@ -176,10 +204,13 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         pi.*,
         COALESCE(array_length(pi.numbers, 1), 0)::int AS qty,
         $2::int4 AS unit_cents,
+        COALESCE(pi.amount_cents, 0)::int AS payment_amount_cents,
+        (COALESCE(array_length(pi.numbers, 1), 0)::int * $2::int4)::int AS expected_by_current_app_config_cents,
         (
           CASE
+            WHEN COALESCE(pi.amount_cents, 0) > 0 THEN COALESCE(pi.amount_cents, 0)
             WHEN COALESCE(array_length(pi.numbers, 1), 0) > 0 THEN (COALESCE(array_length(pi.numbers, 1), 0) * $2::int4)
-            ELSE COALESCE(pi.amount_cents, 0)
+            ELSE 0
           END
         )::int AS delta_cents
       FROM pi
@@ -195,7 +226,7 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     h AS (
       INSERT INTO public.coupon_balance_history
         (user_id, payment_id, delta_cents, balance_before_cents, balance_after_cents,
-         event_type, channel, status, draw_id, reservation_id, run_trace_id, meta)
+         event_type, channel, status, draw_id, reservation_id, run_trace_id, meta${eventOccurredAtColumnSql})
       SELECT
         ul.user_id,
         c.id,
@@ -210,8 +241,19 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
         $4::text,
         (
           COALESCE($5::jsonb, '{}'::jsonb)
-          || jsonb_build_object('unit_cents', c.unit_cents, 'qty', c.qty, 'channel', $3::text)
+          || jsonb_build_object(
+            'pricing_source', 'payments.amount_cents',
+            'fallback_pricing_source', 'public.app_config.ticket_price_cents',
+            'app_config_unit_cents', c.unit_cents,
+            'payment_amount_cents', c.payment_amount_cents,
+            'numbers_qty', c.qty,
+            'expected_by_current_app_config_cents', c.expected_by_current_app_config_cents,
+            'unit_cents', c.unit_cents,
+            'qty', c.qty,
+            'channel', $3::text
+          )
         )
+        ${eventOccurredAtSelectSql}
       FROM calc c
       JOIN ul ON true
       WHERE c.status_l IN ('approved','paid','pago')
@@ -255,6 +297,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       (SELECT c.status_l::text FROM calc c LIMIT 1) AS status_l,
       (SELECT c.qty::int FROM calc c LIMIT 1) AS qty,
       (SELECT c.unit_cents::int FROM calc c LIMIT 1) AS unit_cents,
+      (SELECT c.payment_amount_cents::int FROM calc c LIMIT 1) AS payment_amount_cents,
+      (SELECT c.expected_by_current_app_config_cents::int FROM calc c LIMIT 1) AS expected_by_current_app_config_cents,
       (SELECT c.delta_cents::int FROM calc c LIMIT 1) AS delta_cents,
       (SELECT COALESCE(EXISTS(
         SELECT 1
@@ -274,6 +318,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     const status = rows?.[0]?.status_l ?? null;
     const qty = rows?.[0]?.qty ?? null;
     const unit_cents = rows?.[0]?.unit_cents ?? null;
+    const payment_amount_cents = rows?.[0]?.payment_amount_cents ?? null;
+    const expected_by_current_app_config_cents = rows?.[0]?.expected_by_current_app_config_cents ?? null;
     const delta_cents = rows?.[0]?.delta_cents ?? null;
     const already_in_ledger = !!rows?.[0]?.already_in_ledger;
     const already_credited = !!rows?.[0]?.already_credited;
@@ -300,6 +346,22 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
     } else if (already_credited) {
       action = "noop";
       reason = "already_credited";
+    }
+
+    if (
+      isFinal &&
+      Number(payment_amount_cents || 0) > 0 &&
+      Number(qty || 0) > 0 &&
+      Number(payment_amount_cents) !== Number(expected_by_current_app_config_cents || 0)
+    ) {
+      // eslint-disable-next-line no-console
+      console.warn("[coupon.credit] amount/app_config mismatch", {
+        paymentId: pid,
+        payment_amount_cents,
+        qty,
+        app_config_unit_cents: unit,
+        expected_by_current_app_config_cents,
+      });
     }
 
     if (isDebugEnabled()) {
@@ -336,6 +398,8 @@ export async function creditCouponOnApprovedPayment(paymentId, options = {}) {
       unit_cents,
       already_in_ledger,
       already_credited,
+      payment_amount_cents,
+      expected_by_current_app_config_cents,
       errCode: null,
       errMsg: null,
     };

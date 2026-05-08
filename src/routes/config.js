@@ -8,6 +8,7 @@ import {
   getMaxNumbersPerSelection,
   setMaxNumbersPerSelection,
 } from "../services/config.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -39,7 +40,7 @@ router.get("/", async (_req, res) => {
  * Atualiza banner_title e max_numbers_per_selection (e opcionalmente price_cents).
  * O preço você já atualiza pela rota antiga; aqui deixo suportado também.
  */
-router.post("/", async (req, res) => {
+router.post("/", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { banner_title, max_numbers_per_selection, ticket_price_cents } = req.body || {};
 
