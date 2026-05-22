@@ -194,6 +194,8 @@ export async function createDispatch({
   return r.rows[0];
 }
 
+// Requires migration 014_notification_delivery_status.sql
+// (provider_status, delivery_status, delivery_event, delivery_events_raw, etc.)
 export async function markDispatchAccepted({ pgClient, dispatchId, result }) {
   const r = await runQuery(
     pgClient,

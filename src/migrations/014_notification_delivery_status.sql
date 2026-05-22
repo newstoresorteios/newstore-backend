@@ -18,4 +18,7 @@ ON public.notification_dispatches (delivery_status);
 CREATE INDEX IF NOT EXISTS idx_notification_dispatches_provider_status
 ON public.notification_dispatches (provider_status);
 
+ALTER TABLE public.notification_campaigns
+ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+
 COMMIT;

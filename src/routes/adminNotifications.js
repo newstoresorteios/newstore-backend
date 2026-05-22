@@ -39,6 +39,56 @@ function attachBrevoHint(payload, dispatch) {
   return payload;
 }
 
+const DISPATCH_DELIVERY_COLUMNS = [
+  "provider_status",
+  "delivery_status",
+  "delivery_event",
+  "delivery_events_raw",
+  "delivery_checked_at",
+  "delivery_confirmed_at",
+  "last_provider_event_at",
+];
+
+router.get("/diagnostics/schema", async (_req, res) => {
+  try {
+    const r = await query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'notification_dispatches'
+        ORDER BY column_name`
+    );
+    const existing_columns = (r.rows || []).map((row) => row.column_name);
+    const missing_columns = DISPATCH_DELIVERY_COLUMNS.filter(
+      (c) => !existing_columns.includes(c)
+    );
+    const schema_ok = missing_columns.length === 0;
+
+    console.log("[admin/notifications] diagnostics schema", {
+      schema_ok,
+      missing_columns,
+    });
+
+    return res.json({
+      ok: true,
+      schema_ok,
+      notification_dispatches: {
+        required_columns: DISPATCH_DELIVERY_COLUMNS,
+        existing_columns,
+        missing_columns,
+      },
+    });
+  } catch (e) {
+    console.error("[admin/notifications] diagnostics schema error", {
+      message: e?.message || null,
+      stack: e?.stack || null,
+      code: e?.code || null,
+      detail: e?.detail || null,
+    });
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
 router.get("/health", async (_req, res) => {
   try {
     const health = getNotificationHealth();
@@ -425,33 +475,60 @@ router.post("/test-whatsapp", async (req, res) => {
       out?.dispatch?.id &&
       out?.result?.messageId
     ) {
-      console.log("[admin/notifications] test-whatsapp:delivery-check:start", {
-        dispatch_id: out.dispatch.id,
-        messageId: out.result.messageId,
-      });
+      try {
+        console.log("[admin/notifications] test-whatsapp:delivery-check:start", {
+          dispatch_id: out.dispatch.id,
+          messageId: out.result.messageId,
+        });
 
-      delivery_check = await runTestWhatsAppDeliveryCheck({
-        dispatchId: out.dispatch.id,
-        messageId: out.result.messageId,
-        contactNumber: getTestRecipient(),
-      });
+        delivery_check = await runTestWhatsAppDeliveryCheck({
+          dispatchId: out.dispatch.id,
+          messageId: out.result.messageId,
+          contactNumber: getTestRecipient(),
+        });
 
-      const refreshed = await query(
-        `SELECT * FROM public.notification_dispatches WHERE id = $1::uuid LIMIT 1`,
-        [out.dispatch.id]
-      );
-      if (refreshed.rows[0]) {
-        out.dispatch = refreshed.rows[0];
+        const refreshed = await query(
+          `SELECT * FROM public.notification_dispatches WHERE id = $1 LIMIT 1`,
+          [out.dispatch.id]
+        );
+        if (refreshed.rows[0]) {
+          out.dispatch = refreshed.rows[0];
+        }
+
+        console.log("[admin/notifications] test-whatsapp:delivery-check:done", {
+          dispatch_id: out.dispatch.id,
+          messageId: out.result.messageId,
+          events_checked: delivery_check?.events_checked ?? 0,
+          matched: Boolean(delivery_check?.matched),
+          matched_event: delivery_check?.matched_event?.event || null,
+          matched_reason: delivery_check?.matched_event?.reason || null,
+          error: delivery_check?.error || null,
+          reason: delivery_check?.reason || null,
+        });
+      } catch (deliveryErr) {
+        console.error("[admin/notifications] test-whatsapp:delivery-check:error", {
+          dispatch_id: out.dispatch.id,
+          messageId: out.result.messageId,
+          message: deliveryErr?.message || null,
+          stack: deliveryErr?.stack || null,
+          code: deliveryErr?.code || null,
+          detail: deliveryErr?.detail || null,
+          hint: deliveryErr?.hint || null,
+          table: deliveryErr?.table || null,
+          column: deliveryErr?.column || null,
+          constraint: deliveryErr?.constraint || null,
+        });
+
+        delivery_check = {
+          checked: true,
+          matched: false,
+          events_checked: 0,
+          error: "delivery_check_failed",
+          reason: deliveryErr?.message || null,
+          message:
+            "Envio aceito pela Brevo, mas a consulta de eventos falhou. Verifique logs do Render.",
+        };
       }
-
-      console.log("[admin/notifications] test-whatsapp:delivery-check:done", {
-        dispatch_id: out.dispatch.id,
-        messageId: out.result.messageId,
-        events_checked: delivery_check.events_checked ?? 0,
-        matched: Boolean(delivery_check.matched),
-        matched_event: delivery_check.matched_event?.event || null,
-        matched_reason: delivery_check.matched_event?.reason || null,
-      });
     }
 
     const warning = getTestModeWarning();
@@ -470,7 +547,16 @@ router.post("/test-whatsapp", async (req, res) => {
       )
     );
   } catch (e) {
-    console.error("[admin/notifications] test-whatsapp error:", e?.message || e);
+    console.error("[admin/notifications] test-whatsapp error", {
+      message: e?.message || null,
+      stack: e?.stack || null,
+      code: e?.code || null,
+      detail: e?.detail || null,
+      hint: e?.hint || null,
+      table: e?.table || null,
+      column: e?.column || null,
+      constraint: e?.constraint || null,
+    });
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
