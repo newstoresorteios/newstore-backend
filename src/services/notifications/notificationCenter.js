@@ -27,6 +27,9 @@ export const TEST_MODE_WARNING = "TEST_MODE_ACTIVE_REAL_RECIPIENTS_BLOCKED";
 export const BREVO_IP_BLOCKED_MESSAGE =
   "A Brevo bloqueou o IP de saída. Adicione o IP nas configurações de Authorized IPs da Brevo.";
 
+export const MISSING_TEMPLATE_ID_MESSAGE =
+  "Template ID ausente. Configure BREVO_WHATSAPP_GENERIC_TEST_TEMPLATE_ID, preencha provider_template_id no banco ou informe template_id no formulário.";
+
 export function getTestModeWarning() {
   return shouldForceTestRecipient() ? TEST_MODE_WARNING : null;
 }
@@ -43,6 +46,13 @@ export function getNotificationHealth() {
       process.env.BREVO_WHATSAPP_SENDER_NUMBER || ""
     ).trim(),
     testRecipientConfigured: !!getTestRecipient(),
+    genericTestTemplateEnvConfigured: Boolean(
+      process.env.BREVO_WHATSAPP_GENERIC_TEST_TEMPLATE_ID ||
+        process.env.BREVO_WHATSAPP_TEMPLATE_ID
+    ),
+    captiveTemplateEnvConfigured: Boolean(
+      process.env.BREVO_WHATSAPP_CAPTIVE_AUTH_TEMPLATE_ID
+    ),
   };
 }
 
@@ -198,6 +208,7 @@ export async function sendTestWhatsApp({
       ok: false,
       skipped: true,
       reason: "missing_template_id",
+      message: MISSING_TEMPLATE_ID_MESSAGE,
       provider: "brevo",
       channel: "whatsapp",
     };
@@ -362,6 +373,7 @@ export async function manualSendNotification({
       ok: false,
       skipped: true,
       reason: "missing_template_id",
+      message: MISSING_TEMPLATE_ID_MESSAGE,
       provider: "brevo",
       channel: "whatsapp",
     };
