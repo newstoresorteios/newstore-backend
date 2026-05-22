@@ -117,7 +117,6 @@ export async function sendBrevoWhatsAppTemplate({
   templateKey,
   correlationId,
 }) {
-  void templateKey;
   void correlationId;
 
   let recipient = null;
@@ -184,6 +183,14 @@ export async function sendBrevoWhatsAppTemplate({
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  console.log("[brevo.whatsapp] send:start", {
+    templateKey: templateKey || null,
+    templateId: Number(templateId),
+    recipient_forced: resolved.recipient_forced,
+    hasParams: Boolean(params && Object.keys(params).length),
+    senderConfigured: Boolean(process.env.BREVO_WHATSAPP_SENDER_NUMBER),
+  });
+
   try {
     const res = await fetch(`${baseUrl}/whatsapp/sendMessage`, {
       method: "POST",
@@ -201,6 +208,13 @@ export async function sendBrevoWhatsAppTemplate({
     const statusCode = res.status;
 
     if (statusCode === 200 || statusCode === 201 || statusCode === 202) {
+      console.log("[brevo.whatsapp] send:accepted", {
+        statusCode,
+        messageId: body?.messageId || body?.id || null,
+        recipient_forced: resolved.recipient_forced,
+        templateId: Number(templateId),
+        templateKey: templateKey || null,
+      });
       return {
         ok: true,
         skipped: false,
@@ -214,6 +228,14 @@ export async function sendBrevoWhatsAppTemplate({
         recipient_forced,
       };
     }
+
+    console.warn("[brevo.whatsapp] send:failed", {
+      statusCode,
+      templateId: Number(templateId),
+      templateKey: templateKey || null,
+      recipient_forced: resolved.recipient_forced,
+      error: body?.message || body?.code || "brevo_request_failed",
+    });
 
     return {
       ok: false,
@@ -229,6 +251,12 @@ export async function sendBrevoWhatsAppTemplate({
     };
   } catch (error) {
     clearTimeout(timer);
+    console.error("[brevo.whatsapp] send:error", {
+      templateId: Number(templateId),
+      templateKey: templateKey || null,
+      recipient_forced: resolved.recipient_forced,
+      error: error?.message,
+    });
     return {
       ok: false,
       skipped: false,

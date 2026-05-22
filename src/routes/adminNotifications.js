@@ -20,6 +20,10 @@ function toInt(v, def) {
   return Number.isFinite(n) && n >= 0 ? Math.trunc(n) : def;
 }
 
+function asRows(rows) {
+  return Array.isArray(rows) ? rows : [];
+}
+
 function attachBrevoHint(payload, dispatch) {
   if (dispatch?.error_message === "brevo_ip_not_authorized") {
     return { ...payload, brevo_message: BREVO_IP_BLOCKED_MESSAGE };
@@ -29,7 +33,18 @@ function attachBrevoHint(payload, dispatch) {
 
 router.get("/health", async (_req, res) => {
   try {
-    return res.json(getNotificationHealth());
+    const health = getNotificationHealth();
+    console.log("[admin/notifications] health", {
+      testMode: health?.testMode,
+      allowRealRecipients: health?.allowRealRecipients,
+      brevoWhatsappEnabled: health?.brevoWhatsappEnabled,
+      hasBrevoApiKey: health?.hasBrevoApiKey,
+      senderNumberConfigured: health?.senderNumberConfigured,
+      testRecipientConfigured: health?.testRecipientConfigured,
+      genericTestTemplateEnvConfigured: health?.genericTestTemplateEnvConfigured,
+      captiveTemplateEnvConfigured: health?.captiveTemplateEnvConfigured,
+    });
+    return res.json(health);
   } catch (e) {
     console.error("[admin/notifications] health error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
@@ -41,6 +56,14 @@ router.get("/dispatches", async (req, res) => {
     const { status, channel, provider } = req.query || {};
     const limit = Math.min(toInt(req.query?.limit, 50), 50);
     const offset = toInt(req.query?.offset, 0);
+
+    console.log("[admin/notifications] list dispatches:start", {
+      status: req.query.status || null,
+      channel: req.query.channel || null,
+      provider: req.query.provider || null,
+      limit,
+      offset,
+    });
 
     const conditions = [];
     const params = [];
@@ -71,7 +94,29 @@ router.get("/dispatches", async (req, res) => {
       params
     );
 
-    return res.json({ rows: r.rows, limit, offset });
+    const rows = asRows(r.rows);
+
+    console.log("[admin/notifications] list dispatches:done", {
+      count: rows.length,
+      limit,
+      offset,
+    });
+
+    if (rows.length === 0) {
+      console.warn(
+        "[admin/notifications] dispatches empty - check notification_dispatches table or filters"
+      );
+    }
+
+    return res.json({
+      ok: true,
+      rows,
+      dispatches: rows,
+      items: rows,
+      count: rows.length,
+      limit,
+      offset,
+    });
   } catch (e) {
     console.error("[admin/notifications] dispatches error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
@@ -91,7 +136,24 @@ router.get("/inbound", async (req, res) => {
       [limit, offset]
     );
 
-    return res.json({ rows: r.rows, limit, offset });
+    const rows = asRows(r.rows);
+
+    console.log("[admin/notifications] list inbound:done", {
+      count: rows.length,
+      limit,
+      offset,
+    });
+
+    return res.json({
+      ok: true,
+      rows,
+      inbound: rows,
+      messages: rows,
+      items: rows,
+      count: rows.length,
+      limit,
+      offset,
+    });
   } catch (e) {
     console.error("[admin/notifications] inbound error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
@@ -105,7 +167,26 @@ router.get("/templates", async (_req, res) => {
          FROM public.notification_templates
         ORDER BY template_key, channel, provider`
     );
-    return res.json({ rows: r.rows });
+
+    const rows = asRows(r.rows);
+
+    console.log("[admin/notifications] list templates:done", {
+      count: rows.length,
+    });
+
+    if (rows.length === 0) {
+      console.warn(
+        "[admin/notifications] templates empty - check notification_templates table"
+      );
+    }
+
+    return res.json({
+      ok: true,
+      rows,
+      templates: rows,
+      items: rows,
+      count: rows.length,
+    });
   } catch (e) {
     console.error("[admin/notifications] templates error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
@@ -122,6 +203,14 @@ router.post("/test-whatsapp", async (req, res) => {
       params,
     } = req.body || {};
 
+    console.log("[admin/notifications] test-whatsapp:start", {
+      admin_user_id: req.user?.id || null,
+      template_key: req.body?.template_key || null,
+      has_template_id: Boolean(req.body?.template_id),
+      has_phone: Boolean(req.body?.phone),
+      has_user_id: Boolean(req.body?.user_id),
+    });
+
     const out = await sendTestWhatsApp({
       userId: userId != null ? Number(userId) : null,
       phone,
@@ -129,6 +218,18 @@ router.post("/test-whatsapp", async (req, res) => {
       templateId,
       params: params || {},
       adminUserId: req.user?.id ?? null,
+    });
+
+    console.log("[admin/notifications] test-whatsapp:result", {
+      ok: out?.ok,
+      dispatch_id: out?.dispatch?.id,
+      dispatch_status: out?.dispatch?.status,
+      result_ok: out?.result?.ok,
+      statusCode: out?.result?.statusCode,
+      messageId: out?.result?.messageId,
+      recipient_forced: out?.result?.recipient_forced,
+      reason: out?.result?.reason || null,
+      error: out?.result?.error || null,
     });
 
     const warning = getTestModeWarning();
@@ -157,13 +258,20 @@ router.post("/audience/estimate", async (req, res) => {
       return res.status(400).json({ ok: false, error: "filter_required" });
     }
 
-    const out = await estimateAudience({
+    const result = await estimateAudience({
       filter,
       userId: userId != null ? Number(userId) : null,
       phone,
     });
 
-    return res.json(out);
+    console.log("[admin/notifications] audience estimate", {
+      filter: req.body?.filter || null,
+      estimated_count: result?.estimated_count,
+      test_mode: result?.test_mode,
+      allow_real_recipients: result?.allow_real_recipients,
+    });
+
+    return res.json(result);
   } catch (e) {
     console.error("[admin/notifications] audience estimate error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
@@ -191,6 +299,17 @@ router.post("/manual-send", async (req, res) => {
       phone,
       params: params || {},
       adminUserId: req.user?.id ?? null,
+    });
+
+    console.log("[admin/notifications] manual-send:result", {
+      ok: out?.ok,
+      dispatch_id: out?.dispatch?.id,
+      dispatch_status: out?.dispatch?.status,
+      warning: out?.warning || null,
+      result_ok: out?.result?.ok,
+      statusCode: out?.result?.statusCode,
+      messageId: out?.result?.messageId,
+      recipient_forced: out?.result?.recipient_forced,
     });
 
     return res.json(
