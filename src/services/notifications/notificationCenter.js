@@ -133,21 +133,47 @@ async function lookupUserPhone(pgClient, userId) {
 }
 
 async function finalizeDispatch({ pgClient, dispatch, result }) {
+  let updated;
+
   if (result?.skipped) {
-    return markDispatchFailed({
+    updated = await markDispatchFailed({
       pgClient,
       dispatchId: dispatch.id,
       result,
       status: "skipped",
     });
+  } else if (result?.ok && result?.provider_status === "accepted") {
+    updated = await markDispatchAccepted({
+      pgClient,
+      dispatchId: dispatch.id,
+      result,
+    });
+  } else if (result?.ok) {
+    updated = await markDispatchAccepted({
+      pgClient,
+      dispatchId: dispatch.id,
+      result,
+    });
+  } else {
+    updated = await markDispatchFailed({
+      pgClient,
+      dispatchId: dispatch.id,
+      result,
+    });
   }
-  if (result?.ok && result?.provider_status === "accepted") {
-    return markDispatchAccepted({ pgClient, dispatchId: dispatch.id, result });
-  }
-  if (result?.ok) {
-    return markDispatchAccepted({ pgClient, dispatchId: dispatch.id, result });
-  }
-  return markDispatchFailed({ pgClient, dispatchId: dispatch.id, result });
+
+  console.log("[notifications.center] dispatch finalized", {
+    dispatch_id: dispatch.id,
+    status: updated?.status,
+    provider_status: updated?.provider_status || null,
+    delivery_status: updated?.delivery_status || null,
+    provider_message_id: updated?.provider_message_id || null,
+    result_ok: result?.ok ?? null,
+    result_error: result?.error || null,
+    result_reason: result?.reason || null,
+  });
+
+  return updated;
 }
 
 function buildAdminResult(dispatch, result) {

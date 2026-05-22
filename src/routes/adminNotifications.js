@@ -14,6 +14,8 @@ import { syncBrevoWhatsAppTemplates } from "../services/notifications/brevoWhats
 import {
   fetchBrevoWhatsAppEvents,
   syncDispatchDeliveryStatus,
+  runTestWhatsAppDeliveryCheck,
+  maskPhone,
 } from "../services/notifications/brevoWhatsAppEvents.js";
 import { getTestRecipient } from "../services/notifications/brevoWhatsApp.js";
 
@@ -249,9 +251,9 @@ router.get("/brevo-whatsapp-events", async (req, res) => {
     const offset = toInt(req.query?.offset, 0);
     const event = req.query?.event || null;
 
-    console.log("[admin/notifications] brevo whatsapp events:start", {
+    console.log("[admin/notifications] brevo events:start", {
       admin_user_id: req.user?.id || null,
-      contactNumber,
+      contactNumber: contactNumber ? maskPhone(contactNumber) : "TEST_DEFAULT",
       days,
       limit,
       event: event || null,
@@ -265,9 +267,12 @@ router.get("/brevo-whatsapp-events", async (req, res) => {
       event,
     });
 
-    console.log("[admin/notifications] brevo whatsapp events:done", {
+    console.log("[admin/notifications] brevo events:done", {
       ok: result.ok,
       count: result.events?.length || 0,
+      statusCode: result.statusCode || null,
+      error: result.error || null,
+      reason: result.reason || null,
     });
 
     if (!result.ok) {
@@ -276,7 +281,8 @@ router.get("/brevo-whatsapp-events", async (req, res) => {
       return res.status(status).json({
         ok: false,
         error: result.error,
-        contactNumber,
+        reason: result.reason || null,
+        contactNumber: result.contactNumber || contactNumber,
         events: [],
         raw: result.raw,
         count: 0,
@@ -289,17 +295,22 @@ router.get("/brevo-whatsapp-events", async (req, res) => {
       events: result.events,
       raw: result.raw,
       count: result.events.length,
+      error: null,
+      reason: null,
     });
   } catch (e) {
-    console.error("[admin/notifications] brevo whatsapp events error:", e?.message || e);
+    console.error("[admin/notifications] brevo events error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id) || id <= 0) {
+    const id = String(req.params.id || "").trim();
+    if (!UUID_RE.test(id)) {
       return res.status(400).json({ ok: false, error: "invalid_dispatch_id" });
     }
 
@@ -318,28 +329,44 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
       console.error("[admin/notifications] sync delivery:error", {
         dispatch_id: id,
         error: result.error,
+        reason: result.reason || null,
       });
       return res.status(502).json({
         ok: false,
         error: result.error,
+        reason: result.reason || null,
         dispatch: result.dispatch || null,
         message: result.message || null,
       });
     }
 
+    const dispatch = result.dispatch;
+    console.log("[admin/notifications] sync delivery:dispatch", {
+      dispatch_id: id,
+      provider_message_id: dispatch?.provider_message_id,
+      current_status: dispatch?.status,
+      current_delivery_status: dispatch?.delivery_status || null,
+      recipient_masked: maskPhone(dispatch?.recipient),
+    });
+
     console.log("[admin/notifications] sync delivery:done", {
       dispatch_id: id,
-      provider_message_id: result.dispatch?.provider_message_id,
-      matched: Boolean(result.matched_event),
-      status_updated_to: result.status_updated_to ?? result.dispatch?.status,
+      matched: Boolean(result.matched),
+      events_checked: result.events_checked,
+      status_updated_to: result.status_updated_to || null,
+      matched_event: result.matched_event?.event || null,
+      matched_reason: result.matched_event?.reason || null,
     });
 
     return res.json({
       ok: true,
+      matched: result.matched,
       dispatch: result.dispatch,
       matched_event: result.matched_event,
       events_checked: result.events_checked,
+      events: result.events,
       status_updated_to: result.status_updated_to,
+      delivery_status_updated_to: result.delivery_status_updated_to,
       message: result.message,
     });
   } catch (e) {
@@ -381,6 +408,8 @@ router.post("/test-whatsapp", async (req, res) => {
       ok: out?.ok,
       dispatch_id: out?.dispatch?.id,
       dispatch_status: out?.dispatch?.status,
+      provider_status: out?.dispatch?.provider_status || null,
+      delivery_status: out?.dispatch?.delivery_status || null,
       result_ok: out?.result?.ok,
       statusCode: out?.result?.statusCode,
       messageId: out?.result?.messageId,
@@ -389,6 +418,42 @@ router.post("/test-whatsapp", async (req, res) => {
       error: out?.result?.error || null,
     });
 
+    let delivery_check = null;
+    if (
+      out?.ok &&
+      out?.result?.provider_status === "accepted" &&
+      out?.dispatch?.id &&
+      out?.result?.messageId
+    ) {
+      console.log("[admin/notifications] test-whatsapp:delivery-check:start", {
+        dispatch_id: out.dispatch.id,
+        messageId: out.result.messageId,
+      });
+
+      delivery_check = await runTestWhatsAppDeliveryCheck({
+        dispatchId: out.dispatch.id,
+        messageId: out.result.messageId,
+        contactNumber: getTestRecipient(),
+      });
+
+      const refreshed = await query(
+        `SELECT * FROM public.notification_dispatches WHERE id = $1::uuid LIMIT 1`,
+        [out.dispatch.id]
+      );
+      if (refreshed.rows[0]) {
+        out.dispatch = refreshed.rows[0];
+      }
+
+      console.log("[admin/notifications] test-whatsapp:delivery-check:done", {
+        dispatch_id: out.dispatch.id,
+        messageId: out.result.messageId,
+        events_checked: delivery_check.events_checked ?? 0,
+        matched: Boolean(delivery_check.matched),
+        matched_event: delivery_check.matched_event?.event || null,
+        matched_reason: delivery_check.matched_event?.reason || null,
+      });
+    }
+
     const warning = getTestModeWarning();
     return res.json(
       attachBrevoHint(
@@ -396,7 +461,9 @@ router.post("/test-whatsapp", async (req, res) => {
           ok: out.ok,
           dispatch: out.dispatch,
           result: out.result,
+          ...(delivery_check && { delivery_check }),
           ...(warning && { warning }),
+          ...(out.delivery_note && { delivery_note: out.delivery_note }),
           ...(out.brevo_message && { brevo_message: out.brevo_message }),
         },
         out.dispatch
