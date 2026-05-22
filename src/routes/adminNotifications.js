@@ -99,8 +99,6 @@ router.get("/dispatches", async (req, res) => {
 
     console.log("[admin/notifications] list dispatches:done", {
       count: rows.length,
-      limit,
-      offset,
     });
 
     if (rows.length === 0) {
@@ -141,8 +139,6 @@ router.get("/inbound", async (req, res) => {
 
     console.log("[admin/notifications] list inbound:done", {
       count: rows.length,
-      limit,
-      offset,
     });
 
     return res.json({
