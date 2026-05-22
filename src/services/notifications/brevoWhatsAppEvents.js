@@ -62,6 +62,23 @@ export function extractBrevoEvents(raw) {
   return [];
 }
 
+export function classifyBrevoReason(reason) {
+  const text = String(reason || "");
+  if (text.includes("131049")) {
+    return {
+      code: "131049",
+      type: "healthy_ecosystem_engagement",
+      description:
+        "WhatsApp/Meta did not deliver the message to maintain healthy ecosystem engagement.",
+    };
+  }
+  return {
+    code: null,
+    type: null,
+    description: null,
+  };
+}
+
 export function normalizeBrevoEvent(e) {
   const event = e?.event || e?.type || e?.status || e?.eventType || null;
   let messageId = e?.messageId || e?.message_id || e?.id || null;
@@ -77,6 +94,9 @@ export function normalizeBrevoEvent(e) {
     e?.contact_number_to ||
     null;
 
+  const reason = e?.reason || e?.error || e?.message || e?.description || null;
+  const classification = classifyBrevoReason(reason);
+
   return {
     event: event != null ? String(event) : null,
     messageId: messageId != null ? String(messageId) : null,
@@ -88,7 +108,12 @@ export function normalizeBrevoEvent(e) {
       e?.timestamp ||
       e?.eventDate ||
       null,
-    reason: e?.reason || e?.error || e?.message || e?.description || null,
+    reason: reason != null ? String(reason) : null,
+    errorCode: classification.code,
+    errorType: classification.type,
+    errorDescription: classification.description,
+    delivery_error_code: classification.code,
+    delivery_error_type: classification.type,
     raw: e,
   };
 }
@@ -97,11 +122,61 @@ export function mapBrevoEventToDeliveryStatus(eventName) {
   const e = String(eventName || "").toLowerCase();
   if (e === "delivered" || e === "delivery") return "delivered";
   if (e === "read") return "read";
-  if (e === "failed" || e === "failure" || e === "undelivered") return "failed";
-  if (e === "rejected" || e === "reject" || e === "blocked") return "rejected";
-  if (e === "error") return "failed";
   if (e === "sent") return "sent_to_provider";
+  if (e === "failed" || e === "failure" || e === "undelivered") return "failed";
+  if (e === "rejected" || e === "reject") return "rejected";
+  if (e === "error") return "failed";
+  if (e === "blocked") return "rejected";
   return "unknown";
+}
+
+function isProviderFailureEvent(matchedEvent) {
+  const deliveryStatus = mapBrevoEventToDeliveryStatus(matchedEvent?.event);
+  return deliveryStatus === "failed" || deliveryStatus === "rejected";
+}
+
+function buildDeliveryFailureErrorMessage(matchedEvent) {
+  if (!matchedEvent) return "whatsapp_delivery_failed";
+  if (matchedEvent.reason) return String(matchedEvent.reason);
+  if (matchedEvent.errorDescription) return String(matchedEvent.errorDescription);
+  return "whatsapp_delivery_failed";
+}
+
+function logProviderDeliveryError(matchedEvent, context = {}) {
+  const eventLower = String(matchedEvent?.event || "").toLowerCase();
+  if (eventLower !== "error" && matchedEvent?.errorCode !== "131049") return;
+
+  console.warn("[brevo.whatsapp.events] provider-error", {
+    ...context,
+    event: matchedEvent?.event || null,
+    errorCode: matchedEvent?.errorCode || null,
+    errorType: matchedEvent?.errorType || null,
+    reason: matchedEvent?.reason || null,
+    messageId: matchedEvent?.messageId || null,
+  });
+
+  if (matchedEvent?.errorCode === "131049") {
+    console.warn("[brevo.whatsapp.events] meta-error-131049", {
+      ...context,
+      code: "131049",
+      type: "healthy_ecosystem_engagement",
+      reason: matchedEvent?.reason || null,
+      messageId: matchedEvent?.messageId || null,
+    });
+  }
+}
+
+function mapRecentErrorEvents(events) {
+  return (events || [])
+    .filter((ev) => String(ev.event || "").toLowerCase() === "error")
+    .slice(0, 5)
+    .map((ev) => ({
+      messageId: ev.messageId,
+      date: ev.date,
+      reason: ev.reason,
+      errorCode: ev.errorCode,
+      errorType: ev.errorType,
+    }));
 }
 
 export function findEventForMessageId(events, messageId) {
@@ -230,7 +305,9 @@ export async function fetchBrevoWhatsAppEvents({
         messageId: ev.messageId,
         date: ev.date,
         reason: ev.reason || null,
+        errorCode: ev.errorCode || null,
       })),
+      error_131049_count: events.filter((ev) => ev.errorCode === "131049").length,
     });
 
     return {
@@ -348,9 +425,13 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7, pgClien
   }
 
   const deliveryStatus = mapBrevoEventToDeliveryStatus(matched.event);
-  const failureStatuses = new Set(["failed", "rejected"]);
-  const errorMessage = failureStatuses.has(deliveryStatus)
-    ? matched.reason || matched.event
+  logProviderDeliveryError(matched, {
+    dispatch_id: dispatchId,
+    provider_message_id: dispatch.provider_message_id,
+  });
+
+  const errorMessage = isProviderFailureEvent(matched)
+    ? buildDeliveryFailureErrorMessage(matched)
     : null;
 
   const updated = await updateDispatchDeliveryStatus({
@@ -362,6 +443,11 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7, pgClien
     errorMessage,
   });
 
+  const userMessage =
+    matched.errorCode === "131049"
+      ? "Envio aceito pela Brevo, mas o WhatsApp/Meta bloqueou a entrega. Código 131049: healthy ecosystem engagement."
+      : `Evento encontrado: ${matched.event} → delivery_status=${deliveryStatus}`;
+
   return {
     ok: true,
     matched: true,
@@ -371,7 +457,7 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7, pgClien
     events,
     status_updated_to: updated?.status,
     delivery_status_updated_to: updated?.delivery_status,
-    message: `Evento encontrado: ${matched.event} → delivery_status=${deliveryStatus}`,
+    message: userMessage,
   };
 }
 
@@ -415,41 +501,72 @@ export async function runTestWhatsAppDeliveryCheck({
   };
 
   if (!matched) {
+    const recent_errors = mapRecentErrorEvents(events);
+
+    if (recent_errors.length > 0) {
+      console.warn("[admin/notifications] test-whatsapp:delivery-check:recent-errors", {
+        dispatch_id: dispatchId,
+        messageId,
+        recent_errors_count: recent_errors.length,
+        first_error_code: recent_errors[0]?.errorCode || null,
+        first_error_reason: recent_errors[0]?.reason || null,
+      });
+    }
+
     await recordDeliveryCheckNoMatch({
       pgClient,
       dispatchId,
-      rawEvents: rawPayload,
+      rawEvents: {
+        ...rawPayload,
+        recent_errors,
+      },
       eventsChecked: events.length,
     });
+
+    const has131049 = recent_errors.some((e) => e.errorCode === "131049");
+    const message = has131049
+      ? "Envio aceito pela Brevo, mas o WhatsApp/Meta bloqueou a entrega. Código 131049: healthy ecosystem engagement. Nenhum evento vinculado a este messageId ainda."
+      : "Brevo accepted the message, but no delivery event for this messageId was found yet. Recent errors exist for this contact.";
+
     return {
       checked: true,
       matched: false,
       events_checked: events.length,
       matched_event: null,
-      message:
-        "Brevo aceitou o envio, mas ainda não há evento de entrega para este messageId.",
+      recent_errors,
+      message,
     };
   }
 
   const deliveryStatus = mapBrevoEventToDeliveryStatus(matched.event);
-  const failureStatuses = new Set(["failed", "rejected"]);
-  await updateDispatchDeliveryStatus({
+  logProviderDeliveryError(matched, {
+    dispatch_id: dispatchId,
+    messageId,
+  });
+
+  const updated = await updateDispatchDeliveryStatus({
     pgClient,
     dispatchId,
     deliveryStatus,
     matchedEvent: matched,
     rawEvents: rawPayload,
-    errorMessage: failureStatuses.has(deliveryStatus)
-      ? matched.reason || matched.event
+    errorMessage: isProviderFailureEvent(matched)
+      ? buildDeliveryFailureErrorMessage(matched)
       : null,
   });
+
+  const message =
+    matched.errorCode === "131049"
+      ? "Envio aceito pela Brevo, mas o WhatsApp/Meta bloqueou a entrega. Código 131049: healthy ecosystem engagement."
+      : `Evento encontrado na Brevo: ${matched.event}`;
 
   return {
     checked: true,
     matched: true,
     events_checked: events.length,
     matched_event: matched,
-    delivery_status: deliveryStatus,
-    message: `Evento encontrado na Brevo: ${matched.event}`,
+    delivery_status: updated?.delivery_status || deliveryStatus,
+    dispatch_status: updated?.status,
+    message,
   };
 }

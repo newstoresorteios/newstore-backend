@@ -399,6 +399,20 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
       recipient_masked: maskPhone(dispatch?.recipient),
     });
 
+    if (result.matched && result.matched_event) {
+      const ev = result.matched_event;
+      if (String(ev.event || "").toLowerCase() === "error" || ev.errorCode === "131049") {
+        console.warn("[admin/notifications] sync delivery:provider-error", {
+          dispatch_id: id,
+          provider_message_id: dispatch?.provider_message_id,
+          event: ev.event,
+          errorCode: ev.errorCode || null,
+          errorType: ev.errorType || null,
+          reason: ev.reason || null,
+        });
+      }
+    }
+
     console.log("[admin/notifications] sync delivery:done", {
       dispatch_id: id,
       matched: Boolean(result.matched),
@@ -406,6 +420,7 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
       status_updated_to: result.status_updated_to || null,
       matched_event: result.matched_event?.event || null,
       matched_reason: result.matched_event?.reason || null,
+      matched_error_code: result.matched_event?.errorCode || null,
     });
 
     return res.json({
@@ -495,6 +510,32 @@ router.post("/test-whatsapp", async (req, res) => {
           out.dispatch = refreshed.rows[0];
         }
 
+        if (
+          delivery_check?.matched_event &&
+          (String(delivery_check.matched_event.event || "").toLowerCase() ===
+            "error" ||
+            delivery_check.matched_event.errorCode === "131049")
+        ) {
+          console.warn("[admin/notifications] test-whatsapp:delivery-check:provider-error", {
+            dispatch_id: out.dispatch.id,
+            messageId: out.result.messageId,
+            event: delivery_check.matched_event.event,
+            errorCode: delivery_check.matched_event.errorCode || null,
+            errorType: delivery_check.matched_event.errorType || null,
+            reason: delivery_check.matched_event.reason || null,
+          });
+        }
+
+        if (delivery_check?.recent_errors?.length) {
+          console.warn("[admin/notifications] test-whatsapp:delivery-check:recent-errors", {
+            dispatch_id: out.dispatch.id,
+            messageId: out.result.messageId,
+            recent_errors_count: delivery_check.recent_errors.length,
+            first_error_code: delivery_check.recent_errors[0]?.errorCode || null,
+            first_error_reason: delivery_check.recent_errors[0]?.reason || null,
+          });
+        }
+
         console.log("[admin/notifications] test-whatsapp:delivery-check:done", {
           dispatch_id: out.dispatch.id,
           messageId: out.result.messageId,
@@ -502,6 +543,7 @@ router.post("/test-whatsapp", async (req, res) => {
           matched: Boolean(delivery_check?.matched),
           matched_event: delivery_check?.matched_event?.event || null,
           matched_reason: delivery_check?.matched_event?.reason || null,
+          matched_error_code: delivery_check?.matched_event?.errorCode || null,
           error: delivery_check?.error || null,
           reason: delivery_check?.reason || null,
         });

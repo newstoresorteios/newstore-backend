@@ -272,6 +272,15 @@ export async function updateDispatchDeliveryStatus({
   const eventAt = parseEventTimestamp(matchedEvent?.date);
   const confirmed =
     deliveryStatus === "delivered" || deliveryStatus === "read";
+  const isFailure =
+    deliveryStatus === "failed" || deliveryStatus === "rejected";
+
+  const finalErrorMessage = isFailure
+    ? errorMessage ||
+      matchedEvent?.reason ||
+      matchedEvent?.errorDescription ||
+      "whatsapp_delivery_failed"
+    : null;
 
   const r = await runQuery(
     pgClient,
@@ -286,7 +295,7 @@ export async function updateDispatchDeliveryStatus({
               ELSE delivery_confirmed_at
             END,
             status = COALESCE($7, status),
-            error_message = COALESCE($8, error_message)
+            error_message = $8
       WHERE id = $1
       RETURNING *`,
     [
@@ -297,7 +306,7 @@ export async function updateDispatchDeliveryStatus({
       eventAt,
       confirmed,
       newStatus,
-      errorMessage,
+      finalErrorMessage,
     ]
   );
   return r.rows[0];
