@@ -14,10 +14,13 @@ import {
   createDispatch,
   createCampaign,
   updateCampaignAudienceCounts,
-  markDispatchSent,
+  markDispatchAccepted,
   markDispatchFailed,
   extractDispatchErrorMessage,
 } from "./notificationLog.js";
+
+export const DELIVERY_NOTE_ACCEPTED =
+  "accepted_by_brevo_not_delivery_confirmed";
 
 const CAMPAIGN_AUDIENCE_FILTERS = new Set([
   "all_users",
@@ -130,8 +133,19 @@ async function lookupUserPhone(pgClient, userId) {
 }
 
 async function finalizeDispatch({ pgClient, dispatch, result }) {
-  if (result.ok && !result.skipped) {
-    return markDispatchSent({ pgClient, dispatchId: dispatch.id, result });
+  if (result?.skipped) {
+    return markDispatchFailed({
+      pgClient,
+      dispatchId: dispatch.id,
+      result,
+      status: "skipped",
+    });
+  }
+  if (result?.ok && result?.provider_status === "accepted") {
+    return markDispatchAccepted({ pgClient, dispatchId: dispatch.id, result });
+  }
+  if (result?.ok) {
+    return markDispatchAccepted({ pgClient, dispatchId: dispatch.id, result });
   }
   return markDispatchFailed({ pgClient, dispatchId: dispatch.id, result });
 }
@@ -145,6 +159,10 @@ function buildAdminResult(dispatch, result) {
     dispatch,
     result,
     warning: getTestModeWarning(),
+    ...(result?.ok &&
+      result?.provider_status === "accepted" && {
+        delivery_note: DELIVERY_NOTE_ACCEPTED,
+      }),
     ...(brevoIpBlocked && { brevo_message: BREVO_IP_BLOCKED_MESSAGE }),
   };
 }

@@ -194,25 +194,34 @@ export async function createDispatch({
   return r.rows[0];
 }
 
-export async function markDispatchSent({ pgClient, dispatchId, result }) {
+export async function markDispatchAccepted({ pgClient, dispatchId, result }) {
+  const status =
+    result?.provider_status === "accepted" ? "accepted" : "sent";
+
   const r = await runQuery(
     pgClient,
     `UPDATE public.notification_dispatches
-        SET status = 'sent',
+        SET status = $2,
             sent_at = NOW(),
             attempts = attempts + 1,
-            provider_message_id = $2,
-            response = $3::jsonb,
+            provider_message_id = $3,
+            response = $4::jsonb,
             error_message = NULL
       WHERE id = $1
       RETURNING *`,
     [
       dispatchId,
+      status,
       result?.messageId ?? null,
       JSON.stringify(result?.response ?? null),
     ]
   );
   return r.rows[0];
+}
+
+/** @deprecated Prefer markDispatchAccepted for Brevo WhatsApp (provider accepted ≠ delivered) */
+export async function markDispatchSent({ pgClient, dispatchId, result }) {
+  return markDispatchAccepted({ pgClient, dispatchId, result });
 }
 
 export async function markDispatchFailed({

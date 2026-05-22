@@ -2,6 +2,8 @@
 import { query } from "../../db.js";
 import { getTestRecipient, normalizePhoneBR } from "./brevoWhatsApp.js";
 
+export { normalizePhoneBR };
+
 function getBaseUrl() {
   return (process.env.BREVO_WHATSAPP_BASE_URL || "https://api.brevo.com/v3").replace(
     /\/+$/,
@@ -49,15 +51,20 @@ function normalizeEventRow(ev) {
 
   const event = pickFirst(ev, ["event", "type", "status"]);
 
+  const contactRaw = pickFirst(ev, [
+    "contactNumber",
+    "contact_number",
+    "recipient",
+    "to",
+    "phone",
+  ]);
+
   return {
     event: event != null ? String(event) : null,
     messageId: messageId != null ? String(messageId) : null,
-    contactNumber:
-      digitsOnly(
-        pickFirst(ev, ["contactNumber", "contact_number", "phone", "to"])
-      ) || null,
+    contactNumber: digitsOnly(contactRaw) || null,
     date: pickFirst(ev, ["date", "createdAt", "created_at", "timestamp"]) || null,
-    reason: pickFirst(ev, ["reason", "error", "description"]) || null,
+    reason: pickFirst(ev, ["reason", "error", "message"]) || null,
     raw: ev,
   };
 }
@@ -84,6 +91,7 @@ export async function fetchBrevoWhatsAppEvents({
       ok: false,
       error: "missing_brevo_api_key",
       statusCode: null,
+      contactNumber: null,
       events: [],
       raw: null,
     };
@@ -95,6 +103,7 @@ export async function fetchBrevoWhatsAppEvents({
       ok: false,
       error: "missing_contact_number",
       statusCode: null,
+      contactNumber: null,
       events: [],
       raw: null,
     };
@@ -147,10 +156,16 @@ export async function fetchBrevoWhatsAppEvents({
     const statusCode = res.status;
 
     if (!res.ok) {
+      const error = mapBrevoApiError(body, statusCode);
+      console.warn("[brevo.whatsapp.events] fetch:failed", {
+        statusCode,
+        error,
+      });
       return {
         ok: false,
-        error: mapBrevoApiError(body, statusCode),
+        error,
         statusCode,
+        contactNumber: contact,
         events: [],
         raw: body,
       };
@@ -167,15 +182,22 @@ export async function fetchBrevoWhatsAppEvents({
     return {
       ok: true,
       statusCode,
+      contactNumber: contact,
       events,
       raw: body,
     };
   } catch (err) {
     clearTimeout(timer);
+    const error = err?.message || "brevo_fetch_failed";
+    console.warn("[brevo.whatsapp.events] fetch:failed", {
+      statusCode: null,
+      error,
+    });
     return {
       ok: false,
-      error: err?.message || "brevo_fetch_failed",
+      error,
       statusCode: null,
+      contactNumber: contact,
       events: [],
       raw: null,
     };
@@ -188,7 +210,8 @@ function mapEventToDispatchStatus(eventName) {
   if (e === "read") return "read";
   if (e === "failed" || e === "failure" || e === "undelivered") return "failed";
   if (e === "rejected" || e === "reject") return "rejected";
-  if (e === "accepted" || e === "sent") return "accepted";
+  if (e === "blocked") return "blocked";
+  if (e === "error") return "error";
   return null;
 }
 
@@ -214,6 +237,28 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7 } = {}) 
   const dispatch = d.rows[0];
   if (!dispatch) {
     return { ok: false, error: "not_found" };
+  }
+
+  if (dispatch.channel !== "whatsapp" || dispatch.provider !== "brevo") {
+    return {
+      ok: false,
+      error: "invalid_dispatch_provider",
+      dispatch,
+      matched_event: null,
+      events_checked: 0,
+      message: "Dispatch não é WhatsApp/Brevo.",
+    };
+  }
+
+  if (!dispatch.provider_message_id) {
+    return {
+      ok: false,
+      error: "missing_provider_message_id",
+      dispatch,
+      matched_event: null,
+      events_checked: 0,
+      message: "Dispatch sem provider_message_id.",
+    };
   }
 
   const contactNumber =
@@ -244,11 +289,11 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7 } = {}) 
       ? dispatch.response
       : {};
 
-  const syncMeta = {
-    synced_at: new Date().toISOString(),
-    matched_event: matched,
-    events_checked_count: events.length,
-    brevo_status_code: eventsResult.statusCode,
+  const responsePayload = {
+    previous_response: prevResponse,
+    delivery_event: matched,
+    delivery_checked_at: new Date().toISOString(),
+    events_checked: events.length,
   };
 
   if (!matched) {
@@ -257,70 +302,66 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7 } = {}) 
           SET response = $2::jsonb
         WHERE id = $1
         RETURNING *`,
-      [
-        dispatchId,
-        JSON.stringify({
-          ...prevResponse,
-          brevo_delivery_sync: syncMeta,
-        }),
-      ]
+      [dispatchId, JSON.stringify(responsePayload)]
     );
     return {
       ok: true,
       dispatch: updated.rows[0],
       matched_event: null,
       events_checked: events.length,
+      status_updated_to: dispatch.status,
       message: "Nenhum evento correspondente encontrado na Brevo.",
     };
   }
 
   const newStatus = mapEventToDispatchStatus(matched.event);
-  const errorMessage =
-    newStatus === "failed" || newStatus === "rejected"
-      ? matched.reason || matched.event
-      : null;
+  const failureStatuses = new Set(["failed", "rejected", "blocked", "error"]);
+  const errorMessage = failureStatuses.has(newStatus)
+    ? matched.reason || matched.event
+    : null;
 
-  let updated;
+  let statusUpdatedTo = dispatch.status;
+
   if (newStatus) {
-    updated = await query(
+    statusUpdatedTo = newStatus;
+    const updated = await query(
       `UPDATE public.notification_dispatches
           SET status = $2,
               response = $3::jsonb,
-              error_message = COALESCE($4, error_message)
+              error_message = $4
         WHERE id = $1
         RETURNING *`,
       [
         dispatchId,
         newStatus,
-        JSON.stringify({
-          ...prevResponse,
-          brevo_delivery_sync: syncMeta,
-          brevo_matched_event: matched,
-        }),
+        JSON.stringify(responsePayload),
         errorMessage,
       ]
     );
-  } else {
-    updated = await query(
-      `UPDATE public.notification_dispatches
-          SET response = $2::jsonb
-        WHERE id = $1
-        RETURNING *`,
-      [
-        dispatchId,
-        JSON.stringify({
-          ...prevResponse,
-          brevo_delivery_sync: syncMeta,
-          brevo_matched_event: matched,
-        }),
-      ]
-    );
+    return {
+      ok: true,
+      dispatch: updated.rows[0],
+      matched_event: matched,
+      events_checked: events.length,
+      status_updated_to: statusUpdatedTo,
+      message: `Status atualizado para ${statusUpdatedTo}.`,
+    };
   }
+
+  const updated = await query(
+    `UPDATE public.notification_dispatches
+        SET response = $2::jsonb
+      WHERE id = $1
+      RETURNING *`,
+    [dispatchId, JSON.stringify(responsePayload)]
+  );
 
   return {
     ok: true,
     dispatch: updated.rows[0],
     matched_event: matched,
     events_checked: events.length,
+    status_updated_to: statusUpdatedTo,
+    message: "Evento encontrado, mas status não alterado.",
   };
 }

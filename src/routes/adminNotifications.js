@@ -285,7 +285,7 @@ router.get("/brevo-whatsapp-events", async (req, res) => {
 
     return res.json({
       ok: true,
-      contactNumber: contactNumber || getTestRecipient(),
+      contactNumber: result.contactNumber || contactNumber || getTestRecipient(),
       events: result.events,
       raw: result.raw,
       count: result.events.length,
@@ -303,6 +303,10 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
       return res.status(400).json({ ok: false, error: "invalid_dispatch_id" });
     }
 
+    console.log("[admin/notifications] sync delivery:start", {
+      dispatch_id: id,
+    });
+
     const days = toInt(req.body?.days ?? req.query?.days, 7) || 7;
     const result = await syncDispatchDeliveryStatus(id, { days });
 
@@ -311,18 +315,23 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
     }
 
     if (!result.ok) {
+      console.error("[admin/notifications] sync delivery:error", {
+        dispatch_id: id,
+        error: result.error,
+      });
       return res.status(502).json({
         ok: false,
         error: result.error,
         dispatch: result.dispatch || null,
+        message: result.message || null,
       });
     }
 
-    console.log("[admin/notifications] dispatch sync delivery", {
+    console.log("[admin/notifications] sync delivery:done", {
       dispatch_id: id,
       provider_message_id: result.dispatch?.provider_message_id,
       matched: Boolean(result.matched_event),
-      matched_event: result.matched_event?.event || null,
+      status_updated_to: result.status_updated_to ?? result.dispatch?.status,
     });
 
     return res.json({
@@ -330,10 +339,13 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
       dispatch: result.dispatch,
       matched_event: result.matched_event,
       events_checked: result.events_checked,
-      ...(result.message && { message: result.message }),
+      status_updated_to: result.status_updated_to,
+      message: result.message,
     });
   } catch (e) {
-    console.error("[admin/notifications] dispatch sync delivery error:", e?.message || e);
+    console.error("[admin/notifications] sync delivery:error", {
+      error: e?.message,
+    });
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
