@@ -195,25 +195,107 @@ export async function createDispatch({
 }
 
 export async function markDispatchAccepted({ pgClient, dispatchId, result }) {
-  const status =
-    result?.provider_status === "accepted" ? "accepted" : "sent";
-
   const r = await runQuery(
     pgClient,
     `UPDATE public.notification_dispatches
-        SET status = $2,
+        SET status = 'accepted',
+            provider_status = 'accepted',
+            delivery_status = COALESCE($4, 'unknown'),
             sent_at = NOW(),
             attempts = attempts + 1,
-            provider_message_id = $3,
-            response = $4::jsonb,
+            provider_message_id = $2,
+            response = $3::jsonb,
             error_message = NULL
       WHERE id = $1
       RETURNING *`,
     [
       dispatchId,
-      status,
       result?.messageId ?? null,
       JSON.stringify(result?.response ?? null),
+      result?.delivery_status || "unknown",
+    ]
+  );
+  return r.rows[0];
+}
+
+function parseEventTimestamp(dateValue) {
+  if (!dateValue) return null;
+  const d = new Date(dateValue);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function dispatchStatusFromDelivery(deliveryStatus) {
+  if (deliveryStatus === "read") return "read";
+  if (deliveryStatus === "delivered") return "delivered";
+  if (deliveryStatus === "failed") return "failed";
+  if (deliveryStatus === "rejected") return "rejected";
+  return null;
+}
+
+export async function recordDeliveryCheckNoMatch({
+  pgClient,
+  dispatchId,
+  rawEvents,
+  eventsChecked = 0,
+}) {
+  const r = await runQuery(
+    pgClient,
+    `UPDATE public.notification_dispatches
+        SET delivery_checked_at = NOW(),
+            delivery_events_raw = $2::jsonb
+      WHERE id = $1
+      RETURNING *`,
+    [
+      dispatchId,
+      JSON.stringify({
+        events_checked: eventsChecked,
+        raw: rawEvents ?? null,
+        matched: false,
+        checked_at: new Date().toISOString(),
+      }),
+    ]
+  );
+  return r.rows[0];
+}
+
+export async function updateDispatchDeliveryStatus({
+  pgClient,
+  dispatchId,
+  deliveryStatus,
+  matchedEvent,
+  rawEvents,
+  errorMessage = null,
+}) {
+  const newStatus = dispatchStatusFromDelivery(deliveryStatus);
+  const eventAt = parseEventTimestamp(matchedEvent?.date);
+  const confirmed =
+    deliveryStatus === "delivered" || deliveryStatus === "read";
+
+  const r = await runQuery(
+    pgClient,
+    `UPDATE public.notification_dispatches
+        SET delivery_status = $2,
+            delivery_event = $3::jsonb,
+            delivery_events_raw = $4::jsonb,
+            delivery_checked_at = NOW(),
+            last_provider_event_at = COALESCE($5::timestamptz, last_provider_event_at),
+            delivery_confirmed_at = CASE
+              WHEN $6 THEN NOW()
+              ELSE delivery_confirmed_at
+            END,
+            status = COALESCE($7, status),
+            error_message = COALESCE($8, error_message)
+      WHERE id = $1
+      RETURNING *`,
+    [
+      dispatchId,
+      deliveryStatus,
+      JSON.stringify(matchedEvent ?? null),
+      JSON.stringify(rawEvents ?? null),
+      eventAt,
+      confirmed,
+      newStatus,
+      errorMessage,
     ]
   );
   return r.rows[0];

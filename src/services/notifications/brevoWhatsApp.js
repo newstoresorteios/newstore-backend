@@ -208,12 +208,19 @@ export async function sendBrevoWhatsAppTemplate({
     const statusCode = res.status;
 
     if (statusCode === 200 || statusCode === 201 || statusCode === 202) {
+      const messageId = body?.messageId || body?.id || null;
       console.log("[brevo.whatsapp] send:accepted", {
         statusCode,
-        messageId: body?.messageId || body?.id || null,
-        recipient_forced: resolved.recipient_forced,
+        messageId,
         templateId: Number(templateId),
         templateKey: templateKey || null,
+        recipient_forced: resolved.recipient_forced,
+        provider_status: "accepted",
+        delivery_status: "unknown",
+        error: null,
+        reason: null,
+        response_keys:
+          body && typeof body === "object" ? Object.keys(body) : [],
       });
       return {
         ok: true,
@@ -221,22 +228,28 @@ export async function sendBrevoWhatsAppTemplate({
         provider: "brevo",
         channel: "whatsapp",
         statusCode,
-        messageId: body.messageId || body.id || null,
+        messageId,
         provider_status: "accepted",
+        delivery_status: "unknown",
         delivery_confirmed: false,
         response: body,
         recipient,
         recipient_original,
         recipient_forced,
+        error: null,
+        reason: null,
       };
     }
 
+    const httpError = body?.message || body?.code || "brevo_request_failed";
     console.warn("[brevo.whatsapp] send:failed", {
       statusCode,
       templateId: Number(templateId),
       templateKey: templateKey || null,
       recipient_forced: resolved.recipient_forced,
-      error: body?.message || body?.code || "brevo_request_failed",
+      error: httpError,
+      reason: body?.reason || null,
+      response: body,
     });
 
     return {
@@ -245,7 +258,8 @@ export async function sendBrevoWhatsAppTemplate({
       provider: "brevo",
       channel: "whatsapp",
       statusCode,
-      error: body.message || body.code || "brevo_request_failed",
+      error: httpError,
+      reason: body?.reason || null,
       response: body,
       recipient,
       recipient_original,
@@ -257,7 +271,8 @@ export async function sendBrevoWhatsAppTemplate({
       templateId: Number(templateId),
       templateKey: templateKey || null,
       recipient_forced: resolved.recipient_forced,
-      error: error?.message,
+      error: error?.message || null,
+      reason: null,
     });
     return {
       ok: false,
@@ -265,6 +280,7 @@ export async function sendBrevoWhatsAppTemplate({
       provider: "brevo",
       channel: "whatsapp",
       error: error?.message || "brevo_request_failed",
+      reason: null,
       response: null,
       recipient,
       recipient_original,
