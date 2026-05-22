@@ -83,7 +83,9 @@ export async function resolveTemplateId({
   }
 
   if (templateKey === "GENERIC_TEST") {
-    const id = process.env.BREVO_WHATSAPP_GENERIC_TEST_TEMPLATE_ID;
+    const id =
+      process.env.BREVO_WHATSAPP_GENERIC_TEST_TEMPLATE_ID ||
+      process.env.BREVO_WHATSAPP_TEMPLATE_ID;
     return id ? String(id).trim() : null;
   }
   if (templateKey === "CAPTIVE_AUTHORIZATION_REQUESTED") {
@@ -97,7 +99,7 @@ export async function resolveTemplateId({
 async function lookupUserPhone(pgClient, userId) {
   const r = await runQuery(
     pgClient,
-    `SELECT id, phone, celular
+    `SELECT id, phone
        FROM public.users
       WHERE id = $1
       LIMIT 1`,
@@ -105,7 +107,7 @@ async function lookupUserPhone(pgClient, userId) {
   );
   const row = r.rows[0];
   if (!row) return null;
-  return row.phone || row.celular || null;
+  return row.phone || null;
 }
 
 async function finalizeDispatch({ pgClient, dispatch, result }) {
@@ -232,8 +234,7 @@ export async function estimateAudience({ pgClient, filter, userId = null, phone 
         `SELECT COUNT(*)::int AS c
            FROM public.users
           WHERE NULLIF(TRIM(email), '') IS NOT NULL
-             OR NULLIF(TRIM(phone), '') IS NOT NULL
-             OR NULLIF(TRIM(celular), '') IS NOT NULL`
+             OR NULLIF(TRIM(phone), '') IS NOT NULL`
       );
       estimated_count = Number(r.rows[0]?.c || 0);
       message = "Usuários com e-mail ou telefone cadastrado";
