@@ -10,6 +10,7 @@ import {
   getTestModeWarning,
   BREVO_IP_BLOCKED_MESSAGE,
 } from "../services/notifications/notificationCenter.js";
+import { syncBrevoWhatsAppTemplates } from "../services/notifications/brevoWhatsAppTemplates.js";
 
 const router = express.Router();
 
@@ -165,7 +166,7 @@ router.get("/templates", async (_req, res) => {
     const r = await query(
       `SELECT *
          FROM public.notification_templates
-        ORDER BY template_key, channel, provider`
+        ORDER BY channel, provider, template_key`
     );
 
     const rows = asRows(r.rows);
@@ -189,6 +190,48 @@ router.get("/templates", async (_req, res) => {
     });
   } catch (e) {
     console.error("[admin/notifications] templates error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+router.post("/templates/sync-brevo-whatsapp", async (req, res) => {
+  try {
+    console.log("[admin/notifications] sync brevo whatsapp templates:start", {
+      admin_user_id: req.user?.id || null,
+    });
+
+    const result = await syncBrevoWhatsAppTemplates();
+
+    if (!result.ok) {
+      console.error("[admin/notifications] sync brevo whatsapp templates:error", {
+        error: result.error || "sync_failed",
+      });
+      const status =
+        result.error === "missing_brevo_api_key" ? 503 : 502;
+      return res.status(status).json({
+        ok: false,
+        error: result.error,
+        fetched_count: 0,
+        synced_count: 0,
+        templates: [],
+      });
+    }
+
+    console.log("[admin/notifications] sync brevo whatsapp templates:done", {
+      fetched_count: result.fetched_count,
+      synced_count: result.synced_count,
+    });
+
+    return res.json({
+      ok: true,
+      fetched_count: result.fetched_count,
+      synced_count: result.synced_count,
+      templates: result.templates,
+    });
+  } catch (e) {
+    console.error("[admin/notifications] sync brevo whatsapp templates:error", {
+      error: e?.message,
+    });
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
