@@ -12,10 +12,19 @@ import {
 } from "./brevoWhatsApp.js";
 import {
   createDispatch,
+  createCampaign,
+  updateCampaignAudienceCounts,
   markDispatchSent,
   markDispatchFailed,
   extractDispatchErrorMessage,
 } from "./notificationLog.js";
+
+const CAMPAIGN_AUDIENCE_FILTERS = new Set([
+  "all_users",
+  "active_balance",
+  "specific_user",
+  "specific_phone",
+]);
 
 async function runQuery(pgClient, text, params) {
   if (pgClient) return pgClient.query(text, params);
@@ -182,6 +191,27 @@ export async function sendTestWhatsApp({
   const normalizedOriginal =
     normalizePhoneBR(originalRecipient) || originalRecipient;
   const dispatchRecipient = forced ? testRecipient : normalizedOriginal;
+  const testMode = isTestModeActive();
+  const allowRealRecipients = isAllowRealRecipients();
+
+  const messageSnapshot = {
+    template_key: templateKey,
+    provider_template_id: resolvedTemplateId,
+    params,
+    requested_phone: phone || null,
+    requested_user_id: userId || null,
+    admin_user_id: adminUserId || null,
+    test_mode: testMode,
+    allow_real_recipients: allowRealRecipients,
+  };
+
+  const recipientSnapshot = {
+    user_id: userId || null,
+    phone: phone || null,
+    source: userId ? "specific_user" : "specific_phone",
+    test_mode: testMode,
+    recipient_forced_expected: forced,
+  };
 
   const dispatch = await createDispatch({
     pgClient,
@@ -197,10 +227,12 @@ export async function sendTestWhatsApp({
     payload: {
       params,
       admin_user_id: adminUserId || null,
-      test_mode: isTestModeActive(),
+      test_mode: testMode,
       requested_phone: phone || null,
       requested_user_id: userId || null,
     },
+    messageSnapshot,
+    recipientSnapshot,
   });
 
   if (!resolvedTemplateId) {
@@ -336,6 +368,10 @@ export async function manualSendNotification({
     };
   }
 
+  const testMode = isTestModeActive();
+  const allowRealRecipients = isAllowRealRecipients();
+  const forced = shouldForceTestRecipient();
+
   const resolvedTemplateId = await resolveTemplateId({
     pgClient,
     templateKey,
@@ -343,6 +379,91 @@ export async function manualSendNotification({
     provider: "brevo",
     explicitTemplateId: templateId,
   });
+
+  let campaign = null;
+  let estimatedCount = null;
+
+  if (filter && CAMPAIGN_AUDIENCE_FILTERS.has(filter)) {
+    const estimate = await estimateAudience({ pgClient, filter, userId, phone });
+    estimatedCount = estimate.estimated_count;
+
+    const audienceParams = {
+      user_id: userId || null,
+      phone: phone || null,
+    };
+
+    const messageSnapshot = {
+      template_key: templateKey,
+      provider_template_id: resolvedTemplateId,
+      params,
+      filter,
+      requested_phone: phone || null,
+      requested_user_id: userId || null,
+      admin_user_id: adminUserId || null,
+      test_mode: testMode,
+      allow_real_recipients: allowRealRecipients,
+      warning: TEST_MODE_WARNING,
+    };
+
+    const audienceSnapshot = {
+      filter,
+      estimated_count: estimatedCount,
+      user_id: userId || null,
+      phone: phone || null,
+      test_mode: testMode,
+      allow_real_recipients: allowRealRecipients,
+      real_send_blocked: forced,
+    };
+
+    campaign = await createCampaign({
+      pgClient,
+      name: `Manual admin — ${filter}`,
+      channel: "whatsapp",
+      provider: "brevo",
+      templateKey,
+      providerTemplateId: resolvedTemplateId,
+      audienceFilter: filter,
+      audienceParams,
+      status: forced ? "test_mode" : "created",
+      createdBy: adminUserId,
+      payload: {
+        admin_user_id: adminUserId || null,
+        test_mode: testMode,
+        note: TEST_MODE_WARNING,
+      },
+      messageSnapshot,
+      audienceSnapshot,
+      campaignType: "manual_admin",
+      audienceCountExpected: estimatedCount,
+    });
+  }
+
+  const messageSnapshot = {
+    template_key: templateKey,
+    provider_template_id: resolvedTemplateId,
+    params,
+    filter: filter || null,
+    requested_phone: phone || null,
+    requested_user_id: userId || null,
+    admin_user_id: adminUserId || null,
+    test_mode: testMode,
+    allow_real_recipients: allowRealRecipients,
+    warning: TEST_MODE_WARNING,
+    campaign_id: campaign?.id || null,
+  };
+
+  const recipientSnapshot = {
+    user_id: userId || null,
+    phone: phone || null,
+    source: filter || "test_recipient",
+    intended_filter: filter || null,
+    test_mode: testMode,
+    recipient_forced_expected: forced,
+    redirected_to_test: forced,
+    test_recipient: testRecipient,
+    actual_recipient: testRecipient,
+    estimated_audience_count: estimatedCount,
+  };
 
   const dispatch = await createDispatch({
     pgClient,
@@ -357,15 +478,19 @@ export async function manualSendNotification({
     recipientForced: true,
     templateKey,
     providerTemplateId: resolvedTemplateId,
+    campaignId: campaign?.id || null,
     payload: {
       params,
       admin_user_id: adminUserId || null,
-      test_mode: isTestModeActive(),
+      test_mode: testMode,
       filter: filter || null,
       requested_phone: phone || null,
       requested_user_id: userId || null,
       note: TEST_MODE_WARNING,
+      campaign_id: campaign?.id || null,
     },
+    messageSnapshot,
+    recipientSnapshot,
   });
 
   if (!resolvedTemplateId) {
@@ -382,7 +507,20 @@ export async function manualSendNotification({
       dispatchId: dispatch.id,
       result: skipped,
     });
+    if (campaign?.id) {
+      await updateCampaignAudienceCounts(pgClient, campaign.id, {
+        created: 1,
+        skipped: 1,
+      });
+      campaign = await runQuery(
+        pgClient,
+        `SELECT * FROM public.notification_campaigns WHERE id = $1`,
+        [campaign.id]
+      ).then((r) => r.rows[0]);
+    }
     return {
+      ok: false,
+      campaign,
       ...buildAdminResult(updated, skipped),
       message: TEST_MODE_WARNING,
     };
@@ -398,7 +536,24 @@ export async function manualSendNotification({
 
   const updated = await finalizeDispatch({ pgClient, dispatch, result });
 
+  if (campaign?.id) {
+    await updateCampaignAudienceCounts(pgClient, campaign.id, {
+      created: 1,
+      sent: result.ok && !result.skipped ? 1 : 0,
+      failed: !result.ok && !result.skipped ? 1 : 0,
+      skipped: result.skipped ? 1 : 0,
+    });
+    const refreshed = await runQuery(
+      pgClient,
+      `SELECT * FROM public.notification_campaigns WHERE id = $1`,
+      [campaign.id]
+    );
+    campaign = refreshed.rows[0];
+  }
+
   return {
+    ok: !!result?.ok,
+    campaign,
     ...buildAdminResult(updated, result),
     message: TEST_MODE_WARNING,
   };

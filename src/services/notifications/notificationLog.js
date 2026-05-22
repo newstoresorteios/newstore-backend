@@ -23,6 +23,10 @@ function sanitizePayload(payload) {
   return clone;
 }
 
+function toJsonb(value) {
+  return JSON.stringify(sanitizePayload(value) ?? {});
+}
+
 export function extractDispatchErrorMessage(result) {
   const body = result?.response;
   if (
@@ -33,6 +37,82 @@ export function extractDispatchErrorMessage(result) {
     return "brevo_ip_not_authorized";
   }
   return result?.reason || result?.error || "notification_failed";
+}
+
+export async function createCampaign({
+  pgClient,
+  name,
+  channel,
+  provider,
+  templateKey,
+  providerTemplateId = null,
+  audienceFilter = null,
+  audienceParams = {},
+  status = "created",
+  createdBy = null,
+  payload = {},
+  messageSnapshot = {},
+  audienceSnapshot = {},
+  campaignType = "manual_admin",
+  audienceCountExpected = null,
+}) {
+  const r = await runQuery(
+    pgClient,
+    `INSERT INTO public.notification_campaigns (
+        name,
+        channel,
+        provider,
+        template_key,
+        provider_template_id,
+        audience_filter,
+        audience_params,
+        status,
+        created_by,
+        payload,
+        message_snapshot,
+        audience_snapshot,
+        campaign_type,
+        audience_count_expected
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14)
+      RETURNING *`,
+    [
+      name,
+      channel,
+      provider,
+      templateKey,
+      providerTemplateId,
+      audienceFilter,
+      toJsonb(audienceParams),
+      status,
+      createdBy,
+      toJsonb(payload),
+      toJsonb(messageSnapshot),
+      toJsonb(audienceSnapshot),
+      campaignType,
+      audienceCountExpected,
+    ]
+  );
+  return r.rows[0];
+}
+
+export async function updateCampaignAudienceCounts(
+  pgClient,
+  campaignId,
+  { created = 0, sent = 0, failed = 0, skipped = 0 } = {}
+) {
+  const r = await runQuery(
+    pgClient,
+    `UPDATE public.notification_campaigns
+        SET audience_count_created = COALESCE(audience_count_created, 0) + $2,
+            audience_count_sent = COALESCE(audience_count_sent, 0) + $3,
+            audience_count_failed = COALESCE(audience_count_failed, 0) + $4,
+            audience_count_skipped = COALESCE(audience_count_skipped, 0) + $5,
+            updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [campaignId, created, sent, failed, skipped]
+  );
+  return r.rows[0];
 }
 
 export async function createDispatch({
@@ -49,7 +129,28 @@ export async function createDispatch({
   templateKey = null,
   providerTemplateId = null,
   payload = null,
+  campaignId = null,
+  messageSnapshot = {},
+  recipientSnapshot = {},
 }) {
+  const safeMessageSnapshot = sanitizePayload(messageSnapshot) ?? {};
+  const safeRecipientSnapshot = sanitizePayload(recipientSnapshot) ?? {};
+
+  console.log("[notifications.audit] create dispatch", {
+    campaign_id: campaignId || null,
+    event_key: eventKey,
+    template_key: templateKey,
+    user_id: userId || null,
+    draw_id: drawId || null,
+    recipient_forced: recipientForced,
+    has_message_snapshot: Boolean(
+      safeMessageSnapshot && Object.keys(safeMessageSnapshot).length
+    ),
+    has_recipient_snapshot: Boolean(
+      safeRecipientSnapshot && Object.keys(safeRecipientSnapshot).length
+    ),
+  });
+
   const r = await runQuery(
     pgClient,
     `INSERT INTO public.notification_dispatches (
@@ -66,8 +167,11 @@ export async function createDispatch({
         provider_template_id,
         status,
         payload,
-        attempts
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12::jsonb, 0)
+        attempts,
+        campaign_id,
+        message_snapshot,
+        recipient_snapshot
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12::jsonb, 0, $13, $14::jsonb, $15::jsonb)
       RETURNING *`,
     [
       eventId,
@@ -81,7 +185,10 @@ export async function createDispatch({
       recipientForced,
       templateKey,
       providerTemplateId,
-      JSON.stringify(sanitizePayload(payload) ?? {}),
+      toJsonb(payload),
+      campaignId,
+      toJsonb(safeMessageSnapshot),
+      toJsonb(safeRecipientSnapshot),
     ]
   );
   return r.rows[0];

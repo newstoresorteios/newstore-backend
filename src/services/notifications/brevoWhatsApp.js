@@ -222,6 +222,8 @@ export async function sendBrevoWhatsAppTemplate({
         channel: "whatsapp",
         statusCode,
         messageId: body.messageId || body.id || null,
+        provider_status: "accepted",
+        delivery_confirmed: false,
         response: body,
         recipient,
         recipient_original,

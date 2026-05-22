@@ -11,6 +11,11 @@ import {
   BREVO_IP_BLOCKED_MESSAGE,
 } from "../services/notifications/notificationCenter.js";
 import { syncBrevoWhatsAppTemplates } from "../services/notifications/brevoWhatsAppTemplates.js";
+import {
+  fetchBrevoWhatsAppEvents,
+  syncDispatchDeliveryStatus,
+} from "../services/notifications/brevoWhatsAppEvents.js";
+import { getTestRecipient } from "../services/notifications/brevoWhatsApp.js";
 
 const router = express.Router();
 
@@ -192,14 +197,14 @@ router.get("/templates", async (_req, res) => {
 
 router.post("/templates/sync-brevo-whatsapp", async (req, res) => {
   try {
-    console.log("[admin/notifications] sync brevo whatsapp templates:start", {
+    console.log("[admin/notifications] sync brevo templates:start", {
       admin_user_id: req.user?.id || null,
     });
 
     const result = await syncBrevoWhatsAppTemplates();
 
     if (!result.ok) {
-      console.error("[admin/notifications] sync brevo whatsapp templates:error", {
+      console.error("[admin/notifications] sync brevo templates:error", {
         error: result.error || "sync_failed",
       });
       const status =
@@ -213,7 +218,7 @@ router.post("/templates/sync-brevo-whatsapp", async (req, res) => {
       });
     }
 
-    console.log("[admin/notifications] sync brevo whatsapp templates:done", {
+    console.log("[admin/notifications] sync brevo templates:done", {
       fetched_count: result.fetched_count,
       synced_count: result.synced_count,
     });
@@ -225,9 +230,110 @@ router.post("/templates/sync-brevo-whatsapp", async (req, res) => {
       templates: result.templates,
     });
   } catch (e) {
-    console.error("[admin/notifications] sync brevo whatsapp templates:error", {
+    console.error("[admin/notifications] sync brevo templates:error", {
       error: e?.message,
     });
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+router.get("/brevo-whatsapp-events", async (req, res) => {
+  try {
+    const contactNumber =
+      req.query?.contactNumber ||
+      req.query?.contact_number ||
+      getTestRecipient() ||
+      null;
+    const days = toInt(req.query?.days, 1) || 1;
+    const limit = Math.min(toInt(req.query?.limit, 50), 50);
+    const offset = toInt(req.query?.offset, 0);
+    const event = req.query?.event || null;
+
+    console.log("[admin/notifications] brevo whatsapp events:start", {
+      admin_user_id: req.user?.id || null,
+      contactNumber,
+      days,
+      limit,
+      event: event || null,
+    });
+
+    const result = await fetchBrevoWhatsAppEvents({
+      contactNumber,
+      days,
+      limit,
+      offset,
+      event,
+    });
+
+    console.log("[admin/notifications] brevo whatsapp events:done", {
+      ok: result.ok,
+      count: result.events?.length || 0,
+    });
+
+    if (!result.ok) {
+      const status =
+        result.error === "missing_brevo_api_key" ? 503 : 502;
+      return res.status(status).json({
+        ok: false,
+        error: result.error,
+        contactNumber,
+        events: [],
+        raw: result.raw,
+        count: 0,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      contactNumber: contactNumber || getTestRecipient(),
+      events: result.events,
+      raw: result.raw,
+      count: result.events.length,
+    });
+  } catch (e) {
+    console.error("[admin/notifications] brevo whatsapp events error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ ok: false, error: "invalid_dispatch_id" });
+    }
+
+    const days = toInt(req.body?.days ?? req.query?.days, 7) || 7;
+    const result = await syncDispatchDeliveryStatus(id, { days });
+
+    if (!result.ok && result.error === "not_found") {
+      return res.status(404).json({ ok: false, error: "not_found" });
+    }
+
+    if (!result.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: result.error,
+        dispatch: result.dispatch || null,
+      });
+    }
+
+    console.log("[admin/notifications] dispatch sync delivery", {
+      dispatch_id: id,
+      provider_message_id: result.dispatch?.provider_message_id,
+      matched: Boolean(result.matched_event),
+      matched_event: result.matched_event?.event || null,
+    });
+
+    return res.json({
+      ok: true,
+      dispatch: result.dispatch,
+      matched_event: result.matched_event,
+      events_checked: result.events_checked,
+      ...(result.message && { message: result.message }),
+    });
+  } catch (e) {
+    console.error("[admin/notifications] dispatch sync delivery error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });

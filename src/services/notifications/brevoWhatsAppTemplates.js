@@ -37,7 +37,11 @@ function normalizeTemplateRow(template) {
   };
 }
 
-function buildTemplateKey(name, brevoId) {
+export function makeTemplateKeyFromBrevoTemplate(template) {
+  const brevoId =
+    template?.brevo_id ??
+    (template?.id != null ? String(template.id) : null);
+  const name = template?.name ?? template?.templateName ?? null;
   const prefix = "BREVO_WHATSAPP_";
   const idPart = String(brevoId || "").replace(/\D/g, "") || "UNKNOWN";
   if (!name || !String(name).trim()) {
@@ -54,8 +58,12 @@ function buildTemplateKey(name, brevoId) {
 }
 
 function buildBodyPreview(t) {
-  const parts = [t.status, t.language, t.category].filter(Boolean);
-  return parts.length ? parts.join(" · ") : null;
+  const short = {
+    status: t.status || null,
+    language: t.language || null,
+    category: t.category || null,
+  };
+  return JSON.stringify(short);
 }
 
 function extractTemplateList(body) {
@@ -76,11 +84,14 @@ export async function fetchBrevoWhatsAppTemplates({
     return {
       ok: false,
       error: "missing_brevo_api_key",
+      statusCode: null,
       count: 0,
       templates: [],
       raw: null,
     };
   }
+
+  console.log("[brevo.whatsapp.templates] fetch:start", { limit, offset, sort });
 
   const baseUrl = getBaseUrl();
   const timeoutMs = Number(process.env.BREVO_WHATSAPP_TIMEOUT_MS) || 15000;
@@ -115,11 +126,14 @@ export async function fetchBrevoWhatsAppTemplates({
       body = { raw: text };
     }
 
+    const statusCode = res.status;
+
     if (!res.ok) {
-      const error = mapBrevoApiError(body, res.status);
+      const error = mapBrevoApiError(body, statusCode);
       return {
         ok: false,
         error,
+        statusCode,
         count: 0,
         templates: [],
         raw: body,
@@ -129,12 +143,13 @@ export async function fetchBrevoWhatsAppTemplates({
     const list = extractTemplateList(body);
     const templates = list.map(normalizeTemplateRow).filter((t) => t.brevo_id);
     const count =
-      Number(body?.count) ||
-      Number(body?.total) ||
-      templates.length;
+      Number(body?.count) || Number(body?.total) || templates.length;
+
+    console.log("[brevo.whatsapp.templates] fetch:done", { statusCode, count });
 
     return {
       ok: true,
+      statusCode,
       count,
       templates,
       raw: body,
@@ -144,6 +159,7 @@ export async function fetchBrevoWhatsAppTemplates({
     return {
       ok: false,
       error: error?.message || "brevo_fetch_failed",
+      statusCode: null,
       count: 0,
       templates: [],
       raw: null,
@@ -171,7 +187,7 @@ export async function syncBrevoWhatsAppTemplates({ pgClient } = {}) {
   const syncedRows = [];
 
   for (const t of fetched.templates) {
-    const templateKey = buildTemplateKey(t.name, t.brevo_id);
+    const templateKey = makeTemplateKeyFromBrevoTemplate(t);
     const isActive = String(t.status || "").toLowerCase() === "approved";
     const bodyPreview = buildBodyPreview(t);
 
@@ -209,6 +225,11 @@ export async function syncBrevoWhatsAppTemplates({ pgClient } = {}) {
 
     if (r.rows[0]) syncedRows.push(r.rows[0]);
   }
+
+  console.log("[brevo.whatsapp.templates] sync:done", {
+    fetched_count: fetched.templates.length,
+    synced_count: syncedRows.length,
+  });
 
   return {
     ok: true,
