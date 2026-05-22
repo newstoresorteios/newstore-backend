@@ -17,7 +17,10 @@ import {
   runTestWhatsAppDeliveryCheck,
   maskPhone,
 } from "../services/notifications/brevoWhatsAppEvents.js";
-import { getTestRecipient } from "../services/notifications/brevoWhatsApp.js";
+import {
+  getTestRecipient,
+  isAdminTestCustomRecipientsEnabled,
+} from "../services/notifications/brevoWhatsApp.js";
 
 const router = express.Router();
 
@@ -101,6 +104,9 @@ router.get("/health", async (_req, res) => {
       testRecipientConfigured: health?.testRecipientConfigured,
       genericTestTemplateEnvConfigured: health?.genericTestTemplateEnvConfigured,
       captiveTemplateEnvConfigured: health?.captiveTemplateEnvConfigured,
+      adminTestCustomRecipientsEnabled: health?.adminTestCustomRecipientsEnabled,
+      adminTestAllowedRecipientsConfigured:
+        health?.adminTestAllowedRecipientsConfigured,
     });
     return res.json(health);
   } catch (e) {
@@ -452,12 +458,16 @@ router.post("/test-whatsapp", async (req, res) => {
       params,
     } = req.body || {};
 
+    const useCustomRecipient = req.body?.use_custom_recipient === true;
+
     console.log("[admin/notifications] test-whatsapp:start", {
       admin_user_id: req.user?.id || null,
       template_key: req.body?.template_key || null,
       has_template_id: Boolean(req.body?.template_id),
       has_phone: Boolean(req.body?.phone),
       has_user_id: Boolean(req.body?.user_id),
+      use_custom_recipient: useCustomRecipient,
+      admin_test_custom_enabled: isAdminTestCustomRecipientsEnabled(),
     });
 
     const out = await sendTestWhatsApp({
@@ -467,6 +477,7 @@ router.post("/test-whatsapp", async (req, res) => {
       templateId,
       params: params || {},
       adminUserId: req.user?.id ?? null,
+      useCustomRecipient,
     });
 
     console.log("[admin/notifications] test-whatsapp:result", {
@@ -479,6 +490,7 @@ router.post("/test-whatsapp", async (req, res) => {
       statusCode: out?.result?.statusCode,
       messageId: out?.result?.messageId,
       recipient_forced: out?.result?.recipient_forced,
+      recipient_mode: out?.result?.recipient_mode || null,
       reason: out?.result?.reason || null,
       error: out?.result?.error || null,
     });
@@ -499,7 +511,7 @@ router.post("/test-whatsapp", async (req, res) => {
         delivery_check = await runTestWhatsAppDeliveryCheck({
           dispatchId: out.dispatch.id,
           messageId: out.result.messageId,
-          contactNumber: getTestRecipient(),
+          contactNumber: out.result?.recipient || getTestRecipient(),
         });
 
         const refreshed = await query(
@@ -573,13 +585,18 @@ router.post("/test-whatsapp", async (req, res) => {
       }
     }
 
-    const warning = getTestModeWarning();
+    const warning =
+      out?.result?.recipient_mode === "admin_test_custom" ? null : getTestModeWarning();
+
     return res.json(
       attachBrevoHint(
         {
           ok: out.ok,
           dispatch: out.dispatch,
           result: out.result,
+          custom_recipient_requested: useCustomRecipient,
+          custom_recipient_enabled: isAdminTestCustomRecipientsEnabled(),
+          recipient_mode: out?.result?.recipient_mode || null,
           ...(delivery_check && { delivery_check }),
           ...(warning && { warning }),
           ...(out.delivery_note && { delivery_note: out.delivery_note }),

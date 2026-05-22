@@ -53,10 +53,51 @@ export function getTestRecipient() {
   return normalizePhoneBR(process.env.NOTIFICATION_TEST_WHATSAPP_TO);
 }
 
-export function resolveRecipientForCurrentMode(originalRecipient) {
+export function isAdminTestCustomRecipientsEnabled() {
+  return isTruthy(process.env.NOTIFICATION_ADMIN_TEST_CUSTOM_RECIPIENTS_ENABLED);
+}
+
+export function getAllowedAdminTestRecipients() {
+  const raw = String(process.env.NOTIFICATION_ADMIN_TEST_ALLOWED_RECIPIENTS || "");
+  return raw
+    .split(",")
+    .map((s) => normalizePhoneBR(s.trim()))
+    .filter(Boolean);
+}
+
+export function isRecipientAllowedForAdminTest(phone) {
+  const normalized = normalizePhoneBR(phone);
+  if (!normalized) return false;
+  const allowed = getAllowedAdminTestRecipients();
+  if (!allowed.length) return true;
+  return allowed.includes(normalized);
+}
+
+function canUseAdminTestCustomRecipient(originalRecipient, options = {}) {
+  const normalized = normalizePhoneBR(originalRecipient);
+  return (
+    options.context === "admin_test" &&
+    options.allowAdminTestCustomRecipient === true &&
+    isAdminTestCustomRecipientsEnabled() &&
+    !!normalized &&
+    isRecipientAllowedForAdminTest(originalRecipient)
+  );
+}
+
+export function resolveRecipientForCurrentMode(originalRecipient, options = {}) {
   const normalizedOriginal = normalizePhoneBR(originalRecipient);
   const originalRaw =
     originalRecipient != null ? String(originalRecipient).trim() : null;
+
+  if (canUseAdminTestCustomRecipient(originalRecipient, options)) {
+    return {
+      ok: true,
+      recipient: normalizedOriginal,
+      recipient_original: normalizedOriginal,
+      recipient_forced: false,
+      recipient_mode: "admin_test_custom",
+    };
+  }
 
   if (!shouldForceTestRecipient()) {
     if (!normalizedOriginal) {
@@ -66,6 +107,7 @@ export function resolveRecipientForCurrentMode(originalRecipient) {
         recipient: null,
         recipient_original: originalRaw,
         recipient_forced: false,
+        recipient_mode: null,
       };
     }
     return {
@@ -73,6 +115,7 @@ export function resolveRecipientForCurrentMode(originalRecipient) {
       recipient: normalizedOriginal,
       recipient_original: normalizedOriginal,
       recipient_forced: false,
+      recipient_mode: "real",
     };
   }
 
@@ -84,6 +127,7 @@ export function resolveRecipientForCurrentMode(originalRecipient) {
       recipient: null,
       recipient_original: normalizedOriginal || originalRaw,
       recipient_forced: true,
+      recipient_mode: "forced_test_recipient",
     };
   }
 
@@ -92,6 +136,7 @@ export function resolveRecipientForCurrentMode(originalRecipient) {
     recipient: testRecipient,
     recipient_original: normalizedOriginal || originalRaw,
     recipient_forced: true,
+    recipient_mode: "forced_test_recipient",
   };
 }
 
@@ -116,12 +161,15 @@ export async function sendBrevoWhatsAppTemplate({
   params,
   templateKey,
   correlationId,
+  allowAdminTestCustomRecipient = false,
+  context = "system",
 }) {
   void correlationId;
 
   let recipient = null;
   let recipient_original = null;
   let recipient_forced = false;
+  let recipient_mode = null;
 
   if (!isWhatsAppEnabled()) {
     return {
@@ -133,13 +181,26 @@ export async function sendBrevoWhatsAppTemplate({
       recipient,
       recipient_original,
       recipient_forced,
+      recipient_mode,
     };
   }
 
-  const resolved = resolveRecipientForCurrentMode(to);
+  const resolved = resolveRecipientForCurrentMode(to, {
+    allowAdminTestCustomRecipient,
+    context,
+  });
   recipient = resolved.recipient;
   recipient_original = resolved.recipient_original;
   recipient_forced = resolved.recipient_forced;
+  recipient_mode = resolved.recipient_mode ?? null;
+
+  console.log("[brevo.whatsapp] recipient resolved", {
+    context,
+    recipient_forced: resolved.recipient_forced,
+    recipient_mode: resolved.recipient_mode || null,
+    has_original_recipient: Boolean(to),
+    custom_admin_test_enabled: isAdminTestCustomRecipientsEnabled(),
+  });
 
   if (!resolved.ok) {
     return {
@@ -151,6 +212,7 @@ export async function sendBrevoWhatsAppTemplate({
       recipient,
       recipient_original,
       recipient_forced,
+      recipient_mode,
     };
   }
 
@@ -164,6 +226,7 @@ export async function sendBrevoWhatsAppTemplate({
       recipient,
       recipient_original,
       recipient_forced,
+      recipient_mode,
     };
   }
 
@@ -236,6 +299,7 @@ export async function sendBrevoWhatsAppTemplate({
         recipient,
         recipient_original,
         recipient_forced,
+        recipient_mode,
         error: null,
         reason: null,
       };
@@ -264,6 +328,7 @@ export async function sendBrevoWhatsAppTemplate({
       recipient,
       recipient_original,
       recipient_forced,
+      recipient_mode,
     };
   } catch (error) {
     clearTimeout(timer);
@@ -285,6 +350,7 @@ export async function sendBrevoWhatsAppTemplate({
       recipient,
       recipient_original,
       recipient_forced,
+      recipient_mode,
     };
   }
 }

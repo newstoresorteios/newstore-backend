@@ -9,6 +9,8 @@ import {
   shouldForceTestRecipient,
   isTestModeActive,
   isAllowRealRecipients,
+  isAdminTestCustomRecipientsEnabled,
+  resolveRecipientForCurrentMode,
 } from "./brevoWhatsApp.js";
 import {
   createDispatch,
@@ -64,6 +66,10 @@ export function getNotificationHealth() {
     ),
     captiveTemplateEnvConfigured: Boolean(
       process.env.BREVO_WHATSAPP_CAPTIVE_AUTH_TEMPLATE_ID
+    ),
+    adminTestCustomRecipientsEnabled: isAdminTestCustomRecipientsEnabled(),
+    adminTestAllowedRecipientsConfigured: Boolean(
+      String(process.env.NOTIFICATION_ADMIN_TEST_ALLOWED_RECIPIENTS || "").trim()
     ),
   };
 }
@@ -176,15 +182,19 @@ async function finalizeDispatch({ pgClient, dispatch, result }) {
   return updated;
 }
 
-function buildAdminResult(dispatch, result) {
+function buildAdminResult(dispatch, result, { includeTestModeWarning = true } = {}) {
   const errorMessage = dispatch?.error_message || extractDispatchErrorMessage(result);
   const brevoIpBlocked = errorMessage === "brevo_ip_not_authorized";
+  const showWarning =
+    includeTestModeWarning &&
+    result?.recipient_mode !== "admin_test_custom" &&
+    getTestModeWarning();
 
   return {
     ok: !!result?.ok,
     dispatch,
     result,
-    warning: getTestModeWarning(),
+    ...(showWarning && { warning: getTestModeWarning() }),
     ...(result?.ok &&
       result?.provider_status === "accepted" && {
         delivery_note: DELIVERY_NOTE_ACCEPTED,
@@ -201,6 +211,7 @@ export async function sendTestWhatsApp({
   templateId = null,
   params = {},
   adminUserId = null,
+  useCustomRecipient = false,
 }) {
   let requestedPhone = phone ? String(phone).trim() : null;
 
@@ -208,22 +219,27 @@ export async function sendTestWhatsApp({
     requestedPhone = await lookupUserPhone(pgClient, userId);
   }
 
-  const forced = shouldForceTestRecipient();
   const testRecipient = getTestRecipient();
-  if (forced && !testRecipient) {
+  const originalRecipient = requestedPhone || testRecipient;
+  const preResolved = resolveRecipientForCurrentMode(originalRecipient, {
+    allowAdminTestCustomRecipient: useCustomRecipient === true,
+    context: "admin_test",
+  });
+
+  if (!preResolved.ok) {
     return {
       ok: false,
       dispatch: null,
       result: {
         ok: false,
         skipped: true,
-        reason: "missing_test_recipient",
+        reason: preResolved.reason,
+        recipient_mode: preResolved.recipient_mode,
       },
       warning: TEST_MODE_WARNING,
     };
   }
 
-  const originalRecipient = requestedPhone || testRecipient;
   const resolvedTemplateId = await resolveTemplateId({
     pgClient,
     templateKey,
@@ -234,7 +250,8 @@ export async function sendTestWhatsApp({
 
   const normalizedOriginal =
     normalizePhoneBR(originalRecipient) || originalRecipient;
-  const dispatchRecipient = forced ? testRecipient : normalizedOriginal;
+  const dispatchRecipient = preResolved.recipient;
+  const dispatchForced = preResolved.recipient_forced;
   const testMode = isTestModeActive();
   const allowRealRecipients = isAllowRealRecipients();
 
@@ -247,6 +264,8 @@ export async function sendTestWhatsApp({
     admin_user_id: adminUserId || null,
     test_mode: testMode,
     allow_real_recipients: allowRealRecipients,
+    use_custom_recipient: useCustomRecipient === true,
+    admin_test_custom_recipients_enabled: isAdminTestCustomRecipientsEnabled(),
   };
 
   const recipientSnapshot = {
@@ -254,7 +273,8 @@ export async function sendTestWhatsApp({
     phone: phone || null,
     source: userId ? "specific_user" : "specific_phone",
     test_mode: testMode,
-    recipient_forced_expected: forced,
+    recipient_forced_expected: dispatchForced,
+    recipient_mode: preResolved.recipient_mode,
   };
 
   const dispatch = await createDispatch({
@@ -264,8 +284,8 @@ export async function sendTestWhatsApp({
     provider: "brevo",
     userId: userId || null,
     recipient: dispatchRecipient,
-    recipientOriginal: normalizedOriginal,
-    recipientForced: forced,
+    recipientOriginal: preResolved.recipient_original,
+    recipientForced: dispatchForced,
     templateKey,
     providerTemplateId: resolvedTemplateId,
     payload: {
@@ -302,10 +322,14 @@ export async function sendTestWhatsApp({
     params,
     templateKey,
     correlationId: String(dispatch.id),
+    context: "admin_test",
+    allowAdminTestCustomRecipient: useCustomRecipient === true,
   });
 
+  recipientSnapshot.recipient_mode = result.recipient_mode || preResolved.recipient_mode;
+
   const updated = await finalizeDispatch({ pgClient, dispatch, result });
-  return buildAdminResult(updated, result);
+  return buildAdminResult(updated, result, { includeTestModeWarning: true });
 }
 
 export async function estimateAudience({ pgClient, filter, userId = null, phone = null }) {
@@ -576,6 +600,8 @@ export async function manualSendNotification({
     params,
     templateKey,
     correlationId: String(dispatch.id),
+    context: "manual_send",
+    allowAdminTestCustomRecipient: false,
   });
 
   const updated = await finalizeDispatch({ pgClient, dispatch, result });
