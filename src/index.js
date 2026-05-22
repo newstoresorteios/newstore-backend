@@ -44,6 +44,8 @@ import meDraws from "./routes/me_draws.js";
 import autopayRunnerRoute from "./routes/autopay_runner.js";
 
 import adminAnalyticsRouter from "./routes/analytics.js";
+import adminNotificationsRouter from "./routes/adminNotifications.js";
+import brevoWebhooksRouter from "./routes/brevoWebhooks.js";
 
 import { autoReconcile } from './middleware/autoReconcile.js';
 
@@ -124,6 +126,9 @@ app.use("/api/config", configRouter);           // GET: preço, banner, max_sele
 app.use("/api/admin/config", adminConfigRouter);
 
 app.use("/api/admin/analytics", adminAnalyticsRouter);
+app.use("/api/admin/notifications", adminNotificationsRouter);
+
+app.use("/api/webhooks/brevo", brevoWebhooksRouter);
 
 // ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);
