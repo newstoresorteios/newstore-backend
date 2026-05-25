@@ -201,16 +201,33 @@ export async function syncBrevoWhatsAppTemplates({ pgClient } = {}) {
           name,
           description,
           body_preview,
+          template_language,
+          template_category,
           is_active,
+          is_synced_from_brevo,
+          last_synced_at,
           updated_at
-        ) VALUES ($1, 'whatsapp', 'brevo', $2, $3, $4, $5, $6, NOW())
+        ) VALUES ($1, 'whatsapp', 'brevo', $2, $3, $4, $5, $6, $7, $8, true, NOW(), NOW())
         ON CONFLICT (template_key, channel, provider)
         DO UPDATE SET
           provider_template_id = EXCLUDED.provider_template_id,
           name = EXCLUDED.name,
           description = EXCLUDED.description,
-          body_preview = EXCLUDED.body_preview,
+          template_language = EXCLUDED.template_language,
+          template_category = EXCLUDED.template_category,
           is_active = EXCLUDED.is_active,
+          is_synced_from_brevo = true,
+          last_synced_at = NOW(),
+          body_preview = CASE
+            WHEN notification_templates.default_message IS NOT NULL
+              AND TRIM(notification_templates.default_message) <> ''
+            THEN notification_templates.body_preview
+            WHEN notification_templates.is_synced_from_brevo = false
+              AND notification_templates.body_preview IS NOT NULL
+              AND TRIM(notification_templates.body_preview) <> ''
+            THEN notification_templates.body_preview
+            ELSE EXCLUDED.body_preview
+          END,
           updated_at = NOW()
         RETURNING *`,
       [
@@ -219,6 +236,8 @@ export async function syncBrevoWhatsAppTemplates({ pgClient } = {}) {
         t.name,
         "Sincronizado automaticamente da Brevo",
         bodyPreview,
+        t.language || null,
+        t.category || null,
         isActive,
       ]
     );

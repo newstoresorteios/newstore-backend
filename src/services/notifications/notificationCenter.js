@@ -74,12 +74,20 @@ export function getNotificationHealth() {
   };
 }
 
+export function getManualSendMaxRecipients() {
+  const n = Number(process.env.NOTIFICATION_MANUAL_SEND_MAX_RECIPIENTS);
+  if (Number.isFinite(n) && n > 0) return Math.min(Math.trunc(n), 50);
+  return 50;
+}
+
 export async function getTemplateByKey({
   pgClient,
   templateKey,
   channel,
   provider,
+  activeOnly = true,
 }) {
+  const activeClause = activeOnly ? "AND is_active = true" : "";
   const r = await runQuery(
     pgClient,
     `SELECT *
@@ -87,9 +95,18 @@ export async function getTemplateByKey({
       WHERE template_key = $1
         AND channel = $2
         AND provider = $3
-        AND is_active = true
+        ${activeClause}
       LIMIT 1`,
     [templateKey, channel, provider]
+  );
+  return r.rows[0] || null;
+}
+
+export async function getTemplateById({ pgClient, templateId }) {
+  const r = await runQuery(
+    pgClient,
+    `SELECT * FROM public.notification_templates WHERE id = $1 LIMIT 1`,
+    [templateId]
   );
   return r.rows[0] || null;
 }
@@ -136,6 +153,179 @@ async function lookupUserPhone(pgClient, userId) {
   const row = r.rows[0];
   if (!row) return null;
   return row.phone || null;
+}
+
+async function lookupUserForRecipient(pgClient, userId) {
+  const r = await runQuery(
+    pgClient,
+    `SELECT id, name, email, phone, coupon_code, coupon_value_cents, is_admin
+       FROM public.users
+      WHERE id = $1
+      LIMIT 1`,
+    [userId]
+  );
+  return r.rows[0] || null;
+}
+
+export async function searchNotificationRecipients({
+  pgClient,
+  q = "",
+  limit = 20,
+} = {}) {
+  const maxLimit = Math.min(Math.max(Number(limit) || 20, 1), 50);
+  const term = String(q || "").trim();
+
+  if (!term) {
+    return [];
+  }
+
+  const pattern = `%${term.replace(/[%_\\]/g, "\\$&")}%`;
+  const r = await runQuery(
+    pgClient,
+    `SELECT id, name, email, phone,
+            NULLIF(TRIM(coupon_code), '') AS coupon_code,
+            COALESCE(coupon_value_cents, 0)::bigint AS coupon_value_cents,
+            COALESCE(is_admin, false) AS is_admin
+       FROM public.users
+      WHERE name ILIKE $1 ESCAPE '\\'
+         OR email ILIKE $1 ESCAPE '\\'
+         OR phone ILIKE $1 ESCAPE '\\'
+         OR NULLIF(TRIM(coupon_code), '') ILIKE $1 ESCAPE '\\'
+      ORDER BY name NULLS LAST, id
+      LIMIT $2`,
+    [pattern, maxLimit]
+  );
+  return r.rows || [];
+}
+
+const TEMPLATE_PATCH_FIELDS = new Set([
+  "template_key",
+  "provider_template_id",
+  "name",
+  "description",
+  "body_preview",
+  "default_message",
+  "default_params",
+  "template_language",
+  "template_category",
+  "is_active",
+]);
+
+export async function updateNotificationTemplate({
+  pgClient,
+  templateId,
+  patch,
+}) {
+  const existing = await getTemplateById({ pgClient, templateId });
+  if (!existing) {
+    return { ok: false, error: "not_found" };
+  }
+
+  const updates = [];
+  const params = [templateId];
+  let idx = 2;
+
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (!TEMPLATE_PATCH_FIELDS.has(key)) continue;
+
+    if (key === "default_params") {
+      if (value !== null && (typeof value !== "object" || Array.isArray(value))) {
+        return { ok: false, error: "invalid_default_params" };
+      }
+      updates.push(`default_params = $${idx++}::jsonb`);
+      params.push(JSON.stringify(value ?? {}));
+      continue;
+    }
+
+    if (key === "is_active") {
+      updates.push(`is_active = $${idx++}`);
+      params.push(value === true);
+      continue;
+    }
+
+    if (key === "provider_template_id") {
+      updates.push(`provider_template_id = $${idx++}`);
+      params.push(value == null || value === "" ? null : String(value));
+      continue;
+    }
+
+    updates.push(`${key} = $${idx++}`);
+    params.push(value == null ? null : String(value));
+  }
+
+  if (!updates.length) {
+    return { ok: true, template: existing };
+  }
+
+  updates.push("updated_at = NOW()");
+
+  const r = await runQuery(
+    pgClient,
+    `UPDATE public.notification_templates
+        SET ${updates.join(", ")}
+      WHERE id = $1
+      RETURNING *`,
+    params
+  );
+
+  return { ok: true, template: r.rows[0] };
+}
+
+function normalizeManualRecipients(recipients) {
+  if (!Array.isArray(recipients)) return [];
+  return recipients
+    .map((r) => {
+      if (!r || typeof r !== "object") return null;
+      if (r.user_id != null) {
+        return { user_id: Number(r.user_id), phone: null, name: null };
+      }
+      if (r.phone) {
+        return {
+          user_id: null,
+          phone: String(r.phone).trim(),
+          name: r.name ? String(r.name).trim() : null,
+        };
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function resolveManualSendSecurity({
+  recipientCount,
+  useCustomRecipient,
+  dryRun,
+}) {
+  const testMode = isTestModeActive();
+  const allowRealRecipients = isAllowRealRecipients();
+  const forced = shouldForceTestRecipient();
+  const customEnabled = isAdminTestCustomRecipientsEnabled();
+  const allowCustomReal =
+    useCustomRecipient === true &&
+    customEnabled &&
+    recipientCount <= 5 &&
+    !dryRun;
+  const blockBulkReal = recipientCount > 5 && forced;
+
+  return {
+    testMode,
+    allowRealRecipients,
+    forced,
+    allowCustomReal,
+    blockBulkReal,
+    warning:
+      blockBulkReal && forced
+        ? TEST_MODE_WARNING
+        : forced && !allowCustomReal
+          ? TEST_MODE_WARNING
+          : null,
+  };
+}
+
+function buildManualSendCampaignStatus(security) {
+  if (security.blockBulkReal) return "blocked_real_recipients";
+  if (security.forced) return "test_mode";
+  return "created";
 }
 
 async function finalizeDispatch({ pgClient, dispatch, result }) {
@@ -626,5 +816,302 @@ export async function manualSendNotification({
     campaign,
     ...buildAdminResult(updated, result),
     message: TEST_MODE_WARNING,
+  };
+}
+
+export async function manualSendSelected({
+  pgClient,
+  channel = "whatsapp",
+  provider = "brevo",
+  templateKey = "GENERIC_TEST",
+  templateId = null,
+  message = null,
+  params = {},
+  recipients = [],
+  useCustomRecipient = false,
+  dryRun = false,
+  adminUserId = null,
+}) {
+  if (channel !== "whatsapp" || provider !== "brevo") {
+    return {
+      ok: false,
+      error: "unsupported_channel_or_provider",
+      message: "Nesta fase apenas channel=whatsapp e provider=brevo são suportados",
+    };
+  }
+
+  const maxRecipients = getManualSendMaxRecipients();
+  const normalizedRecipients = normalizeManualRecipients(recipients);
+
+  if (!normalizedRecipients.length) {
+    return { ok: false, error: "recipients_required" };
+  }
+  if (normalizedRecipients.length > maxRecipients) {
+    return {
+      ok: false,
+      error: "too_many_recipients",
+      max: maxRecipients,
+    };
+  }
+
+  const testRecipient = getTestRecipient();
+  if (!testRecipient && shouldForceTestRecipient()) {
+    return {
+      ok: false,
+      error: "missing_test_recipient",
+      message:
+        "NOTIFICATION_TEST_WHATSAPP_TO ausente ou inválido. Configure o número de teste.",
+    };
+  }
+
+  const security = resolveManualSendSecurity({
+    recipientCount: normalizedRecipients.length,
+    useCustomRecipient,
+    dryRun,
+  });
+
+  const resolvedTemplateId = await resolveTemplateId({
+    pgClient,
+    templateKey,
+    channel,
+    provider,
+    explicitTemplateId: templateId,
+  });
+
+  const sendParams = { ...(params || {}) };
+  if (message != null && String(message).trim() !== "") {
+    sendParams.message = String(message).trim();
+  }
+
+  const messageSnapshot = {
+    channel,
+    provider,
+    template_key: templateKey,
+    provider_template_id: resolvedTemplateId,
+    message: message != null ? String(message) : null,
+    params: sendParams,
+    admin_user_id: adminUserId || null,
+    test_mode: security.testMode,
+    allow_real_recipients: security.allowRealRecipients,
+    use_custom_recipient: useCustomRecipient === true,
+  };
+
+  let campaign = null;
+  if (normalizedRecipients.length > 1) {
+    const audienceSnapshot = {
+      source: "manual_selected",
+      recipient_count: normalizedRecipients.length,
+      test_mode: security.testMode,
+      allow_real_recipients: security.allowRealRecipients,
+      real_send_blocked: security.blockBulkReal || security.forced,
+      use_custom_recipient: useCustomRecipient === true,
+    };
+
+    campaign = await createCampaign({
+      pgClient,
+      name: `Manual selected — ${normalizedRecipients.length} destinatários`,
+      channel,
+      provider,
+      templateKey,
+      providerTemplateId: resolvedTemplateId,
+      audienceFilter: "manual_selected",
+      audienceParams: { recipient_count: normalizedRecipients.length },
+      status: buildManualSendCampaignStatus(security),
+      createdBy: adminUserId,
+      payload: {
+        admin_user_id: adminUserId || null,
+        test_mode: security.testMode,
+        dry_run: dryRun === true,
+      },
+      messageSnapshot,
+      audienceSnapshot,
+      campaignType: "manual_selected",
+      audienceCountExpected: normalizedRecipients.length,
+    });
+  }
+
+  const dispatches = [];
+  const summary = {
+    requested_count: normalizedRecipients.length,
+    created_count: 0,
+    accepted_count: 0,
+    failed_count: 0,
+    skipped_count: 0,
+    forced_count: 0,
+  };
+
+  const brevoContext =
+    security.allowCustomReal && !security.blockBulkReal
+      ? "admin_test"
+      : "manual_send_selected";
+
+  const allowAdminTestCustom =
+    security.allowCustomReal && !security.blockBulkReal;
+
+  for (const item of normalizedRecipients) {
+    let userRow = null;
+    let source = "manual_phone";
+    let requestedRecipient = null;
+
+    if (item.user_id) {
+      userRow = await lookupUserForRecipient(pgClient, item.user_id);
+      source = "selected_user";
+      requestedRecipient = userRow?.phone || `user:${item.user_id}`;
+    } else {
+      requestedRecipient = item.phone;
+    }
+
+    const originalRecipient =
+      normalizePhoneBR(userRow?.phone || item.phone) ||
+      userRow?.phone ||
+      item.phone ||
+      testRecipient;
+
+    let preResolved;
+    if (security.blockBulkReal) {
+      preResolved = {
+        ok: true,
+        recipient: testRecipient,
+        recipient_original: originalRecipient,
+        recipient_forced: true,
+        recipient_mode: "forced_test_recipient",
+      };
+    } else {
+      preResolved = resolveRecipientForCurrentMode(originalRecipient, {
+        allowAdminTestCustomRecipient: allowAdminTestCustom,
+        context: brevoContext,
+      });
+    }
+
+    if (!preResolved.ok) {
+      summary.skipped_count += 1;
+      dispatches.push({
+        ok: false,
+        skipped: true,
+        reason: preResolved.reason,
+        user_id: item.user_id || null,
+      });
+      continue;
+    }
+
+    if (preResolved.recipient_forced) {
+      summary.forced_count += 1;
+    }
+
+    const recipientSnapshot = {
+      user_id: userRow?.id || item.user_id || null,
+      name: userRow?.name || item.name || null,
+      email: userRow?.email || null,
+      phone: userRow?.phone || item.phone || null,
+      source,
+      requested_recipient: requestedRecipient,
+      resolved_recipient: preResolved.recipient,
+      recipient_forced: preResolved.recipient_forced,
+      recipient_mode: preResolved.recipient_mode,
+    };
+
+    if (dryRun) {
+      summary.created_count += 1;
+      dispatches.push({
+        ok: true,
+        dry_run: true,
+        recipient_snapshot: recipientSnapshot,
+        would_send_to: preResolved.recipient,
+      });
+      continue;
+    }
+
+    const dispatch = await createDispatch({
+      pgClient,
+      eventKey: "MANUAL_ADMIN_SELECTED_SEND",
+      channel,
+      provider,
+      userId: userRow?.id || item.user_id || null,
+      recipient: preResolved.recipient,
+      recipientOriginal: preResolved.recipient_original,
+      recipientForced: preResolved.recipient_forced,
+      templateKey,
+      providerTemplateId: resolvedTemplateId,
+      campaignId: campaign?.id || null,
+      payload: {
+        params: sendParams,
+        admin_user_id: adminUserId || null,
+        test_mode: security.testMode,
+        campaign_id: campaign?.id || null,
+      },
+      messageSnapshot,
+      recipientSnapshot,
+    });
+
+    summary.created_count += 1;
+
+    if (!resolvedTemplateId) {
+      const skipped = {
+        ok: false,
+        skipped: true,
+        reason: "missing_template_id",
+        message: MISSING_TEMPLATE_ID_MESSAGE,
+        provider,
+        channel,
+      };
+      const updated = await markDispatchFailed({
+        pgClient,
+        dispatchId: dispatch.id,
+        result: skipped,
+      });
+      summary.skipped_count += 1;
+      dispatches.push(updated);
+      continue;
+    }
+
+    const result = await sendBrevoWhatsAppTemplate({
+      to: originalRecipient,
+      templateId: resolvedTemplateId,
+      params: sendParams,
+      templateKey,
+      correlationId: String(dispatch.id),
+      context: brevoContext,
+      allowAdminTestCustomRecipient: allowAdminTestCustom,
+    });
+
+    recipientSnapshot.recipient_mode =
+      result.recipient_mode || preResolved.recipient_mode;
+    recipientSnapshot.recipient_forced = result.recipient_forced;
+
+    const updated = await finalizeDispatch({ pgClient, dispatch, result });
+    dispatches.push(updated);
+
+    if (result?.skipped) summary.skipped_count += 1;
+    else if (result?.ok && result?.provider_status === "accepted") {
+      summary.accepted_count += 1;
+    } else if (result?.ok) summary.accepted_count += 1;
+    else summary.failed_count += 1;
+  }
+
+  if (campaign?.id && !dryRun) {
+    await updateCampaignAudienceCounts(pgClient, campaign.id, {
+      created: summary.created_count,
+      sent: summary.accepted_count,
+      failed: summary.failed_count,
+      skipped: summary.skipped_count,
+    });
+    const refreshed = await runQuery(
+      pgClient,
+      `SELECT * FROM public.notification_campaigns WHERE id = $1`,
+      [campaign.id]
+    );
+    campaign = refreshed.rows[0];
+  }
+
+  const anyAccepted = summary.accepted_count > 0;
+  const warning = security.warning || null;
+
+  return {
+    ok: dryRun ? true : anyAccepted || summary.skipped_count > 0,
+    campaign,
+    dispatches,
+    summary,
+    warning,
+    dry_run: dryRun === true,
   };
 }

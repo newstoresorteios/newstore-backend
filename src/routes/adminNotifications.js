@@ -7,6 +7,9 @@ import {
   sendTestWhatsApp,
   estimateAudience,
   manualSendNotification,
+  manualSendSelected,
+  searchNotificationRecipients,
+  updateNotificationTemplate,
   getTestModeWarning,
   BREVO_IP_BLOCKED_MESSAGE,
 } from "../services/notifications/notificationCenter.js";
@@ -23,6 +26,9 @@ import {
 } from "../services/notifications/brevoWhatsApp.js";
 
 const router = express.Router();
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 router.use(requireAuth, requireAdmin);
 
@@ -220,6 +226,96 @@ router.get("/inbound", async (req, res) => {
   }
 });
 
+router.get("/recipients/search", async (req, res) => {
+  try {
+    const q = String(req.query?.q || "").trim();
+    const limit = Math.min(toInt(req.query?.limit, 20), 50);
+
+    const rows = await searchNotificationRecipients({ q, limit });
+
+    console.log("[admin/notifications] recipients search", {
+      admin_user_id: req.user?.id || null,
+      has_query: Boolean(q),
+      count: rows.length,
+    });
+
+    return res.json({
+      ok: true,
+      rows,
+      recipients: rows,
+      items: rows,
+      count: rows.length,
+    });
+  } catch (e) {
+    console.error("[admin/notifications] recipients search error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+router.patch("/templates/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!UUID_RE.test(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_template_id" });
+    }
+
+    const body = req.body || {};
+    const templateKey = body.template_key;
+    if (templateKey !== undefined && !String(templateKey || "").trim()) {
+      return res.status(400).json({ ok: false, error: "template_key_required" });
+    }
+
+    if (
+      body.default_params !== undefined &&
+      body.default_params !== null &&
+      (typeof body.default_params !== "object" || Array.isArray(body.default_params))
+    ) {
+      return res.status(400).json({ ok: false, error: "invalid_default_params" });
+    }
+
+    if (body.is_active !== undefined && typeof body.is_active !== "boolean") {
+      return res.status(400).json({ ok: false, error: "invalid_is_active" });
+    }
+
+    const allowed = {};
+    for (const key of [
+      "template_key",
+      "provider_template_id",
+      "name",
+      "description",
+      "body_preview",
+      "default_message",
+      "default_params",
+      "template_language",
+      "template_category",
+      "is_active",
+    ]) {
+      if (body[key] !== undefined) allowed[key] = body[key];
+    }
+
+    const out = await updateNotificationTemplate({
+      templateId: id,
+      patch: allowed,
+    });
+
+    if (!out.ok) {
+      const status = out.error === "not_found" ? 404 : 400;
+      return res.status(status).json({ ok: false, error: out.error });
+    }
+
+    console.log("[admin/notifications] template updated", {
+      admin_user_id: req.user?.id || null,
+      template_id: id,
+      template_key: out.template?.template_key,
+    });
+
+    return res.json({ ok: true, template: out.template });
+  } catch (e) {
+    console.error("[admin/notifications] template update error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
 router.get("/templates", async (_req, res) => {
   try {
     const r = await query(
@@ -359,9 +455,6 @@ router.get("/brevo-whatsapp-events", async (req, res) => {
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
-
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
   try {
@@ -643,6 +736,81 @@ router.post("/audience/estimate", async (req, res) => {
     return res.json(result);
   } catch (e) {
     console.error("[admin/notifications] audience estimate error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+router.post("/manual-send-selected", async (req, res) => {
+  try {
+    const {
+      channel,
+      provider,
+      template_key: templateKey,
+      template_id: templateId,
+      message,
+      params,
+      recipients,
+      use_custom_recipient: useCustomRecipient,
+      dry_run: dryRun,
+    } = req.body || {};
+
+    console.log("[admin/notifications] manual-send-selected:start", {
+      admin_user_id: req.user?.id || null,
+      template_key: templateKey || null,
+      recipient_count: Array.isArray(recipients) ? recipients.length : 0,
+      use_custom_recipient: useCustomRecipient === true,
+      dry_run: dryRun === true,
+    });
+
+    const out = await manualSendSelected({
+      channel: channel || "whatsapp",
+      provider: provider || "brevo",
+      templateKey: templateKey || "GENERIC_TEST",
+      templateId,
+      message,
+      params: params || {},
+      recipients: recipients || [],
+      useCustomRecipient: useCustomRecipient === true,
+      dryRun: dryRun === true,
+      adminUserId: req.user?.id ?? null,
+    });
+
+    if (out.error === "too_many_recipients") {
+      return res.status(400).json({
+        ok: false,
+        error: out.error,
+        max: out.max,
+      });
+    }
+    if (
+      out.error === "recipients_required" ||
+      out.error === "unsupported_channel_or_provider"
+    ) {
+      return res.status(400).json({ ok: false, error: out.error, message: out.message });
+    }
+    if (out.error === "missing_test_recipient") {
+      return res.status(503).json({ ok: false, error: out.error, message: out.message });
+    }
+
+    console.log("[admin/notifications] manual-send-selected:result", {
+      ok: out?.ok,
+      campaign_id: out?.campaign?.id || null,
+      summary: out?.summary || null,
+      warning: out?.warning || null,
+    });
+
+    return res.json({
+      ok: out.ok,
+      campaign: out.campaign || null,
+      dispatches: out.dispatches || [],
+      summary: out.summary,
+      warning: out.warning || getTestModeWarning(),
+      dry_run: out.dry_run === true,
+      ...(out.error && { error: out.error }),
+      ...(out.message && { message: out.message }),
+    });
+  } catch (e) {
+    console.error("[admin/notifications] manual-send-selected error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
