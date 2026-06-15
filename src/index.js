@@ -21,6 +21,7 @@ import adminDrawsRouter from "./routes/admin_draws.js";
 import adminClientsRouter from "./routes/admin_clients.js";
 import adminWinnersRouter from "./routes/admin_winners.js";
 import adminDashboardRouter from "./routes/admin_dashboard.js";
+import adminBalanceHistoryRouter from "./routes/admin_balance_history.js";
 
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
@@ -120,6 +121,7 @@ app.use("/api/admin/draws", adminDrawsRouter);
 app.use("/api/admin/clients", adminClientsRouter);
 app.use("/api/admin/winners", adminWinnersRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
+app.use("/api/admin/balance-history", adminBalanceHistoryRouter);
 
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza
@@ -323,8 +325,15 @@ async function bootstrap() {
     // Validação de env Vindi
     validateVindiConfig();
 
-    await ensureSchema(); // cria o schema base/tabelas
-    await ensureAppConfig(); // garante app_config e ticket_price_cents
+    const skipBootstrapWrites = process.env.SKIP_BOOTSTRAP_WRITES === "true";
+    if (skipBootstrapWrites) {
+      console.warn(
+        "[bootstrap] SKIP_BOOTSTRAP_WRITES=true: ensureSchema/ensureAppConfig nao serao executados nesta inicializacao local."
+      );
+    } else {
+      await ensureSchema(); // cria o schema base/tabelas
+      await ensureAppConfig(); // garante app_config e ticket_price_cents
+    }
 
     const pool = await getPool();
     await pool.query("SELECT 1");
