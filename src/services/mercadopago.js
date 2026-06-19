@@ -7,17 +7,12 @@ const MP_BASE =
   "https://api.mercadopago.com";
 
 // Busca o token sempre que precisar (permite trocar env e redeploy sem cache em const)
-function getAccessToken() {
-  return (
-    process.env.MERCADOPAGO_ACCESS_TOKEN ||
-    process.env.MP_ACCESS_TOKEN ||
-    process.env.REACT_APP_MP_ACCESS_TOKEN || // fallback (não recomendado)
-    ""
-  );
+export function getMercadoPagoAccessToken() {
+  return process.env.MP_ACCESS_TOKEN || process.env.MERCADOPAGO_ACCESS_TOKEN || "";
 }
 
 function ensureToken() {
-  if (!getAccessToken()) {
+  if (!getMercadoPagoAccessToken()) {
     throw new Error(
       "MP_ACCESS_TOKEN/MERCADOPAGO_ACCESS_TOKEN não configurado no servidor."
     );
@@ -41,7 +36,7 @@ async function mpFetch(
     res = await fetch(`${MP_BASE}${path}`, {
       method,
       headers: {
-        Authorization: `Bearer ${getAccessToken()}`,
+        Authorization: `Bearer ${getMercadoPagoAccessToken()}`,
         "Content-Type": "application/json",
         Accept: "application/json",
         "User-Agent": "newstore-autopay/1.0",

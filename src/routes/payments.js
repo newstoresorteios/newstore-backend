@@ -9,16 +9,20 @@ import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
 
 const router = Router();
 
-// Aceita MP_ACCESS_TOKEN (backend) ou REACT_APP_MP_ACCESS_TOKEN (Render)
-const mpClient = new MercadoPagoConfig({
-  accessToken: process.env.MP_ACCESS_TOKEN || process.env.REACT_APP_MP_ACCESS_TOKEN,
-});
-const mpPayment = new Payment(mpClient);
-
 const PIX_EXP_MIN = Math.max(
   30,
   Number(process.env.PIX_EXP_MIN || process.env.PIX_EXP_MINUTES || 30)
 );
+
+function getMercadoPagoAccessToken() {
+  return process.env.MP_ACCESS_TOKEN || process.env.MERCADOPAGO_ACCESS_TOKEN || "";
+}
+
+function getMercadoPagoPaymentClient() {
+  const token = getMercadoPagoAccessToken();
+  if (!token) return null;
+  return new Payment(new MercadoPagoConfig({ accessToken: token }));
+}
 
 function isDebugCouponEnabled() {
   const v = String(process.env.DEBUG_COUPON || "").toLowerCase().trim();
@@ -81,10 +85,14 @@ async function finalizeDrawIfComplete(drawId) {
       // Abre novo SOMENTE se não existir outro aberto
       const ins = await query(
         `WITH chk AS (
-           SELECT 1 FROM draws WHERE status = 'open' LIMIT 1
+           SELECT 1
+             FROM draws
+            WHERE status = 'open'
+              AND COALESCE(draw_type, 'principal') = 'principal'
+            LIMIT 1
          )
-         INSERT INTO draws (status)
-         SELECT 'open'
+         INSERT INTO draws (status, draw_type)
+         SELECT 'open', 'principal'
          WHERE NOT EXISTS (SELECT 1 FROM chk)
          RETURNING id`
       );
@@ -116,20 +124,21 @@ async function finalizeDrawIfComplete(drawId) {
 async function settleApprovedPayment(id, drawId, numbers) {
   // marca números como vendidos
   await query(
-    `UPDATE numbers
+    `UPDATE public.numbers
         SET status = 'sold',
             reservation_id = NULL
       WHERE draw_id = $1
-        AND n = ANY($2)`,
+        AND n = ANY($2::int[])`,
     [drawId, numbers]
   );
 
   // marca reserva como paga (idempotente)
   await query(
-    `UPDATE reservations
+    `UPDATE public.reservations
         SET status = 'paid'
-      WHERE payment_id = $1`,
-    [id]
+      WHERE payment_id = $1
+        AND draw_id = $2`,
+    [id, drawId]
   );
 }
 
@@ -138,10 +147,15 @@ async function settleApprovedPayment(id, drawId, numbers) {
  * Reutilizada pelo endpoint /reconcile e pelo middleware autoReconcile.
  */
 async function _reconcilePendingPaymentsCore(minutes) {
+  const mpPayment = getMercadoPagoPaymentClient();
+  if (!mpPayment) {
+    return { scanned: 0, updated: 0, approved: 0, failed: 1, error: "mp_token_missing" };
+  }
+
   const lookbackMin = Math.max(5, Number(minutes || 1440)); // default 24h
   const { rows } = await query(
     `SELECT id
-       FROM payments
+       FROM public.payments
       WHERE lower(status) NOT IN ('approved','paid','pago')
         AND COALESCE(created_at, now()) >= NOW() - ($1::int || ' minutes')::interval`,
     [lookbackMin]
@@ -156,7 +170,7 @@ async function _reconcilePendingPaymentsCore(minutes) {
       const st = String(body?.status || '').toLowerCase();
 
       await query(
-        `UPDATE payments
+        `UPDATE public.payments
             SET status = $2,
                 paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
           WHERE id = $1`,
@@ -165,7 +179,7 @@ async function _reconcilePendingPaymentsCore(minutes) {
       updated++;
 
       if (st === 'approved') {
-        const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+        const pr = await query(`SELECT draw_id, numbers FROM public.payments WHERE id = $1`, [id]);
         if (pr.rows.length) {
           const { draw_id, numbers } = pr.rows[0];
           await settleApprovedPayment(id, draw_id, numbers);
@@ -235,6 +249,8 @@ router.post('/pix', requireAuth, async (req, res) => {
   console.log('[payments/pix] user=', req.user?.id, 'body=', req.body);
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'unauthorized' });
+    const mpPayment = getMercadoPagoPaymentClient();
+    if (!mpPayment) return res.status(503).json({ error: 'mp_token_missing' });
 
     const { reservationId } = req.body || {};
     if (!reservationId) {
@@ -243,7 +259,7 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     // Corrige reservas antigas sem user_id (anexa ao usuário atual)
     await query(
-      `UPDATE reservations
+      `UPDATE public.reservations
           SET user_id = $2
         WHERE id = $1
           AND user_id IS NULL`,
@@ -253,8 +269,10 @@ router.post('/pix', requireAuth, async (req, res) => {
     // Carrega a reserva + (opcional) usuário
     const r = await query(
       `SELECT r.id, r.user_id, r.draw_id, r.numbers, r.status, r.expires_at,
+              d.draw_type,
               u.email AS user_email, u.name AS user_name
          FROM reservations r
+         JOIN draws d ON d.id = r.draw_id
     LEFT JOIN users u ON u.id = r.user_id
         WHERE r.id = $1`,
       [reservationId]
@@ -262,6 +280,10 @@ router.post('/pix', requireAuth, async (req, res) => {
     if (!r.rows.length) return res.status(404).json({ error: 'reservation_not_found' });
 
     const rs = r.rows[0];
+
+    if (String(rs.draw_type || 'principal') !== 'principal') {
+      return res.status(404).json({ error: 'draw_not_found' });
+    }
 
     if (rs.status !== 'active') return res.status(400).json({ error: 'reservation_not_active' });
     if (new Date(rs.expires_at).getTime() < Date.now()) {
@@ -326,12 +348,12 @@ router.post('/pix', requireAuth, async (req, res) => {
 
     // Persiste o pagamento
     await query(
-      `INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64)
+      `INSERT INTO public.payments AS pay (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (id) DO UPDATE
          SET status = EXCLUDED.status,
-             qr_code = COALESCE(EXCLUDED.qr_code, payments.qr_code),
-             qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64)`,
+             qr_code = COALESCE(EXCLUDED.qr_code, pay.qr_code),
+             qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, pay.qr_code_base64)`,
       [
         String(id),
         rs.user_id || req.user.id,
@@ -345,7 +367,7 @@ router.post('/pix', requireAuth, async (req, res) => {
     );
 
     // Amarra a reserva ao pagamento (status segue 'active' até aprovar)
-    await query(`UPDATE reservations SET payment_id = $2 WHERE id = $1`, [reservationId, String(id)]);
+    await query(`UPDATE public.reservations SET payment_id = $2 WHERE id = $1`, [reservationId, String(id)]);
 
     return res.json({ paymentId: String(id), status, qr_code, qr_code_base64 });
   } catch (e) {
@@ -361,13 +383,16 @@ router.post('/pix', requireAuth, async (req, res) => {
 router.get('/:id/status', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    const mpPayment = getMercadoPagoPaymentClient();
+    if (!mpPayment) return res.status(503).json({ error: 'mp_token_missing' });
+
     const resp = await mpPayment.get({ id: String(id) });
     const body = resp?.body || resp;
 
-    await query(`UPDATE payments SET status = $2 WHERE id = $1`, [id, body.status]);
+    await query(`UPDATE public.payments SET status = $2 WHERE id = $1`, [id, body.status]);
 
     if (String(body.status).toLowerCase() === 'approved') {
-      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+      const pr = await query(`SELECT draw_id, numbers FROM public.payments WHERE id = $1`, [id]);
       if (pr.rows.length) {
         const { draw_id, numbers } = pr.rows[0];
 
@@ -415,6 +440,9 @@ router.post('/webhook', async (req, res) => {
     if (type && type !== 'payment') return res.sendStatus(200);
     if (!paymentId) return res.sendStatus(200);
 
+    const mpPayment = getMercadoPagoPaymentClient();
+    if (!mpPayment) return res.sendStatus(200);
+
     const resp = await mpPayment.get({ id: String(paymentId) });
     const body = resp?.body || resp;
 
@@ -422,7 +450,7 @@ router.post('/webhook', async (req, res) => {
     const status = body.status;
 
     await query(
-      `UPDATE payments
+      `UPDATE public.payments
           SET status = $2,
               paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
         WHERE id = $1`,
@@ -430,7 +458,7 @@ router.post('/webhook', async (req, res) => {
     );
 
     if (String(status).toLowerCase() === 'approved') {
-      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+      const pr = await query(`SELECT draw_id, numbers FROM public.payments WHERE id = $1`, [id]);
       if (pr.rows.length) {
         const { draw_id, numbers } = pr.rows[0];
 
@@ -480,7 +508,7 @@ router.get('/me', requireAuth, async (req, res) => {
               status,
               created_at,
               paid_at
-         FROM payments
+         FROM public.payments
         WHERE user_id = $1
         ORDER BY COALESCE(paid_at, created_at) ASC`,
       [req.user.id]
@@ -522,6 +550,9 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
     const paymentId = req.body?.id || req.body?.paymentId;
     if (!paymentId) return res.status(400).json({ error: 'missing_id' });
 
+    const mpPayment = getMercadoPagoPaymentClient();
+    if (!mpPayment) return res.status(503).json({ error: 'mp_token_missing' });
+
     const resp = await mpPayment.get({ id: String(paymentId) });
     const body = resp?.body || resp;
 
@@ -529,7 +560,7 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
     const status = String(body?.status || '').toLowerCase();
 
     await query(
-      `UPDATE payments
+      `UPDATE public.payments
           SET status = $2,
               paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
         WHERE id = $1`,
@@ -537,7 +568,7 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
     );
 
     if (status === 'approved') {
-      const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+        const pr = await query(`SELECT draw_id, numbers FROM public.payments WHERE id = $1`, [id]);
       if (pr.rows.length) {
         const { draw_id, numbers } = pr.rows[0];
         await settleApprovedPayment(id, draw_id, numbers);

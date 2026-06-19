@@ -17,7 +17,7 @@ function log(...a) {
  *
  * Agora:
  * - "sold" = quantidade de números vendidos APENAS por payments aprovados (approved/paid/pago)
- * - "remaining" = 100 - sold
+ * - "remaining" = total de números cadastrados - sold
  * Mantive também contagens da tabela numbers como campos auxiliares (debug).
  */
 router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
@@ -29,7 +29,10 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
       `SELECT id, opened_at
          FROM draws
         WHERE status = 'open'
-        ORDER BY id DESC
+          AND COALESCE(draw_type, 'principal') = 'principal'
+        ORDER BY opened_at DESC NULLS LAST,
+                 created_at DESC NULLS LAST,
+                 id DESC
         LIMIT 1`
     );
     const current = d.rows[0] || null;
@@ -39,6 +42,7 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
     if (!current?.id) {
       return res.json({
         draw_id: null,
+        total: 0,
         sold: 0,
         remaining: 0,
         price_cents,
@@ -62,14 +66,16 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
       nums AS (
         SELECT
           SUM(CASE WHEN status = 'sold'      THEN 1 ELSE 0 END)::int AS sold_numbers,
-          SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END)::int AS available_numbers
+          SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END)::int AS available_numbers,
+          COUNT(*)::int AS total_numbers
           FROM numbers
          WHERE draw_id = $1
       )
       SELECT
         (SELECT COUNT(*)::int FROM approved)        AS sold_by_payments,
         (SELECT sold_numbers       FROM nums)       AS sold_by_numbers,
-        (SELECT available_numbers  FROM nums)       AS available_by_numbers
+        (SELECT available_numbers  FROM nums)       AS available_by_numbers,
+        (SELECT total_numbers      FROM nums)       AS total_numbers
       `,
       [current.id]
     );
@@ -78,13 +84,15 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
     const sold_by_payments     = Number(row.sold_by_payments || 0);
     const sold_by_numbers      = Number(row.sold_by_numbers  || 0);
     const available_by_numbers = Number(row.available_by_numbers || 0);
+    const total = Number(row.total_numbers || 0);
 
     // contador exibido: somente aprovados
     const sold = sold_by_payments;
-    const remaining = Math.max(0, 100 - sold);
+    const remaining = Math.max(0, total - sold);
 
     return res.json({
       draw_id: current.id,
+      total,
       sold,
       remaining,
       price_cents,
@@ -182,13 +190,17 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
       `SELECT id
          FROM draws
         WHERE status = 'open'
-        ORDER BY id DESC
+          AND COALESCE(draw_type, 'principal') = 'principal'
+        ORDER BY opened_at DESC NULLS LAST,
+                 created_at DESC NULLS LAST,
+                 id DESC
         LIMIT 1`
     );
     const cur = d.rows[0];
     if (!cur?.id) {
       return res.json({
         draw_id: null,
+        total: 0,
         sold: 0,
         remaining: 100,
         buyers: [],
@@ -225,6 +237,7 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
       taken AS ( SELECT DISTINCT n FROM unn )
       SELECT
         (SELECT COUNT(*)::int FROM taken) AS sold_approved,
+        (SELECT COUNT(*)::int FROM numbers WHERE draw_id = $1) AS total_numbers,
         json_agg(
           json_build_object(
             'user_id', pu.user_id,
@@ -243,6 +256,7 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
     `;
     const agg = await query(sql, [cur.id]);
     const sold = Number(agg.rows[0]?.sold_approved || 0);
+    const total = Number(agg.rows[0]?.total_numbers || 0);
     const buyers = agg.rows[0]?.buyers_json || [];
 
     // Mapa número -> comprador
@@ -268,8 +282,9 @@ router.get("/open-buyers", requireAuth, requireAdmin, async (_req, res) => {
 
     return res.json({
       draw_id: cur.id,
+      total,
       sold,
-      remaining: Math.max(0, 100 - sold),
+      remaining: Math.max(0, total - sold),
       buyers,
       numbers: nums.rows || [],
     });

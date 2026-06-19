@@ -8,6 +8,7 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 // mpSaveCard({ customerId, card_token }) -> { cardId, brand, last4 }
 // mpChargeCard({ customerId, cardId, amount_cents, description, metadata }) -> { status, paymentId }
 import {
+  getMercadoPagoAccessToken,
   mpEnsureCustomer,
   mpSaveCard,
   mpChargeCard,
@@ -15,13 +16,6 @@ import {
 import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
 
 const router = express.Router();
-
-// ====== MP token (server) — aceita várias chaves de env para evitar quebra ======
-const MP_TOKEN =
-  process.env.MP_ACCESS_TOKEN ||
-  process.env.MERCADOPAGO_ACCESS_TOKEN ||
-  process.env.REACT_APP_MP_ACCESS_TOKEN ||
-  null;
 
 /* ------------------------------------------------------------------ *
  * Utils
@@ -186,9 +180,9 @@ router.post("/me/autopay", requireAuth, async (req, res) => {
     }
 
     // Se tentará salvar cartão mas o servidor não tem MP token, avisa claramente
-    if (card_token && !MP_TOKEN) {
+    if (card_token && !getMercadoPagoAccessToken()) {
       console.error("[autopay] missing MP_ACCESS_TOKEN on server");
-      return res.status(503).json({ error: "mp_not_configured" });
+      return res.status(503).json({ error: "mp_token_missing" });
     }
 
     await client.query("BEGIN");

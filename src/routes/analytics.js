@@ -31,54 +31,58 @@ router.get("/summary/:drawId", async (req, res) => {
     const sold = (await q(
       `SELECT SUM((status='sold')::int) AS sold,
               SUM((status='reserved')::int) AS reserved,
-              SUM((status='available')::int) AS available
+              SUM((status='available')::int) AS available,
+              COUNT(*)::int AS total
        FROM numbers WHERE draw_id=$1`,
       [drawId]
-    ))?.rows?.[0] || { sold: 0, reserved: 0, available: 0 };
+    ))?.rows?.[0] || { sold: 0, reserved: 0, available: 0, total: 0 };
 
     const paid = (await q(
       `SELECT COALESCE(SUM(amount_cents),0) AS gmv_cents,
               COALESCE(AVG(amount_cents),0) AS avg_ticket_cents,
               COUNT(*) AS paid_orders,
-              MAX(paid_at) AS last_paid_at
+              MAX(COALESCE(paid_at, created_at)) AS last_paid_at
        FROM payments WHERE draw_id=$1 AND lower(status) IN ('approved','paid','pago')`,
       [drawId]
     ))?.rows?.[0] || { gmv_cents: 0, avg_ticket_cents: 0, paid_orders: 0, last_paid_at: null };
 
     const expiredRes = (await q(
       `SELECT COUNT(*) AS expired_reservations
-         FROM reservations WHERE draw_id=$1 AND status='expired'`,
+         FROM reservations WHERE draw_id=$1 AND lower(status)='expired'`,
       [drawId]
     ))?.rows?.[0] || { expired_reservations: 0 };
 
     const expiredPays = (await q(
       `SELECT COUNT(*) AS expired_payments
-         FROM payments WHERE draw_id=$1 AND status='expired'`,
+         FROM payments WHERE draw_id=$1 AND lower(status)='expired'`,
       [drawId]
     ))?.rows?.[0] || { expired_payments: 0 };
 
     const hourDist = (await q(
-      `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
+      `SELECT EXTRACT(HOUR FROM (COALESCE(paid_at, created_at) AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*) AS paid
          FROM payments
-        WHERE lower(status) IN ('approved','paid','pago') AND paid_at IS NOT NULL AND draw_id=$1
+        WHERE lower(status) IN ('approved','paid','pago')
+          AND COALESCE(paid_at, created_at) IS NOT NULL
+          AND draw_id=$1
         GROUP BY 1 ORDER BY 1`,
       [drawId]
     ))?.rows ?? [];
 
     const numHeat = (await q(
-      `SELECT n.n::int AS n, COUNT(*)::int AS sold_count
-         FROM numbers n
-         JOIN reservations r ON r.id=n.reservation_id AND r.status='captured'
-         JOIN payments p ON p.id=r.payment_id AND lower(p.status) IN ('approved','paid','pago')
-        WHERE n.status='sold' AND n.draw_id=$1
-        GROUP BY n.n
-        ORDER BY n.n`,
+      `SELECT sold_number.n::int AS n, COUNT(*)::int AS sold_count
+         FROM payments p
+         CROSS JOIN LATERAL unnest(p.numbers) AS sold_number(n)
+        WHERE p.draw_id=$1
+          AND lower(p.status) IN ('approved','paid','pago')
+        GROUP BY sold_number.n
+        ORDER BY sold_number.n`,
       [drawId]
     ))?.rows ?? [];
 
     const soldCount = Number(sold?.sold || 0);
-    const fill_rate = soldCount ? Number((soldCount / 100).toFixed(2)) : 0;
+    const totalCount = Number(sold?.total || 0);
+    const fill_rate = totalCount > 0 ? Number((soldCount / totalCount).toFixed(4)) : 0;
 
     let velocity_to_close_minutes = null;
     if (draw.opened_at && draw.closed_at) {
@@ -88,7 +92,7 @@ router.get("/summary/:drawId", async (req, res) => {
     }
 
     let velocity_to_fill_minutes = null;
-    if (soldCount === 100 && draw.opened_at && paid.last_paid_at) {
+    if (totalCount > 0 && soldCount === totalCount && draw.opened_at && paid.last_paid_at) {
       velocity_to_fill_minutes = Math.round(
         (new Date(paid.last_paid_at).getTime() - new Date(draw.opened_at).getTime()) / 60000
       );
@@ -97,6 +101,7 @@ router.get("/summary/:drawId", async (req, res) => {
     res.json({
       draw,
       funnel: {
+        total: totalCount,
         available: Number(sold?.available || 0),
         reserved: Number(sold?.reserved || 0),
         sold: soldCount,
@@ -129,30 +134,50 @@ router.get("/draws-summary", async (_req, res) => {
   try {
     const { rows } = await q(
       `WITH sold_counts AS (
-         SELECT draw_id, SUM((status='sold')::int) AS sold
+         SELECT draw_id,
+                COUNT(*)::int AS total,
+                SUM((status='sold')::int) AS sold
          FROM numbers GROUP BY draw_id
        ),
        paid_gmv AS (
          SELECT draw_id,
-                SUM(amount_cents) AS gmv_cents,
-                AVG(amount_cents) AS avg_ticket_cents,
-                COUNT(*)          AS paid_orders
+                 SUM(amount_cents) AS gmv_cents,
+                 AVG(amount_cents) AS avg_ticket_cents,
+                 COUNT(*) AS paid_orders,
+                 COUNT(DISTINCT user_id)::int AS unique_buyers
            FROM payments
           WHERE lower(status) IN ('approved','paid','pago')
           GROUP BY draw_id
        )
-       SELECT d.id, d.status, d.opened_at, d.closed_at, d.realized_at, d.product_name,
+       SELECT d.id, d.status, d.draw_type, d.opened_at, d.closed_at, d.realized_at, d.product_name,
+              COALESCE(sc.total,0) AS total,
               sc.sold,
               COALESCE(pg.gmv_cents,0) AS gmv_cents,
               COALESCE(pg.avg_ticket_cents,0) AS avg_ticket_cents,
               COALESCE(pg.paid_orders,0) AS paid_orders,
-              ROUND(COALESCE(sc.sold,0)/100.0,2) AS fill_rate
+              ROUND(COALESCE(sc.sold,0)::numeric/NULLIF(COALESCE(sc.total,0),0),4) AS fill_rate
          FROM draws d
          LEFT JOIN sold_counts sc ON sc.draw_id=d.id
          LEFT JOIN paid_gmv     pg ON pg.draw_id=d.id
         ORDER BY d.id DESC`
     );
-    res.json(rows);
+    res.json(rows.map((row) => {
+      const fillRate = Number(row.fill_rate || 0);
+      return {
+        ...row,
+        id: Number(row.id),
+        total: Number(row.total || 0),
+        numbers_count: Number(row.total || 0),
+        sold: Number(row.sold || 0),
+        sold_numbers: Number(row.sold || 0),
+        gmv_cents: Number(row.gmv_cents || 0),
+        avg_ticket_cents: Number(row.avg_ticket_cents || 0),
+        average_ticket_cents: Number(row.avg_ticket_cents || 0),
+        paid_orders: Number(row.paid_orders || 0),
+        fill_rate: fillRate,
+        progress_percent: Number((fillRate * 100).toFixed(2)),
+      };
+    }));
   } catch (e) {
     console.error("[analytics/draws-summary]", e);
     res.status(500).json({ error: "Falha ao listar draws-summary" });
@@ -168,6 +193,7 @@ router.get("/funnel/:drawId", async (req, res) => {
   try {
     const { rows } = await q(
       `SELECT
+         COUNT(*)::int                    AS total,
          SUM((status='available')::int) AS available,
          SUM((status='reserved')::int)  AS reserved,
          SUM((status='sold')::int)      AS sold
@@ -175,7 +201,7 @@ router.get("/funnel/:drawId", async (req, res) => {
       WHERE draw_id=$1`,
       [drawId]
     );
-    res.json(rows?.[0] || { available: 0, reserved: 0, sold: 0 });
+    res.json(rows?.[0] || { total: 0, available: 0, reserved: 0, sold: 0 });
   } catch (e) {
     console.error("[analytics/funnel]", e);
     res.status(500).json({ error: "Falha ao obter funil" });
@@ -189,8 +215,8 @@ router.get("/leaks/daily", async (req, res) => {
   try {
     const paramsR = [days];
     const paramsP = [days];
-    let filterR = `WHERE status='expired' AND expires_at >= now() - ($1 || ' days')::interval`;
-    let filterP = `WHERE status='expired' AND created_at >= now() - ($1 || ' days')::interval`;
+    let filterR = `WHERE lower(status)='expired' AND expires_at >= now() - ($1 || ' days')::interval`;
+    let filterP = `WHERE lower(status)='expired' AND created_at >= now() - ($1 || ' days')::interval`;
     if (Number.isFinite(drawId)) {
       filterR += ` AND draw_id = $2`;
       filterP += ` AND draw_id = $2`;
@@ -268,7 +294,7 @@ router.get("/cohorts", async (_req, res) => {
   try {
     const { rows } = await q(
       `WITH first_paid AS (
-         SELECT user_id, MIN(paid_at) AS first_paid_at
+         SELECT user_id, MIN(COALESCE(paid_at, created_at)) AS first_paid_at
            FROM payments
           WHERE lower(status) IN ('approved','paid','pago')
           GROUP BY user_id
@@ -278,7 +304,7 @@ router.get("/cohorts", async (_req, res) => {
            FROM first_paid
        )
        SELECT c.cohort_month,
-              date_trunc('month', p.paid_at) AS month,
+              date_trunc('month', COALESCE(p.paid_at, p.created_at)) AS month,
               COUNT(DISTINCT p.user_id) AS active_buyers,
               SUM(p.amount_cents) AS gmv_cents
          FROM payments p
@@ -302,16 +328,22 @@ router.get("/numbers/soldcount/:drawId", async (req, res) => {
   if (!Number.isFinite(drawId)) return res.status(400).json({ error: "drawId inválido" });
   try {
     const { rows } = await q(
-      `SELECT n.n::int AS n, COUNT(*)::int AS sold_count
-         FROM numbers n
-         JOIN reservations r ON r.id=n.reservation_id AND r.status='captured'
-         JOIN payments p ON p.id=r.payment_id AND lower(p.status) IN ('approved','paid','pago')
-        WHERE n.status='sold' AND n.draw_id=$1
-        GROUP BY n.n
-        ORDER BY n.n`,
+      `SELECT sold_number.n::int AS n, COUNT(*)::int AS sold_count
+         FROM payments p
+         CROSS JOIN LATERAL unnest(p.numbers) AS sold_number(n)
+        WHERE p.draw_id=$1
+          AND lower(p.status) IN ('approved','paid','pago')
+        GROUP BY sold_number.n
+        ORDER BY sold_number.n`,
       [drawId]
     );
-    res.json(rows);
+    res.json(rows.map((row) => ({
+      ...row,
+      n: Number(row.n),
+      number: Number(row.n),
+      sold_count: Number(row.sold_count || 0),
+      frequency: Number(row.sold_count || 0),
+    })));
   } catch (e) {
     console.error("[analytics/numbers/soldcount]", e);
     res.status(500).json({ error: "Falha ao obter soldcount" });
@@ -321,18 +353,66 @@ router.get("/numbers/soldcount/:drawId", async (req, res) => {
 router.get("/numbers/favorites-by-user", async (_req, res) => {
   try {
     const { rows } = await q(
-      `SELECT u.id AS user_id, u.name, x.n::int, COUNT(*)::int AS times_bought
+      `SELECT u.id AS user_id,
+              u.name,
+              u.email,
+              x.n::int,
+              COUNT(*)::int AS times_bought,
+              MAX(COALESCE(p.paid_at, p.created_at)) AS last_payment_at
          FROM payments p
          JOIN users u ON u.id=p.user_id
          JOIN LATERAL unnest(p.numbers) AS x(n) ON true
         WHERE lower(p.status) IN ('approved','paid','pago')
-        GROUP BY u.id, u.name, x.n
+        GROUP BY u.id, u.name, u.email, x.n
         ORDER BY times_bought DESC, u.id ASC, x.n ASC`
     );
-    res.json(rows);
+    res.json(rows.map((row) => ({
+      ...row,
+      user_id: Number(row.user_id),
+      n: Number(row.n),
+      number: Number(row.n),
+      times_bought: Number(row.times_bought || 0),
+      frequency: Number(row.times_bought || 0),
+      numbers_count: Number(row.times_bought || 0),
+    })));
   } catch (e) {
     console.error("[analytics/numbers/favorites-by-user]", e);
     res.status(500).json({ error: "Falha ao obter favorites-by-user" });
+  }
+});
+
+router.get("/numbers/winning-frequency", async (_req, res) => {
+  try {
+    const { rows } = await q(
+      `WITH winners AS (
+         SELECT id,
+                winner_number::int AS number,
+                COALESCE(realized_at, closed_at, created_at) AS won_at
+           FROM public.draws
+          WHERE winner_number IS NOT NULL
+       )
+       SELECT number,
+              COUNT(*)::int AS wins,
+              ARRAY_AGG(id ORDER BY id)::int[] AS draws,
+              (ARRAY_AGG(id ORDER BY won_at DESC NULLS LAST, id DESC))[1]::int AS last_draw_id,
+              MAX(won_at) AS last_won_at
+         FROM winners
+        GROUP BY number
+        ORDER BY wins DESC, last_won_at DESC NULLS LAST`
+    );
+
+    res.json(rows.map((row) => ({
+      ...row,
+      number: Number(row.number),
+      wins: Number(row.wins || 0),
+      frequency: Number(row.wins || 0),
+      draws: Array.isArray(row.draws) ? row.draws.map(Number) : [],
+      draws_count: Number(row.wins || 0),
+      last_draw_id: row.last_draw_id === null ? null : Number(row.last_draw_id),
+    })));
+  } catch (e) {
+    console.error("[analytics/numbers/winning-frequency]", e);
+    res.status(500).json({ error: "Falha ao obter winning-frequency" });
   }
 });
 
@@ -342,22 +422,65 @@ router.get("/numbers/favorites-by-user", async (_req, res) => {
 router.get("/coupons/efficacy", async (_req, res) => {
   try {
     const { rows } = await q(
-      `WITH enriched AS (
-         SELECT p.*, u.coupon_code, u.coupon_value_cents, u.coupon_updated_at
-           FROM payments p
-           JOIN users u ON u.id=p.user_id
-          WHERE lower(p.status) IN ('approved','paid','pago','expired','pending','processing')
-       )
-       SELECT coupon_code,
-              COUNT(*) FILTER (WHERE lower(status) IN ('approved','paid','pago'))::float / NULLIF(COUNT(*),0) AS pay_rate,
-              SUM(amount_cents) FILTER (WHERE lower(status) IN ('approved','paid','pago')) AS gmv_cents,
-              AVG(amount_cents) FILTER (WHERE lower(status) IN ('approved','paid','pago')) AS avg_ticket_cents,
-              AVG(coupon_value_cents) AS avg_coupon_cents
-         FROM enriched
-        GROUP BY coupon_code
+      `SELECT u.id AS user_id,
+              COALESCE(NULLIF(u.name, ''), '-') AS name,
+              COALESCE(NULLIF(u.email, ''), '-') AS email,
+              u.coupon_code,
+              COALESCE(sync.tray_coupon_id, u.tray_coupon_id) AS tray_coupon_id,
+              sync.tray_sync_status,
+              COUNT(p.id)::int AS total_orders,
+              COUNT(p.id) FILTER (
+                WHERE lower(p.status) IN ('approved','paid','pago')
+              )::int AS paid_orders,
+              COALESCE(
+                COUNT(p.id) FILTER (
+                  WHERE lower(p.status) IN ('approved','paid','pago')
+                )::float / NULLIF(COUNT(p.id),0),
+                0
+              ) AS pay_rate,
+              COALESCE(SUM(p.amount_cents) FILTER (
+                WHERE lower(p.status) IN ('approved','paid','pago')
+              ),0)::bigint AS gmv_cents,
+              COALESCE(AVG(p.amount_cents) FILTER (
+                WHERE lower(p.status) IN ('approved','paid','pago')
+              ),0) AS avg_ticket_cents,
+              u.coupon_value_cents,
+              u.coupon_value_cents AS avg_coupon_cents,
+              u.coupon_updated_at,
+              MAX(COALESCE(p.paid_at, p.created_at)) FILTER (
+                WHERE lower(p.status) IN ('approved','paid','pago')
+              ) AS last_payment_at
+         FROM public.users u
+         LEFT JOIN public.payments p
+           ON p.user_id=u.id
+          AND lower(p.status) IN ('approved','paid','pago','expired','pending','processing')
+         LEFT JOIN LATERAL (
+           SELECT c.tray_coupon_id, c.tray_sync_status
+             FROM public.coupon_tray_sync c
+            WHERE c.user_id=u.id
+            ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC NULLS LAST
+            LIMIT 1
+         ) sync ON true
+        WHERE u.coupon_code IS NOT NULL
+           OR u.tray_coupon_id IS NOT NULL
+           OR sync.tray_coupon_id IS NOT NULL
+        GROUP BY u.id, u.name, u.email, u.coupon_code,
+                 u.tray_coupon_id, sync.tray_coupon_id, sync.tray_sync_status,
+                 u.coupon_value_cents, u.coupon_updated_at
         ORDER BY gmv_cents DESC NULLS LAST`
     );
-    res.json(rows);
+    res.json(rows.map((row) => ({
+      ...row,
+      user_id: Number(row.user_id),
+      total_orders: Number(row.total_orders || 0),
+      paid_orders: Number(row.paid_orders || 0),
+      pay_rate: Number(row.pay_rate || 0),
+      gmv_cents: Number(row.gmv_cents || 0),
+      avg_ticket_cents: Number(row.avg_ticket_cents || 0),
+      average_ticket_cents: Number(row.avg_ticket_cents || 0),
+      coupon_value_cents: Number(row.coupon_value_cents || 0),
+      avg_coupon_cents: Number(row.avg_coupon_cents || 0),
+    })));
   } catch (e) {
     console.error("[analytics/coupons/efficacy]", e);
     res.status(500).json({ error: "Falha ao obter coupons/efficacy" });
@@ -372,8 +495,8 @@ router.get("/autopay/stats", async (_req, res) => {
     const { rows: daily } = await q(
       `SELECT date_trunc('day', created_at) AS day,
               COUNT(*)::int AS runs,
-              SUM((status='ok')::int)::int AS ok_runs,
-              COALESCE(SUM(amount_cents),0)::bigint AS gmv_cents
+              SUM((lower(status) IN ('ok','charged_ok'))::int)::int AS ok_runs,
+              COALESCE(SUM(amount_cents) FILTER (WHERE lower(status) IN ('ok','charged_ok')),0)::bigint AS gmv_cents
          FROM autopay_runs
         GROUP BY 1
         ORDER BY 1 DESC`
@@ -399,13 +522,13 @@ router.get("/payments/hourly", async (req, res) => {
   const drawId = req.query.drawId ? Number(req.query.drawId) : null;
   try {
     const params = [];
-    let filter = `WHERE lower(status) IN ('approved','paid','pago') AND paid_at IS NOT NULL`;
+    let filter = `WHERE lower(status) IN ('approved','paid','pago') AND COALESCE(paid_at, created_at) IS NOT NULL`;
     if (Number.isFinite(drawId)) {
       filter += ` AND draw_id=$1`;
       params.push(drawId);
     }
     const { rows } = await q(
-      `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
+      `SELECT EXTRACT(HOUR FROM (COALESCE(paid_at, created_at) AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*)::int AS paid
          FROM payments
        ${filter}
@@ -473,7 +596,7 @@ router.get("/payments/latency", async (req, res) => {
 router.get("/draws", async (_req, res) => {
   try {
     const { rows } = await q(
-      `SELECT id, product_name, status, opened_at, closed_at
+      `SELECT id, product_name, status, draw_type, opened_at, closed_at
          FROM draws
         ORDER BY id DESC
         LIMIT 200`
@@ -495,12 +618,21 @@ router.get("/kpis/overview", async (_req, res) => {
     // Totais pagos
     const totals = (await q(
       `WITH paid AS (
-         SELECT user_id, amount_cents
+         SELECT user_id, amount_cents, COALESCE(paid_at, created_at) AS financial_at
          FROM payments
          WHERE lower(status) IN ('approved','paid','pago')
        )
        SELECT
          COALESCE(SUM(amount_cents),0)::bigint                 AS total_gmv_cents,
+         COALESCE(SUM(amount_cents) FILTER (
+           WHERE financial_at >= now() - interval '30 days'
+         ),0)::bigint                                          AS gmv_30d_cents,
+         COALESCE(SUM(amount_cents) FILTER (
+           WHERE financial_at >= date_trunc('month', now())
+         ),0)::bigint                                          AS gmv_current_month_cents,
+         COALESCE(SUM(amount_cents) FILTER (
+           WHERE financial_at >= date_trunc('year', now())
+         ),0)::bigint                                          AS gmv_current_year_cents,
          COUNT(*)::int                                         AS total_orders,
          COUNT(DISTINCT user_id)::int                          AS unique_buyers,
          COALESCE(AVG(amount_cents),0)::bigint                 AS avg_ticket_cents
@@ -521,20 +653,22 @@ router.get("/kpis/overview", async (_req, res) => {
 
     // Últimos 30 dias: GMV & pedidos/dia
     const daily30 = (await q(
-      `SELECT date_trunc('day', paid_at) AS day,
+      `SELECT date_trunc('day', COALESCE(paid_at, created_at)) AS day,
               SUM(amount_cents)::bigint  AS gmv_cents,
               COUNT(*)::int              AS orders
          FROM payments
-        WHERE lower(status) IN ('approved','paid','pago') AND paid_at >= now() - interval '30 days'
+        WHERE lower(status) IN ('approved','paid','pago')
+          AND COALESCE(paid_at, created_at) >= now() - interval '30 days'
         GROUP BY 1 ORDER BY 1`
     ))?.rows ?? [];
 
     // Distribuição por hora (BR)
     const hourly = (await q(
-      `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
+      `SELECT EXTRACT(HOUR FROM (COALESCE(paid_at, created_at) AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*)::int AS paid
          FROM payments
-        WHERE lower(status) IN ('approved','paid','pago') AND paid_at IS NOT NULL
+        WHERE lower(status) IN ('approved','paid','pago')
+          AND COALESCE(paid_at, created_at) IS NOT NULL
         GROUP BY 1 ORDER BY 1`
     ))?.rows ?? [];
 
@@ -542,7 +676,11 @@ router.get("/kpis/overview", async (_req, res) => {
     const topBuyers = (await q(
       `SELECT u.id, u.name, u.email,
               SUM(p.amount_cents)::bigint AS gmv_cents,
-              COUNT(*)::int               AS orders
+              COUNT(*)::int AS orders,
+              COUNT(*)::int AS paid_orders,
+              COALESCE(AVG(p.amount_cents),0) AS average_ticket_cents,
+              COALESCE(SUM(cardinality(p.numbers)),0)::int AS numbers_count,
+              MAX(COALESCE(p.paid_at, p.created_at)) AS last_payment_at
          FROM payments p
          JOIN users u ON u.id=p.user_id
         WHERE lower(p.status) IN ('approved','paid','pago')
@@ -553,12 +691,15 @@ router.get("/kpis/overview", async (_req, res) => {
 
     // Top sorteios por GMV (usa pagamentos)
     const topDraws = (await q(
-      `SELECT d.id, d.product_name, d.status,
+      `SELECT d.id, d.product_name, d.status, d.draw_type,
               COALESCE(SUM(p.amount_cents),0)::bigint AS gmv_cents,
-              COUNT(p.*)::int                         AS paid_orders
+              COUNT(p.*)::int AS paid_orders,
+              COUNT(DISTINCT p.user_id)::int AS unique_buyers,
+              COALESCE(AVG(p.amount_cents),0) AS average_ticket_cents,
+              (SELECT COUNT(*)::int FROM numbers n WHERE n.draw_id=d.id) AS numbers_count
          FROM draws d
          LEFT JOIN payments p ON p.draw_id=d.id AND lower(p.status) IN ('approved','paid','pago')
-        GROUP BY d.id, d.product_name, d.status
+        GROUP BY d.id, d.product_name, d.status, d.draw_type
         ORDER BY gmv_cents DESC
         LIMIT 20`
     ))?.rows ?? [];
@@ -577,15 +718,39 @@ router.get("/kpis/overview", async (_req, res) => {
     res.json({
       totals: {
         total_gmv_cents: Number(totals.total_gmv_cents || 0),
+        gmv_all_time_cents: Number(totals.total_gmv_cents || 0),
+        gmv_30d_cents: Number(totals.gmv_30d_cents || 0),
+        gmv_current_month_cents: Number(totals.gmv_current_month_cents || 0),
+        gmv_current_year_cents: Number(totals.gmv_current_year_cents || 0),
         total_orders: Number(totals.total_orders || 0),
         unique_buyers: Number(totals.unique_buyers || 0),
         avg_ticket_cents: Number(totals.avg_ticket_cents || 0),
         avg_orders_per_buyer: Number(avgOrdersPerBuyer || 0)
       },
-      daily30,
+      daily30: daily30.map((row) => ({
+        ...row,
+        gmv_cents: Number(row.gmv_cents || 0),
+        orders: Number(row.orders || 0),
+      })),
       hourly,
-      topBuyers,
-      topDraws,
+      topBuyers: topBuyers.map((row) => ({
+        ...row,
+        id: Number(row.id),
+        gmv_cents: Number(row.gmv_cents || 0),
+        orders: Number(row.orders || 0),
+        paid_orders: Number(row.paid_orders || 0),
+        average_ticket_cents: Number(row.average_ticket_cents || 0),
+        numbers_count: Number(row.numbers_count || 0),
+      })),
+      topDraws: topDraws.map((row) => ({
+        ...row,
+        id: Number(row.id),
+        gmv_cents: Number(row.gmv_cents || 0),
+        paid_orders: Number(row.paid_orders || 0),
+        unique_buyers: Number(row.unique_buyers || 0),
+        average_ticket_cents: Number(row.average_ticket_cents || 0),
+        numbers_count: Number(row.numbers_count || 0),
+      })),
       quantiles
     });
   } catch (e) {
@@ -599,11 +764,12 @@ router.get("/sales/daily", async (req, res) => {
   const days = Math.min(Number(req.query.days) || 90, 365);
   try {
     const rows = (await q(
-      `SELECT date_trunc('day', paid_at) AS day,
+      `SELECT date_trunc('day', COALESCE(paid_at, created_at)) AS day,
               SUM(amount_cents)::bigint  AS gmv_cents,
               COUNT(*)::int              AS orders
          FROM payments
-        WHERE lower(status) IN ('approved','paid','pago') AND paid_at >= now() - ($1 || ' days')::interval
+        WHERE lower(status) IN ('approved','paid','pago')
+          AND COALESCE(paid_at, created_at) >= now() - ($1 || ' days')::interval
         GROUP BY 1 ORDER BY 1`,
       [days]
     ))?.rows ?? [];
@@ -621,7 +787,11 @@ router.get("/buyers/top", async (req, res) => {
     const rows = (await q(
       `SELECT u.id, u.name, u.email, u.phone,
               SUM(p.amount_cents)::bigint AS gmv_cents,
-              COUNT(*)::int               AS orders
+              COUNT(*)::int AS orders,
+              COUNT(*)::int AS paid_orders,
+              COALESCE(AVG(p.amount_cents),0) AS average_ticket_cents,
+              COALESCE(SUM(cardinality(p.numbers)),0)::int AS numbers_count,
+              MAX(COALESCE(p.paid_at, p.created_at)) AS last_payment_at
          FROM payments p
          JOIN users u ON u.id=p.user_id
         WHERE lower(p.status) IN ('approved','paid','pago')
@@ -630,7 +800,15 @@ router.get("/buyers/top", async (req, res) => {
         LIMIT $1`,
       [limit]
     ))?.rows ?? [];
-    res.json(rows);
+    res.json(rows.map((row) => ({
+      ...row,
+      id: Number(row.id),
+      gmv_cents: Number(row.gmv_cents || 0),
+      orders: Number(row.orders || 0),
+      paid_orders: Number(row.paid_orders || 0),
+      average_ticket_cents: Number(row.average_ticket_cents || 0),
+      numbers_count: Number(row.numbers_count || 0),
+    })));
   } catch (e) {
     console.error("[analytics/buyers/top]", e);
     res.status(500).json({ error: "Falha ao obter top compradores" });
@@ -643,21 +821,28 @@ router.get("/draws/leaderboard", async (req, res) => {
   try {
     const rows = (await q(
       `WITH sold_counts AS (
-         SELECT draw_id, SUM((status='sold')::int) AS sold
+         SELECT draw_id,
+                COUNT(*)::int AS total,
+                SUM((status='sold')::int) AS sold
          FROM numbers GROUP BY draw_id
        ),
        paid_gmv AS (
          SELECT draw_id,
-                SUM(amount_cents) AS gmv_cents,
+                SUM(amount_cents)::bigint AS gmv_cents,
                 AVG(amount_cents) AS avg_ticket_cents,
-                COUNT(*)          AS paid_orders
+                COUNT(*)::int AS paid_orders,
+                COUNT(DISTINCT user_id)::int AS unique_buyers
          FROM payments WHERE lower(status) IN ('approved','paid','pago') GROUP BY draw_id
        )
-       SELECT d.id, d.product_name, d.status,
+       SELECT d.id, d.product_name, d.status, d.draw_type,
+              COALESCE(sc.total,0) AS total,
               COALESCE(sc.sold,0) AS sold,
               COALESCE(pg.gmv_cents,0) AS gmv_cents,
+              COALESCE(pg.avg_ticket_cents,0) AS avg_ticket_cents,
               COALESCE(pg.paid_orders,0) AS paid_orders,
-              ROUND(COALESCE(sc.sold,0)/100.0,2) AS fill_rate
+              COALESCE(pg.unique_buyers,0) AS unique_buyers,
+              COALESCE(pg.unique_buyers,0) AS unique_buyers,
+              ROUND(COALESCE(sc.sold,0)::numeric/NULLIF(COALESCE(sc.total,0),0),4) AS fill_rate
        FROM draws d
        LEFT JOIN sold_counts sc ON sc.draw_id=d.id
        LEFT JOIN paid_gmv    pg ON pg.draw_id=d.id
@@ -665,10 +850,371 @@ router.get("/draws/leaderboard", async (req, res) => {
        LIMIT $1`,
       [limit]
     ))?.rows ?? [];
-    res.json(rows);
+    res.json(rows.map((row) => {
+      const fillRate = Number(row.fill_rate || 0);
+      return {
+        ...row,
+        id: Number(row.id),
+        total: Number(row.total || 0),
+        numbers_count: Number(row.total || 0),
+        sold: Number(row.sold || 0),
+        sold_numbers: Number(row.sold || 0),
+        gmv_cents: Number(row.gmv_cents || 0),
+        avg_ticket_cents: Number(row.avg_ticket_cents || 0),
+        average_ticket_cents: Number(row.avg_ticket_cents || 0),
+        paid_orders: Number(row.paid_orders || 0),
+        unique_buyers: Number(row.unique_buyers || 0),
+        unique_buyers: Number(row.unique_buyers || 0),
+        fill_rate: fillRate,
+        progress_percent: Number((fillRate * 100).toFixed(2)),
+      };
+    }));
   } catch (e) {
     console.error("[analytics/draws/leaderboard]", e);
     res.status(500).json({ error: "Falha ao obter leaderboard de sorteios" });
+  }
+});
+
+/* ============================================================================
+ * DASHBOARD KPI CONSOLIDADO
+ * ============================================================================ */
+router.get("/kpi-dashboard", async (_req, res) => {
+  try {
+    const [
+      summaryResult,
+      currentDrawResult,
+      monthlyResult,
+      dailyResult,
+      rankingResult,
+      topBuyersResult,
+      qualityResult,
+      duplicateNumbersResult,
+    ] = await Promise.all([
+      q(
+        `WITH paid AS (
+           SELECT user_id,
+                  amount_cents,
+                  COALESCE(paid_at, created_at) AS financial_at
+             FROM public.payments
+            WHERE lower(status) IN ('approved','paid','pago')
+         )
+         SELECT
+           COALESCE(SUM(amount_cents) FILTER (
+             WHERE financial_at >= now() - interval '30 days'
+           ),0)::bigint AS gmv_30d_cents,
+           COALESCE(SUM(amount_cents),0)::bigint AS gmv_all_time_cents,
+           COALESCE(SUM(amount_cents) FILTER (
+             WHERE financial_at >= date_trunc('month', now())
+           ),0)::bigint AS gmv_current_month_cents,
+           COALESCE(SUM(amount_cents) FILTER (
+             WHERE financial_at >= date_trunc('year', now())
+           ),0)::bigint AS gmv_current_year_cents,
+           COUNT(*) FILTER (
+             WHERE financial_at >= now() - interval '30 days'
+           )::int AS paid_orders_30d,
+           COUNT(*)::int AS paid_orders_all_time,
+           COUNT(DISTINCT user_id)::int AS unique_buyers_all_time,
+           COALESCE(AVG(amount_cents),0)::bigint AS average_ticket_cents
+         FROM paid`
+      ),
+      q(
+        `WITH current_draw AS (
+           SELECT id, status, draw_type, product_name, opened_at, closed_at, created_at
+             FROM public.draws
+            WHERE status = 'open'
+              AND COALESCE(draw_type, 'principal') = 'principal'
+            ORDER BY opened_at DESC NULLS LAST,
+                     created_at DESC NULLS LAST,
+                     id DESC
+            LIMIT 1
+         ),
+         number_stats AS (
+           SELECT n.draw_id,
+                  COUNT(*)::int AS total_numbers,
+                  COUNT(*) FILTER (WHERE lower(n.status)='sold')::int AS sold_numbers,
+                  COUNT(*) FILTER (WHERE lower(n.status)='reserved')::int AS reserved_numbers,
+                  COUNT(*) FILTER (WHERE lower(n.status)='available')::int AS available_numbers
+             FROM public.numbers n
+             JOIN current_draw d ON d.id=n.draw_id
+            GROUP BY n.draw_id
+         ),
+         payment_stats AS (
+           SELECT p.draw_id,
+                  COALESCE(SUM(p.amount_cents),0)::bigint AS gmv_cents,
+                  COUNT(*)::int AS paid_orders,
+                  COUNT(DISTINCT p.user_id)::int AS unique_buyers
+             FROM public.payments p
+             JOIN current_draw d ON d.id=p.draw_id
+            WHERE lower(p.status) IN ('approved','paid','pago')
+            GROUP BY p.draw_id
+         )
+         SELECT d.id,
+                d.status,
+                COALESCE(d.draw_type, 'principal') AS draw_type,
+                d.product_name,
+                d.opened_at,
+                d.closed_at,
+                d.created_at,
+                COALESCE(ns.total_numbers,0)::int AS total_numbers,
+                COALESCE(ns.sold_numbers,0)::int AS sold_numbers,
+                COALESCE(ns.reserved_numbers,0)::int AS reserved_numbers,
+                COALESCE(ns.available_numbers,0)::int AS available_numbers,
+                ROUND(
+                  COALESCE(ns.sold_numbers,0)::numeric /
+                  NULLIF(COALESCE(ns.total_numbers,0),0),
+                  4
+                ) AS fill_rate,
+                COALESCE(ps.gmv_cents,0)::bigint AS gmv_cents,
+                COALESCE(ps.paid_orders,0)::int AS paid_orders,
+                COALESCE(ps.unique_buyers,0)::int AS unique_buyers
+           FROM current_draw d
+           LEFT JOIN number_stats ns ON ns.draw_id=d.id
+           LEFT JOIN payment_stats ps ON ps.draw_id=d.id`
+      ),
+      q(
+        `WITH paid AS (
+           SELECT amount_cents,
+                  COALESCE(paid_at, created_at) AS financial_at
+             FROM public.payments
+            WHERE lower(status) IN ('approved','paid','pago')
+         )
+         SELECT date_trunc('month', financial_at) AS month,
+                COALESCE(SUM(amount_cents),0)::bigint AS gmv_cents,
+                COUNT(*)::int AS paid_orders
+           FROM paid
+          WHERE financial_at IS NOT NULL
+          GROUP BY 1
+          ORDER BY 1`
+      ),
+      q(
+        `WITH days AS (
+           SELECT generate_series(
+             date_trunc('day', now()) - interval '29 days',
+             date_trunc('day', now()),
+             interval '1 day'
+           ) AS day
+         ),
+         paid AS (
+           SELECT date_trunc('day', COALESCE(paid_at, created_at)) AS day,
+                  SUM(amount_cents)::bigint AS gmv_cents,
+                  COUNT(*)::int AS paid_orders
+             FROM public.payments
+            WHERE lower(status) IN ('approved','paid','pago')
+              AND COALESCE(paid_at, created_at) >= date_trunc('day', now()) - interval '29 days'
+            GROUP BY 1
+         )
+         SELECT d.day,
+                COALESCE(p.gmv_cents,0)::bigint AS gmv_cents,
+                COALESCE(p.paid_orders,0)::int AS paid_orders
+           FROM days d
+           LEFT JOIN paid p ON p.day=d.day
+          ORDER BY d.day`
+      ),
+      q(
+        `WITH number_stats AS (
+           SELECT draw_id,
+                  COUNT(*)::int AS total_numbers,
+                  COUNT(*) FILTER (WHERE lower(status)='sold')::int AS sold_numbers
+             FROM public.numbers
+            GROUP BY draw_id
+         ),
+         payment_stats AS (
+           SELECT draw_id,
+                  COALESCE(SUM(amount_cents),0)::bigint AS gmv_cents,
+                  COUNT(*)::int AS paid_orders,
+                  COUNT(DISTINCT user_id)::int AS unique_buyers,
+                  COALESCE(AVG(amount_cents),0) AS average_ticket_cents
+             FROM public.payments
+            WHERE lower(status) IN ('approved','paid','pago')
+            GROUP BY draw_id
+         )
+         SELECT d.id AS draw_id,
+                d.product_name,
+                d.status,
+                COALESCE(d.draw_type, 'principal') AS draw_type,
+                COALESCE(ns.total_numbers,0)::int AS total_numbers,
+                COALESCE(ns.sold_numbers,0)::int AS sold_numbers,
+                ROUND(
+                  COALESCE(ns.sold_numbers,0)::numeric /
+                  NULLIF(COALESCE(ns.total_numbers,0),0),
+                  4
+                ) AS fill_rate,
+                COALESCE(ps.gmv_cents,0)::bigint AS gmv_cents,
+                COALESCE(ps.paid_orders,0)::int AS paid_orders,
+                COALESCE(ps.unique_buyers,0)::int AS unique_buyers,
+                COALESCE(ps.average_ticket_cents,0) AS average_ticket_cents
+           FROM public.draws d
+           LEFT JOIN number_stats ns ON ns.draw_id=d.id
+           LEFT JOIN payment_stats ps ON ps.draw_id=d.id
+          WHERE COALESCE(d.draw_type, 'principal') = 'principal'
+          ORDER BY gmv_cents DESC, d.id DESC
+          LIMIT 20`
+      ),
+      q(
+        `SELECT u.id AS user_id,
+                u.name,
+                u.email,
+                 COUNT(*)::int AS paid_orders,
+                 SUM(p.amount_cents)::bigint AS gmv_cents,
+                 AVG(p.amount_cents)::bigint AS average_ticket_cents,
+                 COALESCE(SUM(cardinality(p.numbers)),0)::int AS numbers_count,
+                 MAX(COALESCE(p.paid_at, p.created_at)) AS last_payment_at
+           FROM public.payments p
+           JOIN public.users u ON u.id=p.user_id
+          WHERE lower(p.status) IN ('approved','paid','pago')
+          GROUP BY u.id, u.name, u.email
+          ORDER BY gmv_cents DESC
+          LIMIT 20`
+      ),
+      q(
+        `SELECT
+           COUNT(*) FILTER (
+             WHERE COALESCE(paid_at, created_at) IS NULL
+           )::int AS missing_financial_date,
+           COUNT(*) FILTER (
+             WHERE amount_cents IS NULL OR amount_cents <= 0
+           )::int AS nonpositive_amount,
+           COUNT(*) FILTER (WHERE user_id IS NULL)::int AS missing_user,
+           COUNT(*) FILTER (WHERE draw_id IS NULL)::int AS missing_draw
+         FROM public.payments
+         WHERE lower(status) IN ('approved','paid','pago')`
+      ),
+      q(
+        `SELECT COUNT(*)::int AS duplicate_number_groups
+           FROM (
+             SELECT p.draw_id, paid_number.n
+               FROM public.payments p
+               CROSS JOIN LATERAL unnest(p.numbers) AS paid_number(n)
+              WHERE lower(p.status) IN ('approved','paid','pago')
+              GROUP BY p.draw_id, paid_number.n
+             HAVING COUNT(*) > 1
+           ) duplicated`
+      ),
+    ]);
+
+    const rawSummary = summaryResult.rows?.[0] || {};
+    const rawCurrentDraw = currentDrawResult.rows?.[0] || null;
+    const quality = qualityResult.rows?.[0] || {};
+    const duplicateNumberGroups = Number(
+      duplicateNumbersResult.rows?.[0]?.duplicate_number_groups || 0
+    );
+
+    const dataQuality = [
+      {
+        key: "approved_payments_missing_financial_date",
+        count: Number(quality.missing_financial_date || 0),
+      },
+      {
+        key: "approved_payments_nonpositive_amount",
+        count: Number(quality.nonpositive_amount || 0),
+      },
+      {
+        key: "approved_payments_missing_user",
+        count: Number(quality.missing_user || 0),
+      },
+      {
+        key: "approved_payments_missing_draw",
+        count: Number(quality.missing_draw || 0),
+      },
+      {
+        key: "duplicate_approved_number_groups",
+        count: duplicateNumberGroups,
+      },
+    ].map((item) => ({ ...item, status: item.count > 0 ? "warning" : "ok" }));
+
+    const alerts = [];
+    if (!rawCurrentDraw) {
+      alerts.push({
+        code: "NO_OPEN_PRINCIPAL_DRAW",
+        severity: "warning",
+        message: "Nenhum sorteio principal aberto foi encontrado.",
+      });
+    } else if (Number(rawCurrentDraw.total_numbers || 0) === 0) {
+      alerts.push({
+        code: "CURRENT_DRAW_WITHOUT_NUMBERS",
+        severity: "warning",
+        message: "O sorteio principal aberto não possui números cadastrados.",
+      });
+    }
+    if (duplicateNumberGroups > 0) {
+      alerts.push({
+        code: "DUPLICATE_APPROVED_NUMBERS",
+        severity: "warning",
+        count: duplicateNumberGroups,
+        message: "Existem números presentes em mais de um pagamento final no mesmo sorteio.",
+      });
+    }
+
+    const currentDraw = rawCurrentDraw
+      ? {
+          ...rawCurrentDraw,
+          id: Number(rawCurrentDraw.id),
+          total_numbers: Number(rawCurrentDraw.total_numbers || 0),
+          numbers_count: Number(rawCurrentDraw.total_numbers || 0),
+          sold_numbers: Number(rawCurrentDraw.sold_numbers || 0),
+          reserved_numbers: Number(rawCurrentDraw.reserved_numbers || 0),
+          available_numbers: Number(rawCurrentDraw.available_numbers || 0),
+          fill_rate: Number(rawCurrentDraw.fill_rate || 0),
+          progress_percent: Number((Number(rawCurrentDraw.fill_rate || 0) * 100).toFixed(2)),
+          gmv_cents: Number(rawCurrentDraw.gmv_cents || 0),
+          paid_orders: Number(rawCurrentDraw.paid_orders || 0),
+          unique_buyers: Number(rawCurrentDraw.unique_buyers || 0),
+        }
+      : {};
+
+    return res.json({
+      summary: {
+        gmv_30d_cents: Number(rawSummary.gmv_30d_cents || 0),
+        gmv_all_time_cents: Number(rawSummary.gmv_all_time_cents || 0),
+        gmv_current_month_cents: Number(rawSummary.gmv_current_month_cents || 0),
+        gmv_current_year_cents: Number(rawSummary.gmv_current_year_cents || 0),
+        paid_orders_30d: Number(rawSummary.paid_orders_30d || 0),
+        paid_orders_all_time: Number(rawSummary.paid_orders_all_time || 0),
+        unique_buyers_all_time: Number(rawSummary.unique_buyers_all_time || 0),
+        average_ticket_cents: Number(rawSummary.average_ticket_cents || 0),
+      },
+      current_draw: currentDraw,
+      monthly_gmv: (monthlyResult.rows || []).map((row) => ({
+        ...row,
+        gmv_cents: Number(row.gmv_cents || 0),
+        paid_orders: Number(row.paid_orders || 0),
+      })),
+      daily_gmv: (dailyResult.rows || []).map((row) => ({
+        ...row,
+        gmv_cents: Number(row.gmv_cents || 0),
+        paid_orders: Number(row.paid_orders || 0),
+      })),
+      draw_ranking: (rankingResult.rows || []).map((row) => ({
+        ...row,
+        draw_id: Number(row.draw_id),
+        total_numbers: Number(row.total_numbers || 0),
+        numbers_count: Number(row.total_numbers || 0),
+        sold_numbers: Number(row.sold_numbers || 0),
+        fill_rate: Number(row.fill_rate || 0),
+        progress_percent: Number((Number(row.fill_rate || 0) * 100).toFixed(2)),
+        gmv_cents: Number(row.gmv_cents || 0),
+        paid_orders: Number(row.paid_orders || 0),
+        unique_buyers: Number(row.unique_buyers || 0),
+        average_ticket_cents: Number(row.average_ticket_cents || 0),
+      })),
+      top_buyers: (topBuyersResult.rows || []).map((row) => ({
+        ...row,
+        user_id: Number(row.user_id),
+        paid_orders: Number(row.paid_orders || 0),
+        gmv_cents: Number(row.gmv_cents || 0),
+        average_ticket_cents: Number(row.average_ticket_cents || 0),
+        numbers_count: Number(row.numbers_count || 0),
+      })),
+      alerts,
+      data_quality: dataQuality,
+      gmv_basis: {
+        statuses: ["approved", "paid", "pago"],
+        financial_date: "COALESCE(paid_at, created_at)",
+      },
+    });
+  } catch (e) {
+    console.error("[analytics/kpi-dashboard]", e);
+    return res.status(500).json({ error: "Falha ao obter kpi-dashboard" });
   }
 });
 
@@ -681,15 +1227,31 @@ router.get("/overview", async (req, res) => {
     const totalsRow = (await q(
       `SELECT
          COALESCE(SUM(CASE WHEN lower(status) IN ('approved','paid','pago') THEN amount_cents END),0)         AS gmv_paid_cents,
+         COALESCE(SUM(amount_cents) FILTER (
+           WHERE lower(status) IN ('approved','paid','pago')
+             AND COALESCE(paid_at, created_at) >= now() - interval '30 days'
+         ),0) AS gmv_30d_cents,
+         COALESCE(SUM(amount_cents) FILTER (
+           WHERE lower(status) IN ('approved','paid','pago')
+             AND COALESCE(paid_at, created_at) >= date_trunc('month', now())
+         ),0) AS gmv_current_month_cents,
+         COALESCE(SUM(amount_cents) FILTER (
+           WHERE lower(status) IN ('approved','paid','pago')
+             AND COALESCE(paid_at, created_at) >= date_trunc('year', now())
+         ),0) AS gmv_current_year_cents,
          COUNT(*) FILTER (WHERE lower(status) IN ('approved','paid','pago'))                                  AS orders_paid,
+         COUNT(*) FILTER (
+           WHERE lower(status) IN ('approved','paid','pago')
+             AND COALESCE(paid_at, created_at) >= now() - interval '30 days'
+         ) AS paid_orders_30d,
          COALESCE(AVG(amount_cents) FILTER (WHERE lower(status) IN ('approved','paid','pago')),0)             AS avg_ticket_paid_cents,
          COUNT(DISTINCT user_id) FILTER (WHERE lower(status) IN ('approved','paid','pago'))                   AS unique_buyers_paid,
-         COALESCE(SUM(CASE WHEN status IN ('pending','processing') THEN amount_cents END),0) AS gmv_intent_cents,
-         COUNT(*) FILTER (WHERE status IN ('pending','processing'))             AS orders_intent,
-         COALESCE(SUM(CASE WHEN status='expired' THEN amount_cents END),0)      AS gmv_expired_cents,
-         COUNT(*) FILTER (WHERE status='expired')                               AS orders_expired,
-         COALESCE(SUM(CASE WHEN status='cancelled' THEN amount_cents END),0)    AS gmv_cancelled_cents,
-         COUNT(*) FILTER (WHERE status='cancelled')                             AS orders_cancelled
+         COALESCE(SUM(CASE WHEN lower(status) IN ('pending','processing') THEN amount_cents END),0) AS gmv_intent_cents,
+         COUNT(*) FILTER (WHERE lower(status) IN ('pending','processing'))             AS orders_intent,
+         COALESCE(SUM(CASE WHEN lower(status)='expired' THEN amount_cents END),0)      AS gmv_expired_cents,
+         COUNT(*) FILTER (WHERE lower(status)='expired')                               AS orders_expired,
+         COALESCE(SUM(CASE WHEN lower(status) IN ('cancelled','canceled') THEN amount_cents END),0) AS gmv_cancelled_cents,
+         COUNT(*) FILTER (WHERE lower(status) IN ('cancelled','canceled'))              AS orders_cancelled
        FROM payments`
     ))?.rows?.[0] || {};
 
@@ -717,9 +1279,11 @@ router.get("/overview", async (req, res) => {
     // séries últimas N days (paid/intent/expired)
     const series = (await q(
       `WITH base AS (
-         SELECT date_trunc('day', created_at) AS day, status, amount_cents
+         SELECT date_trunc('day', COALESCE(paid_at, created_at)) AS day,
+                lower(status) AS status,
+                amount_cents
            FROM payments
-          WHERE created_at >= now() - ($1 || ' days')::interval
+          WHERE COALESCE(paid_at, created_at) >= now() - ($1 || ' days')::interval
        )
        SELECT day,
               SUM(amount_cents) FILTER (WHERE lower(status) IN ('approved','paid','pago'))                      AS gmv_paid_cents,
@@ -736,20 +1300,25 @@ router.get("/overview", async (req, res) => {
 
     // pagos por hora (últimos 90 dias)
     const hourly = (await q(
-      `SELECT EXTRACT(HOUR FROM (paid_at AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
+      `SELECT EXTRACT(HOUR FROM (COALESCE(paid_at, created_at) AT TIME ZONE 'America/Sao_Paulo')) AS hour_br,
               COUNT(*) AS paid
          FROM payments
         WHERE lower(status) IN ('approved','paid','pago')
-          AND paid_at >= now() - interval '90 days'
-          AND paid_at IS NOT NULL
+          AND COALESCE(paid_at, created_at) >= now() - interval '90 days'
+          AND COALESCE(paid_at, created_at) IS NOT NULL
         GROUP BY 1 ORDER BY 1`
     ))?.rows ?? [];
 
     // top compradores (paid)
     const topBuyers = (await q(
       `SELECT u.id AS user_id, u.name, u.email,
-              COUNT(*) AS orders, SUM(p.amount_cents) AS gmv_cents,
-              AVG(p.amount_cents) AS avg_ticket_cents
+              COUNT(*)::int AS orders,
+              COUNT(*)::int AS paid_orders,
+              SUM(p.amount_cents)::bigint AS gmv_cents,
+              AVG(p.amount_cents) AS avg_ticket_cents,
+              AVG(p.amount_cents) AS average_ticket_cents,
+              COALESCE(SUM(cardinality(p.numbers)),0)::int AS numbers_count,
+              MAX(COALESCE(p.paid_at, p.created_at)) AS last_payment_at
          FROM payments p
          JOIN users u ON u.id=p.user_id
         WHERE lower(p.status) IN ('approved','paid','pago')
@@ -761,7 +1330,12 @@ router.get("/overview", async (req, res) => {
     res.json({
       totals: {
         gmv_paid_cents: Number(totalsRow.gmv_paid_cents || 0),
+        gmv_all_time_cents: Number(totalsRow.gmv_paid_cents || 0),
+        gmv_30d_cents: Number(totalsRow.gmv_30d_cents || 0),
+        gmv_current_month_cents: Number(totalsRow.gmv_current_month_cents || 0),
+        gmv_current_year_cents: Number(totalsRow.gmv_current_year_cents || 0),
         orders_paid: Number(totalsRow.orders_paid || 0),
+        paid_orders_30d: Number(totalsRow.paid_orders_30d || 0),
         avg_ticket_paid_cents: Number(totalsRow.avg_ticket_paid_cents || 0),
         unique_buyers_paid: Number(totalsRow.unique_buyers_paid || 0),
         avg_orders_per_buyer: Number(avgOrdersPerBuyer || 0),
@@ -778,7 +1352,16 @@ router.get("/overview", async (req, res) => {
       },
       series,
       hourly,
-      topBuyers
+      topBuyers: topBuyers.map((row) => ({
+        ...row,
+        user_id: Number(row.user_id),
+        orders: Number(row.orders || 0),
+        paid_orders: Number(row.paid_orders || 0),
+        gmv_cents: Number(row.gmv_cents || 0),
+        avg_ticket_cents: Number(row.avg_ticket_cents || 0),
+        average_ticket_cents: Number(row.average_ticket_cents || 0),
+        numbers_count: Number(row.numbers_count || 0),
+      }))
     });
   } catch (e) {
     console.error("[analytics/overview]", e);
@@ -789,8 +1372,16 @@ router.get("/overview", async (req, res) => {
 // alias simples se seu front já chama /stats
 router.get("/stats", async (req, res) => {
   try {
-    const o = await (await fetch(req.protocol + "://" + req.get("host") + `/api/admin/analytics/overview${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`)).json();
-    res.json(o);
+    const headers = {};
+    if (req.headers.authorization) headers.authorization = req.headers.authorization;
+    if (req.headers.cookie) headers.cookie = req.headers.cookie;
+
+    const upstream = await fetch(
+      req.protocol + "://" + req.get("host") + `/api/admin/analytics/overview${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`,
+      { headers }
+    );
+    const o = await upstream.json();
+    res.status(upstream.status).json(o);
   } catch (e) {
     console.error("[analytics/stats alias]", e);
     res.status(500).json({ error: "Falha ao obter stats" });
