@@ -1,5 +1,4 @@
 import { Router } from "express";
-import { v4 as uuid } from "uuid";
 import { getPool } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { getMercadoPagoAccessToken, mpCreatePixPayment } from "../services/mercadopago.js";
@@ -196,7 +195,7 @@ router.post("/pix", requireAuth, async (req, res) => {
         },
         notification_url: notificationUrl,
         date_of_expiration: new Date(reservation.expires_at).toISOString(),
-        idempotencyKey: uuid(),
+        idempotencyKey: String(reservation.id),
       });
     } catch (e) {
       console.error("[additional_payments/pix][mercadopago] error:", {
