@@ -110,34 +110,40 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
 
 /**
  * POST /api/admin/dashboard/new
- * Fecha sorteios 'open', cria um novo, popula 0..99 'available'
+ * Fecha sorteios principais 'open', cria um novo principal e popula os numeros.
  * e DISPARA o Autopay oficial (services/autopayRunner.js).
  */
-router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
+router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   try {
     log("POST /new");
+    const numberCount = Number(req.body?.number_count ?? 100);
+    if (!Number.isInteger(numberCount) || numberCount <= 0 || numberCount > 10000) {
+      return res.status(400).json({ error: "invalid_number_count" });
+    }
 
     // fecha os abertos anteriores
     await query(
       `update draws
           set status = 'closed', closed_at = now()
-        where status = 'open'`
+        where status = 'open'
+          and COALESCE(draw_type, 'principal') = 'principal'`
     );
 
     // cria draw novo
     const ins = await query(
-      `insert into draws(status, opened_at, autopay_ran_at)
-       values('open', now(), null)
+      `insert into draws(status, draw_type, opened_at, autopay_ran_at)
+       values('open', 'principal', now(), null)
        returning id`
     );
     const newId = ins.rows[0].id;
     log("novo draw id =", newId);
 
-    // popula números 00..99
-    const tuples = Array.from({ length: 100 }, (_, i) => `(${newId}, ${i}, 'available', null)`);
+    // popula numeros do sorteio principal
     await query(
       `insert into numbers(draw_id, n, status, reservation_id)
-       values ${tuples.join(",")}`
+       select $1, gs::int, 'available', null
+         from generate_series(0, $2::int - 1) as gs`,
+      [newId, numberCount]
     );
 
     // dispara o AUTOPAY oficial — gera logs [autopayRunner]
@@ -146,10 +152,10 @@ router.post("/new", requireAuth, requireAdmin, async (_req, res) => {
     // resposta inclui o resultado do autopay para depuração
     if (!autopay?.ok) {
       console.warn("[admin/dashboard] autopay falhou", autopay);
-      return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: 100, autopay });
+      return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: numberCount, autopay });
     }
 
-    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: 100, autopay });
+    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: numberCount, autopay });
   } catch (e) {
     console.error("[admin/dashboard] /new error:", e);
     return res.status(500).json({ error: "new_draw_failed" });

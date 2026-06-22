@@ -1,20 +1,12 @@
 import { Router } from "express";
-import { MercadoPagoConfig, Payment } from "mercadopago";
 import { v4 as uuid } from "uuid";
 import { getPool } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
-import { getTicketPriceCents } from "../services/config.js";
+import { getMercadoPagoAccessToken, mpCreatePixPayment } from "../services/mercadopago.js";
 import { expireDrawReservations, isAdditionalDrawType } from "./additional_draws.js";
 
 const router = Router();
-
-function getMercadoPagoAccessToken() {
-  return (
-    process.env.MP_ACCESS_TOKEN ||
-    process.env.MERCADOPAGO_ACCESS_TOKEN ||
-    ""
-  );
-}
+const ACTIVE_RESERVATION_STATUSES = new Set(["active", "reserved", "pending"]);
 
 function amountFromCents(cents) {
   return Number((Math.max(0, Number(cents || 0)) / 100).toFixed(2));
@@ -36,17 +28,29 @@ function resolveBaseUrl(req) {
   return fallback;
 }
 
+function safeMpErrorMessage(err) {
+  return String(
+    err?.response?.message ||
+      err?.response?.error ||
+      err?.message ||
+      "mercado_pago_error"
+  ).slice(0, 240);
+}
+
 router.post("/pix", requireAuth, async (req, res) => {
-  const { reservation_id: reservationId } = req.body || {};
+  const reservationId = req.body?.reservation_id ?? req.body?.reservationId ?? req.body?.id;
   if (!reservationId) return res.status(400).json({ error: "missing_reservation_id" });
 
-  const token = getMercadoPagoAccessToken();
-  if (!token) return res.status(503).json({ error: "mp_token_missing" });
+  if (!getMercadoPagoAccessToken()) {
+    console.warn("[additional_payments/pix] Mercado Pago token missing");
+    return res.status(503).json({ error: "mp_token_missing" });
+  }
 
-  const pool = await getPool();
-  const client = await pool.connect();
-
+  let client;
   try {
+    const pool = await getPool();
+    client = await pool.connect();
+
     await client.query("BEGIN");
     await expireDrawReservations(client);
 
@@ -57,9 +61,13 @@ router.post("/pix", requireAuth, async (req, res) => {
               r.numbers,
               r.status,
               r.expires_at,
+              r.payment_id,
               d.draw_type,
               d.product_name,
+              c.id AS config_id,
+              c.banner_title,
               c.ticket_price_cents,
+              c.max_numbers_per_selection,
               u.email AS user_email,
               u.name AS user_name
          FROM public.reservations r
@@ -76,79 +84,155 @@ router.post("/pix", requireAuth, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "reservation_not_found" });
     }
-    if (!isAdditionalDrawType(reservation.draw_type)) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "draw_not_found" });
-    }
+
     if (Number(reservation.user_id) !== Number(req.user.id)) {
       await client.query("ROLLBACK");
       return res.status(403).json({ error: "reservation_not_owned" });
     }
-    if (reservation.status !== "active") {
+
+    if (!isAdditionalDrawType(reservation.draw_type)) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "reservation_not_active" });
+      return res.status(400).json({ error: "draw_not_additional" });
     }
+
+    const reservationStatus = String(reservation.status || "").toLowerCase();
+    if (!ACTIVE_RESERVATION_STATUSES.has(reservationStatus)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: `reservation_${reservationStatus || "invalid"}` });
+    }
+
     if (new Date(reservation.expires_at).getTime() <= Date.now()) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "reservation_expired" });
+      return res.status(409).json({ error: "reservation_expired" });
     }
 
-    const numbers = (reservation.numbers || []).map(Number);
-    const fallbackPrice = await getTicketPriceCents();
-    const priceCents = Number(reservation.ticket_price_cents || fallbackPrice);
-    const amountCents = priceCents * numbers.length;
+    const numbers = Array.isArray(reservation.numbers)
+      ? reservation.numbers.map(Number).filter((n) => Number.isInteger(n) && n >= 0)
+      : [];
+    if (!numbers.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "invalid_numbers" });
+    }
+
+    if (!reservation.config_id) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "additional_config_not_found" });
+    }
+
+    const ticketPriceCents = Number(reservation.ticket_price_cents);
+    if (!Number.isInteger(ticketPriceCents) || ticketPriceCents <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "invalid_ticket_price" });
+    }
+
+    const amountCents = ticketPriceCents * numbers.length;
+    if (!Number.isInteger(amountCents) || amountCents <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "invalid_amount" });
+    }
+
+    if (reservation.payment_id) {
+      const existing = await client.query(
+        `SELECT id, status, qr_code, qr_code_base64, amount_cents
+           FROM public.payments
+          WHERE id = $1`,
+        [String(reservation.payment_id)]
+      );
+      const payment = existing.rows[0];
+      if (!payment) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "reservation_payment_missing" });
+      }
+
+      const paymentStatus = String(payment.status || "").toLowerCase();
+      if (["approved", "paid", "pago"].includes(paymentStatus)) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "reservation_already_paid" });
+      }
+
+      if (paymentStatus === "pending") {
+        await client.query("COMMIT");
+        return res.json({
+          payment_id: String(payment.id),
+          paymentId: String(payment.id),
+          reservation_id: reservation.id,
+          draw_id: reservation.draw_id,
+          status: payment.status,
+          amount_cents: Number(payment.amount_cents || amountCents),
+          qr_code: payment.qr_code || null,
+          qr_code_base64: payment.qr_code_base64 || null,
+          numbers,
+        });
+      }
+
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: `payment_${paymentStatus || "invalid"}` });
+    }
 
     await client.query("COMMIT");
+    client.release();
+    client = null;
 
-    const mpPayment = new Payment(new MercadoPagoConfig({ accessToken: token }));
-    const description = `${reservation.product_name || "Sorteio adicional New Store"} - ${numbers
+    const description = `${reservation.product_name || reservation.banner_title || "Sorteio adicional New Store"} - ${numbers
       .map((n) => n.toString().padStart(2, "0"))
       .join(", ")}`;
     const notificationUrl = `${resolveBaseUrl(req)}/api/payments/webhook`;
     const payerEmail = reservation.user_email || req.user?.email || "comprador@example.com";
+    const transactionAmount = amountFromCents(amountCents);
 
-    let mpResp;
+    let mpBody;
     try {
-      mpResp = await mpPayment.create({
-        body: {
-          transaction_amount: amountFromCents(amountCents),
-          description,
-          payment_method_id: "pix",
-          payer: { email: payerEmail },
-          external_reference: String(reservation.id),
-          metadata: {
-            source: "additional_draw",
-            draw_id: Number(reservation.draw_id),
-            reservation_id: reservation.id,
-            user_id: Number(req.user.id),
-            numbers,
-          },
-          notification_url: notificationUrl,
-          date_of_expiration: new Date(reservation.expires_at).toISOString(),
+      mpBody = await mpCreatePixPayment({
+        transaction_amount: transactionAmount,
+        description,
+        payerEmail,
+        external_reference: String(reservation.id),
+        metadata: {
+          source: "additional_draw",
+          draw_id: Number(reservation.draw_id),
+          reservation_id: String(reservation.id),
+          user_id: Number(req.user.id),
+          numbers,
         },
-        requestOptions: { idempotencyKey: uuid() },
+        notification_url: notificationUrl,
+        date_of_expiration: new Date(reservation.expires_at).toISOString(),
+        idempotencyKey: uuid(),
       });
     } catch (e) {
-      console.error("[additional_payments/pix][mercadopago] error:", e?.status || e?.code || e?.message || e);
-      return res.status(502).json({ error: "mercado_pago_payment_failed" });
+      console.error("[additional_payments/pix][mercadopago] error:", {
+        status: e?.status,
+        code: e?.code,
+        message: e?.message,
+      });
+      return res.status(502).json({
+        error: "mp_pix_create_failed",
+        details: safeMpErrorMessage(e),
+      });
     }
 
-    const body = mpResp?.body || mpResp;
-    const td = body?.point_of_interaction?.transaction_data || {};
-    const paymentId = body?.id != null ? String(body.id) : null;
-    const status = body?.status || "pending";
+    const td = mpBody?.point_of_interaction?.transaction_data || {};
+    const paymentId = mpBody?.id != null ? String(mpBody.id) : null;
+    const status = mpBody?.status || "pending";
     const qrCode = typeof td.qr_code === "string" ? td.qr_code.trim() : null;
     const qrCodeBase64 =
       typeof td.qr_code_base64 === "string" ? td.qr_code_base64.replace(/\s+/g, "") : null;
 
-    if (!paymentId) return res.status(502).json({ error: "mercado_pago_payment_failed" });
+    if (!paymentId || !qrCode) {
+      return res.status(502).json({
+        error: "mp_pix_create_failed",
+        details: "Mercado Pago did not return PIX data",
+      });
+    }
 
     try {
+      const pool = await getPool();
+      client = await pool.connect();
       await client.query("BEGIN");
+
       await client.query(
         `INSERT INTO public.payments AS pay
-          (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64, provider)
-         VALUES ($1, $2, $3, $4::int[], $5, $6, $7, $8, 'mercadopago')
+          (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64, provider, created_at)
+         VALUES ($1, $2, $3, $4::int[], $5, $6, $7, $8, 'mercadopago', NOW())
          ON CONFLICT (id) DO UPDATE
            SET status = EXCLUDED.status,
                qr_code = COALESCE(EXCLUDED.qr_code, pay.qr_code),
@@ -156,7 +240,7 @@ router.post("/pix", requireAuth, async (req, res) => {
                provider = COALESCE(EXCLUDED.provider, pay.provider)`,
         [
           paymentId,
-          reservation.user_id || req.user.id,
+          req.user.id,
           reservation.draw_id,
           numbers,
           amountCents,
@@ -168,35 +252,51 @@ router.post("/pix", requireAuth, async (req, res) => {
 
       await client.query(
         `UPDATE public.reservations
-            SET payment_id = $2
-          WHERE id = $1
-            AND draw_id = $3`,
-        [reservation.id, paymentId, reservation.draw_id]
+            SET payment_id = $1
+          WHERE id = $2
+            AND user_id = $3
+            AND draw_id = $4`,
+        [paymentId, reservation.id, req.user.id, reservation.draw_id]
       );
+
       await client.query("COMMIT");
     } catch (e) {
-      try { await client.query("ROLLBACK"); } catch {}
-      console.error("[additional_payments/pix][persist] error:", e?.code || e?.message || e);
+      if (client) {
+        try { await client.query("ROLLBACK"); } catch {}
+      }
+      console.error("[additional_payments/pix][persist] error:", {
+        code: e?.code,
+        message: e?.message,
+        table: e?.table,
+        column: e?.column,
+      });
       return res.status(500).json({ error: "payment_create_failed" });
     }
 
     return res.status(201).json({
       payment_id: paymentId,
       paymentId,
+      reservation_id: reservation.id,
+      draw_id: reservation.draw_id,
       status,
       amount_cents: amountCents,
       qr_code: qrCode,
       qr_code_base64: qrCodeBase64,
-      expires_at: reservation.expires_at,
-      reservation_id: reservation.id,
       numbers,
     });
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    console.error("[additional_payments/pix] error:", e?.status || e?.code || e?.message || e);
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch {}
+    }
+    console.error("[additional_payments/pix] error:", {
+      code: e?.code,
+      message: e?.message,
+      table: e?.table,
+      column: e?.column,
+    });
     return res.status(500).json({ error: "additional_pix_failed" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 

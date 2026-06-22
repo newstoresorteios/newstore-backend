@@ -74,17 +74,21 @@ async function expireDrawReservations(client, drawId = null) {
   }
 }
 
-function publicDraw(row, priceCents = null) {
+function publicDraw(row, config = null, fallbackPriceCents = null) {
   if (!row) return null;
-  const productName = row.product_name || "Sorteio Secundario";
+  const productName = row.product_name || config?.banner_title || "Sorteio Secundario";
+  const priceCents = Number(config?.ticket_price_cents || fallbackPriceCents || 0);
   return {
     id: row.id,
     status: row.status,
     draw_type: normalizeDrawType(row.draw_type),
     product_name: productName,
     product_link: row.product_link || null,
-    promo_phrase: productName,
+    banner_title: config?.banner_title || productName,
+    promo_phrase: config?.banner_title || productName,
+    ticket_price_cents: priceCents,
     price_cents: priceCents,
+    max_numbers_per_selection: config?.max_numbers_per_selection ?? null,
     opened_at: row.opened_at || null,
   };
 }
@@ -110,10 +114,17 @@ router.get("/current", async (_req, res) => {
       return res.json({ draw: null, numbers: [] });
     }
 
+    const config = await client.query(
+      `SELECT id, banner_title, ticket_price_cents, max_numbers_per_selection
+         FROM app_config_new
+        WHERE id = $1`,
+      [String(draw.id)]
+    );
+
     await client.query("COMMIT");
 
-    const priceCents = await getTicketPriceCents();
-    return res.json({ draw: publicDraw(draw, priceCents) });
+    const fallbackPriceCents = await getTicketPriceCents();
+    return res.json({ draw: publicDraw(draw, config.rows[0] || null, fallbackPriceCents) });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[secondary_draws/current] error:", e?.code || e?.message || e);
@@ -245,9 +256,17 @@ router.post("/:id/reserve", requireAuth, async (req, res) => {
       [drawId, nums, reservationId]
     );
 
+    const config = await client.query(
+      `SELECT ticket_price_cents
+         FROM app_config_new
+        WHERE id = $1`,
+      [String(drawId)]
+    );
+
     await client.query("COMMIT");
 
-    const priceCents = await getTicketPriceCents();
+    const fallbackPriceCents = await getTicketPriceCents();
+    const priceCents = Number(config.rows[0]?.ticket_price_cents || fallbackPriceCents);
     return res.status(201).json({
       reservation_id: reservationId,
       draw_id: drawId,

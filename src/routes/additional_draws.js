@@ -2,7 +2,6 @@ import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { getPool, query } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
-import { getTicketPriceCents } from "../services/config.js";
 
 const router = Router();
 
@@ -53,19 +52,25 @@ async function expireDrawReservations(client, drawId = null) {
       WHERE r.status = 'active'
         AND r.expires_at < NOW()
         ${drawFilter}
-      RETURNING r.id, r.draw_id`,
+      RETURNING r.id, r.draw_id, r.numbers`,
     params
   );
 
   for (const row of expired.rows || []) {
+    const nums = Array.isArray(row.numbers)
+      ? row.numbers.map(Number).filter((n) => Number.isInteger(n) && n >= 0)
+      : [];
+    if (!nums.length) continue;
+
     await client.query(
       `UPDATE public.numbers
           SET status = 'available',
               reservation_id = NULL
         WHERE draw_id = $1
-          AND reservation_id = $2
+          AND n = ANY($2::int[])
+          AND reservation_id = $3
           AND status = 'reserved'`,
-      [row.draw_id, row.id]
+      [row.draw_id, nums, row.id]
     );
   }
 }
@@ -83,9 +88,10 @@ async function loadDrawConfigs(drawIds) {
 
 async function formatAdditionalDraw(row, config = null) {
   if (!row) return null;
-  const fallbackPrice = await getTicketPriceCents();
   const productName = row.product_name || config?.banner_title || "SORTEIO ADICIONAL";
-  const ticketPriceCents = Number(config?.ticket_price_cents || fallbackPrice);
+  const configuredPrice = Number(config?.ticket_price_cents);
+  const ticketPriceCents =
+    Number.isInteger(configuredPrice) && configuredPrice > 0 ? configuredPrice : null;
 
   return {
     id: row.id,
@@ -95,6 +101,7 @@ async function formatAdditionalDraw(row, config = null) {
     product_link: row.product_link || null,
     banner_title: config?.banner_title || productName,
     promo_phrase: config?.banner_title || productName,
+    config_missing: !config,
     ticket_price_cents: ticketPriceCents,
     price_cents: ticketPriceCents,
     max_numbers_per_selection: config?.max_numbers_per_selection ?? null,
@@ -257,11 +264,19 @@ router.post("/:id/reserve", requireAuth, async (req, res) => {
         WHERE id = $1`,
       [String(drawId)]
     );
+    if (!config.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "additional_config_not_found" });
+    }
+
+    const priceCents = Number(config.rows[0]?.ticket_price_cents);
+    if (!Number.isInteger(priceCents) || priceCents <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "invalid_ticket_price" });
+    }
 
     await client.query("COMMIT");
 
-    const fallbackPrice = await getTicketPriceCents();
-    const priceCents = Number(config.rows[0]?.ticket_price_cents || fallbackPrice);
     return res.status(201).json({
       reservation_id: reservationId,
       draw_id: drawId,

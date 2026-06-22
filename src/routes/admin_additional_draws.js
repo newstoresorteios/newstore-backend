@@ -195,52 +195,69 @@ router.post("/", async (req, res) => {
   const status = String(req.body?.status ?? "open").trim();
   if (!VALID_STATUSES.has(status)) return res.status(400).json({ error: "invalid_status" });
 
+  const drawType = String(req.body?.draw_type ?? "adicional").trim().toLowerCase();
+  if (!["adicional", "secundario"].includes(drawType)) {
+    return res.status(400).json({ error: "invalid_draw_type" });
+  }
+
   const numberCount = normalizeNumberCount(req.body?.number_count);
   if (numberCount.error) return res.status(400).json({ error: numberCount.error });
 
-  const productName = toOptionalString(
-    req.body?.product_name ?? req.body?.promo_phrase ?? req.body?.banner_title ?? "SORTEIO ADICIONAL",
-    255
-  );
-  const productLink = toOptionalString(req.body?.product_link ?? null, 1024);
-  const bannerTitle = toOptionalString(req.body?.banner_title ?? req.body?.promo_phrase ?? productName, 255);
-  const ticketPriceCents =
-    req.body?.ticket_price_cents === undefined || req.body?.ticket_price_cents === null
-      ? await getTicketPriceCents()
-      : Number(req.body.ticket_price_cents);
-  const maxNumbers =
-    req.body?.max_numbers_per_selection === undefined || req.body?.max_numbers_per_selection === null
-      ? null
-      : Number(req.body.max_numbers_per_selection);
-
-  if (!Number.isInteger(Number(ticketPriceCents)) || Number(ticketPriceCents) < 0) {
-    return res.status(400).json({ error: "invalid_ticket_price_cents" });
-  }
-  if (maxNumbers !== null && (!Number.isInteger(maxNumbers) || maxNumbers <= 0)) {
-    return res.status(400).json({ error: "invalid_max_numbers_per_selection" });
-  }
-
-  const pool = await getPool();
-  const client = await pool.connect();
+  let client;
   try {
+    const productName = toOptionalString(
+      req.body?.product_name ?? req.body?.promo_phrase ?? req.body?.banner_title ?? "SORTEIO ADICIONAL",
+      255
+    );
+    const productLink = toOptionalString(req.body?.product_link ?? null, 1024);
+    const bannerTitle = toOptionalString(req.body?.banner_title ?? req.body?.promo_phrase ?? productName, 255);
+    const ticketPriceCents =
+      req.body?.ticket_price_cents === undefined || req.body?.ticket_price_cents === null
+        ? await getTicketPriceCents()
+        : Number(req.body.ticket_price_cents);
+    const maxNumbers =
+      req.body?.max_numbers_per_selection === undefined || req.body?.max_numbers_per_selection === null
+        ? null
+        : Number(req.body.max_numbers_per_selection);
+
+    if (!Number.isInteger(Number(ticketPriceCents)) || Number(ticketPriceCents) < 0) {
+      return res.status(400).json({ error: "invalid_ticket_price_cents" });
+    }
+    if (maxNumbers !== null && (!Number.isInteger(maxNumbers) || maxNumbers <= 0)) {
+      return res.status(400).json({ error: "invalid_max_numbers_per_selection" });
+    }
+
+    const pool = await getPool();
+    client = await pool.connect();
     await client.query("BEGIN");
+
+    if (status === "open") {
+      await client.query(
+        `UPDATE public.draws
+            SET status = 'closed',
+                closed_at = COALESCE(closed_at, NOW())
+          WHERE status = 'open'
+            AND draw_type = $1`,
+        [drawType]
+      );
+    }
 
     const inserted = await client.query(
       `INSERT INTO public.draws (status, draw_type, product_name, product_link, opened_at)
-       VALUES ($1, 'adicional', $2, $3, CASE WHEN $1 = 'open' THEN NOW() ELSE NULL END)
+       VALUES ($1, $2, $3, $4, CASE WHEN $1 = 'open' THEN NOW() ELSE NULL END)
        RETURNING id, status, draw_type, product_name, product_link, opened_at,
                  closed_at, realized_at, winner_user_id, winner_name, winner_number`,
-      [status, productName, productLink]
+      [status, drawType, productName, productLink]
     );
 
     const draw = inserted.rows[0];
-    await ensureDrawNumbers(client, draw.id, numberCount.count);
     await upsertConfig(
       client,
       draw.id,
       { banner_title: bannerTitle, ticket_price_cents: Number(ticketPriceCents), max_numbers_per_selection: maxNumbers },
       productName
     );
+    await ensureDrawNumbers(client, draw.id, numberCount.count);
 
     await client.query("COMMIT");
     const configMap = await loadDrawConfigs([draw.id]);
@@ -249,14 +266,25 @@ router.post("/", async (req, res) => {
       stats: await loadStats(draw.id),
     });
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    console.error("[admin_additional_draws/create] error:", e?.code || e?.message || e);
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch {}
+    }
+    console.error("[admin_additional_draws/create] error:", {
+      code: e?.code,
+      message: e?.message,
+      constraint: e?.constraint,
+      table: e?.table,
+      detail: e?.detail,
+    });
     if (e?.code === "23514") {
       return res.status(409).json({ error: "draw_type_adicional_not_allowed" });
     }
+    if (e?.code === "23505") {
+      return res.status(409).json({ error: "additional_draw_duplicate" });
+    }
     return res.status(500).json({ error: "additional_draw_create_failed" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 

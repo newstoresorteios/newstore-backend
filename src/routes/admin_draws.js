@@ -119,9 +119,13 @@ router.get("/:id/participants", requireAuth, requireAdmin, async (req, res) => {
         u.email as user_email
       from reservations r
       left join users u on u.id = r.user_id
+      left join payments p on p.id = r.payment_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        and (
+          lower(coalesce(r.status,'')) in ('paid', 'pago', 'approved')
+          or lower(coalesce(p.status,'')) in ('approved', 'paid', 'pago')
+        )
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);
@@ -150,9 +154,13 @@ router.get("/:id/players", requireAuth, requireAdmin, async (req, res) => {
         u.email as user_email
       from reservations r
       left join users u on u.id = r.user_id
+      left join payments p on p.id = r.payment_id
       cross join lateral unnest(coalesce(r.numbers, '{}'::int[])) as num
       where r.draw_id = $1
-        and (lower(coalesce(r.status,'')) = 'paid' or coalesce(r.paid,false) = true)
+        and (
+          lower(coalesce(r.status,'')) in ('paid', 'pago', 'approved')
+          or lower(coalesce(p.status,'')) in ('approved', 'paid', 'pago')
+        )
       order by user_name asc, number asc
     `;
     const r = await query(sql, [drawId]);

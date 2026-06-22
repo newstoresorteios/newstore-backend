@@ -1,6 +1,7 @@
 // backend/src/services/mercadopago.js
 // ESM
 import crypto from "node:crypto";
+import https from "node:https";
 
 const MP_BASE =
   (process.env.MP_BASE_URL && process.env.MP_BASE_URL.replace(/\/+$/, "")) ||
@@ -86,6 +87,94 @@ async function mpFetch(
   }
 
   return json;
+}
+
+function shouldRetryWithoutTlsVerification(err) {
+  if (process.env.NODE_ENV === "production") return false;
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "");
+  return (
+    code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" ||
+    code === "SELF_SIGNED_CERT_IN_CHAIN" ||
+    /unable to verify|self[- ]signed certificate/i.test(message)
+  );
+}
+
+function mpHttpsRequest(method, path, body, extraHeaders = {}, options = {}) {
+  ensureToken();
+
+  const url = new URL(`${MP_BASE}${path}`);
+  const payload = body != null ? JSON.stringify(body) : undefined;
+  const rejectUnauthorized = options.rejectUnauthorized !== false;
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      {
+        method,
+        rejectUnauthorized,
+        timeout: options.timeoutMs || 15000,
+        headers: {
+          Authorization: `Bearer ${getMercadoPagoAccessToken()}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent": "newstore-backend/1.0",
+          ...(payload ? { "Content-Length": Buffer.byteLength(payload) } : {}),
+          ...extraHeaders,
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          let json;
+          try {
+            json = text ? JSON.parse(text) : {};
+          } catch {
+            json = { raw: text };
+          }
+
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const err = new Error(
+              json?.message ||
+                json?.error?.message ||
+                json?.error ||
+                `MercadoPago ${method} ${path} falhou (${res.statusCode})`
+            );
+            err.status = res.statusCode;
+            err.response = json;
+            reject(err);
+            return;
+          }
+
+          resolve(json);
+        });
+      }
+    );
+
+    req.on("timeout", () => {
+      req.destroy(new Error(`MercadoPago ${method} ${path} timeout`));
+    });
+    req.on("error", reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+async function mpRequest(method, path, body, extraHeaders = {}, options = {}) {
+  try {
+    return await mpHttpsRequest(method, path, body, extraHeaders, options);
+  } catch (err) {
+    if (shouldRetryWithoutTlsVerification(err)) {
+      console.warn("[mercadopago] certificate verification failed; retrying with local TLS fallback");
+      return mpHttpsRequest(method, path, body, extraHeaders, {
+        ...options,
+        rejectUnauthorized: false,
+      });
+    }
+    throw err;
+  }
 }
 
 function toBRL(amount_cents) {
@@ -213,4 +302,32 @@ export async function mpChargeCard({
   return { status: pay.status, paymentId: pay.id };
 }
 
-export default { mpEnsureCustomer, mpSaveCard, mpChargeCard };
+export async function mpCreatePixPayment({
+  transaction_amount,
+  description,
+  payerEmail,
+  external_reference,
+  metadata,
+  notification_url,
+  date_of_expiration,
+  idempotencyKey = crypto.randomUUID(),
+}) {
+  ensureToken();
+  return mpRequest(
+    "POST",
+    "/v1/payments",
+    {
+      transaction_amount,
+      description,
+      payment_method_id: "pix",
+      payer: { email: payerEmail },
+      external_reference,
+      metadata: metadata || {},
+      notification_url,
+      date_of_expiration,
+    },
+    { "X-Idempotency-Key": idempotencyKey }
+  );
+}
+
+export default { mpEnsureCustomer, mpSaveCard, mpChargeCard, mpCreatePixPayment };

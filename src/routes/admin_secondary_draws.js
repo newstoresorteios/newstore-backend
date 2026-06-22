@@ -28,13 +28,21 @@ function normalizeNumbers(input) {
   return { numbers };
 }
 
-async function ensureDrawNumbers(client, drawId) {
+function normalizeNumberCount(value) {
+  const count = Number(value ?? 100);
+  if (!Number.isInteger(count) || count <= 0 || count > 10000) {
+    return { error: "invalid_number_count" };
+  }
+  return { count };
+}
+
+async function ensureDrawNumbers(client, drawId, numberCount = 100) {
   await client.query(
     `INSERT INTO numbers (draw_id, n, status)
      SELECT $1, gs::int, 'available'
-       FROM generate_series(0, 99) AS gs
+       FROM generate_series(0, $2::int - 1) AS gs
      ON CONFLICT DO NOTHING`,
-    [drawId]
+    [drawId, numberCount]
   );
 }
 
@@ -60,17 +68,27 @@ async function loadStats(drawId) {
 
 async function drawResponse(row) {
   if (!row) return null;
-  const priceCents = await getTicketPriceCents();
-  const productName = row.product_name || "Sorteio Secundario";
+  const config = (await query(
+    `SELECT banner_title, ticket_price_cents, max_numbers_per_selection
+       FROM app_config_new
+      WHERE id = $1`,
+    [String(row.id)]
+  ))?.rows?.[0] || null;
+  const fallbackPriceCents = await getTicketPriceCents();
+  const priceCents = Number(config?.ticket_price_cents || fallbackPriceCents);
+  const productName = row.product_name || config?.banner_title || "Sorteio Secundario";
   return {
     id: row.id,
     status: row.status,
     draw_type: row.draw_type,
     product_name: productName,
     product_link: row.product_link || null,
-    promo_phrase: productName,
+    banner_title: config?.banner_title || productName,
+    promo_phrase: config?.banner_title || productName,
+    ticket_price_cents: priceCents,
     price_cents: priceCents,
-    max_tickets_per_user: null,
+    max_numbers_per_selection: config?.max_numbers_per_selection ?? null,
+    max_tickets_per_user: config?.max_numbers_per_selection ?? null,
     opened_at: row.opened_at || null,
     closed_at: row.closed_at || null,
     realized_at: row.realized_at || null,
@@ -78,6 +96,36 @@ async function drawResponse(row) {
     winner_name: row.winner_name || null,
     winner_number: row.winner_number ?? null,
   };
+}
+
+async function upsertConfig(db, drawId, values, fallbackProductName) {
+  const fallbackPriceCents = await getTicketPriceCents();
+  const bannerTitle = toOptionalString(values.banner_title ?? fallbackProductName ?? "Sorteio Adicional", 255);
+  const ticketPriceCents =
+    values.ticket_price_cents === undefined || values.ticket_price_cents === null
+      ? Number(fallbackPriceCents)
+      : Number(values.ticket_price_cents);
+  const maxNumbers =
+    values.max_numbers_per_selection === undefined || values.max_numbers_per_selection === null
+      ? null
+      : Number(values.max_numbers_per_selection);
+
+  if (!Number.isInteger(ticketPriceCents) || ticketPriceCents < 0) {
+    throw Object.assign(new Error("invalid_ticket_price_cents"), { status: 400 });
+  }
+  if (maxNumbers !== null && (!Number.isInteger(maxNumbers) || maxNumbers <= 0)) {
+    throw Object.assign(new Error("invalid_max_numbers_per_selection"), { status: 400 });
+  }
+
+  await db.query(
+    `INSERT INTO app_config_new (id, banner_title, ticket_price_cents, max_numbers_per_selection)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (id) DO UPDATE
+       SET banner_title = COALESCE(EXCLUDED.banner_title, app_config_new.banner_title),
+           ticket_price_cents = COALESCE(EXCLUDED.ticket_price_cents, app_config_new.ticket_price_cents),
+           max_numbers_per_selection = COALESCE(EXCLUDED.max_numbers_per_selection, app_config_new.max_numbers_per_selection)`,
+    [String(drawId), bannerTitle, ticketPriceCents, maxNumbers]
+  );
 }
 
 router.get("/current", async (_req, res) => {
@@ -162,34 +210,50 @@ router.patch("/:id", async (req, res) => {
     if (status === "open") updates.push("opened_at = COALESCE(opened_at, NOW())");
   }
 
-  if (!updates.length) return res.status(400).json({ error: "no_fields_to_update" });
+  const configValues = {
+    banner_title: req.body?.banner_title ?? req.body?.promo_phrase,
+    ticket_price_cents: req.body?.ticket_price_cents,
+    max_numbers_per_selection: req.body?.max_numbers_per_selection,
+  };
+  const hasConfigUpdate =
+    configValues.banner_title !== undefined ||
+    configValues.ticket_price_cents !== undefined ||
+    configValues.max_numbers_per_selection !== undefined;
+
+  if (!updates.length && !hasConfigUpdate) return res.status(400).json({ error: "no_fields_to_update" });
 
   try {
-    params.push(drawId);
-    const updated = await query(
-      `UPDATE draws
-          SET ${updates.join(", ")}
-        WHERE id = $${params.length}
-          AND draw_type IN ('adicional', 'secundario')
-        RETURNING id, status, draw_type, product_name, product_link, opened_at,
-                  closed_at, realized_at, winner_user_id, winner_name, winner_number`,
-      params
-    );
+    let updated;
+    if (updates.length) {
+      params.push(drawId);
+      updated = await query(
+        `UPDATE draws
+            SET ${updates.join(", ")}
+          WHERE id = $${params.length}
+            AND draw_type IN ('adicional', 'secundario')
+          RETURNING id, status, draw_type, product_name, product_link, opened_at,
+                    closed_at, realized_at, winner_user_id, winner_name, winner_number`,
+        params
+      );
+    } else {
+      updated = await query(
+        `SELECT id, status, draw_type, product_name, product_link, opened_at,
+                closed_at, realized_at, winner_user_id, winner_name, winner_number
+           FROM draws
+          WHERE id = $1
+            AND draw_type IN ('adicional', 'secundario')`,
+        [drawId]
+      );
+    }
 
     if (!updated.rowCount) return res.status(404).json({ error: "draw_not_found" });
-    if (productName !== undefined) {
-      const ticketPriceCents = await getTicketPriceCents();
-      await query(
-        `INSERT INTO app_config_new (id, banner_title, ticket_price_cents, max_numbers_per_selection)
-         VALUES ($1, $2, $3, NULL)
-         ON CONFLICT (id) DO UPDATE
-           SET banner_title = EXCLUDED.banner_title`,
-        [String(drawId), productName || "Sorteio Adicional", Number(ticketPriceCents)]
-      );
+    if (hasConfigUpdate) {
+      await upsertConfig({ query }, drawId, configValues, updated.rows[0]?.product_name || productName);
     }
     return res.json({ draw: await drawResponse(updated.rows[0]) });
   } catch (e) {
     console.error("[admin_secondary_draws/update] error:", e?.code || e?.message || e);
+    if (e?.status === 400) return res.status(400).json({ error: e.message });
     return res.status(500).json({ error: "secondary_draw_update_failed" });
   }
 });
@@ -197,6 +261,8 @@ router.patch("/:id", async (req, res) => {
 router.post("/", async (req, res) => {
   const status = String(req.body?.status ?? "open").trim();
   if (!VALID_STATUSES.has(status)) return res.status(400).json({ error: "invalid_status" });
+  const numberCount = normalizeNumberCount(req.body?.number_count);
+  if (numberCount.error) return res.status(400).json({ error: numberCount.error });
 
   const pool = await getPool();
   const client = await pool.connect();
@@ -205,9 +271,10 @@ router.post("/", async (req, res) => {
     await client.query("BEGIN");
 
     const productName = toOptionalString(
-      req.body?.product_name ?? req.body?.promo_phrase ?? "Sorteio Adicional",
+      req.body?.product_name ?? req.body?.promo_phrase ?? req.body?.banner_title ?? "Sorteio Adicional",
       255
     );
+    const bannerTitle = toOptionalString(req.body?.banner_title ?? req.body?.promo_phrase ?? productName, 255);
 
     const inserted = await client.query(
       `INSERT INTO draws (status, draw_type, product_name, product_link, opened_at)
@@ -218,14 +285,16 @@ router.post("/", async (req, res) => {
     );
 
     const draw = inserted.rows[0];
-    await ensureDrawNumbers(client, draw.id);
-    await client.query(
-      `INSERT INTO app_config_new (id, banner_title, ticket_price_cents, max_numbers_per_selection)
-       VALUES ($1, $2, $3, NULL)
-       ON CONFLICT (id) DO UPDATE
-         SET banner_title = EXCLUDED.banner_title,
-             ticket_price_cents = COALESCE(app_config_new.ticket_price_cents, EXCLUDED.ticket_price_cents)`,
-      [String(draw.id), productName || "Sorteio Adicional", Number(await getTicketPriceCents())]
+    await ensureDrawNumbers(client, draw.id, numberCount.count);
+    await upsertConfig(
+      client,
+      draw.id,
+      {
+        banner_title: bannerTitle,
+        ticket_price_cents: req.body?.ticket_price_cents,
+        max_numbers_per_selection: req.body?.max_numbers_per_selection,
+      },
+      productName
     );
 
     await client.query("COMMIT");

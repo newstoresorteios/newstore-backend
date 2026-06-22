@@ -255,7 +255,7 @@ router.get("/rfm", async (req, res) => {
   try {
     const { rows } = await q(
       `WITH paid AS (
-         SELECT user_id, SUM(amount_cents) AS m, COUNT(*) AS f, MAX(paid_at) AS last_paid
+         SELECT user_id, SUM(amount_cents) AS m, COUNT(*) AS f, MAX(COALESCE(paid_at, created_at)) AS last_paid
            FROM payments WHERE lower(status) IN ('approved','paid','pago') GROUP BY user_id
        )
        SELECT u.id, u.name, u.email, u.phone,
@@ -547,7 +547,7 @@ router.get("/payments/latency", async (req, res) => {
   const drawId = req.query.drawId ? Number(req.query.drawId) : null;
   try {
     const params = [days];
-    let filter = `WHERE lower(p.status) IN ('approved','paid','pago') AND p.paid_at >= now() - ($1 || ' days')::interval`;
+    let filter = `WHERE lower(p.status) IN ('approved','paid','pago') AND COALESCE(p.paid_at, p.created_at) >= now() - ($1 || ' days')::interval`;
     if (Number.isFinite(drawId)) {
       filter += ` AND p.draw_id=$2`;
       params.push(drawId);
@@ -555,7 +555,7 @@ router.get("/payments/latency", async (req, res) => {
 
     const avg = (await q(
       `WITH link AS (
-         SELECT p.id AS payment_id, p.paid_at, r.created_at AS reserved_at
+         SELECT p.id AS payment_id, COALESCE(p.paid_at, p.created_at) AS paid_at, r.created_at AS reserved_at
            FROM payments p
            JOIN reservations r ON r.payment_id=p.id
          ${filter}
@@ -567,7 +567,7 @@ router.get("/payments/latency", async (req, res) => {
 
     const series = (await q(
       `WITH link AS (
-         SELECT p.id AS payment_id, p.paid_at, r.created_at AS reserved_at
+         SELECT p.id AS payment_id, COALESCE(p.paid_at, p.created_at) AS paid_at, r.created_at AS reserved_at
            FROM payments p
            JOIN reservations r ON r.payment_id=p.id
         ${filter}
