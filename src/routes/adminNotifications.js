@@ -24,6 +24,8 @@ import {
   getTestRecipient,
   isAdminTestCustomRecipientsEnabled,
 } from "../services/notifications/brevoWhatsApp.js";
+import { sendTestPushToConfiguredSubscription } from "../services/notifications/pushNotifications.js";
+import { assertPushTestAccountAllowed } from "../services/notifications/pushAccessGuard.js";
 
 const router = express.Router();
 
@@ -31,6 +33,40 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 router.use(requireAuth, requireAdmin);
+
+router.post("/push/test-single-device", async (req, res) => {
+  try {
+    assertPushTestAccountAllowed({ user: req.user });
+    const allowedFields = new Set(["title", "body", "url"]);
+    if (Object.keys(req.body || {}).some((key) => !allowedFields.has(key))) {
+      return res.status(400).json({ ok: false, error: "push_test_payload_not_allowed" });
+    }
+    const result = await sendTestPushToConfiguredSubscription({
+      title: req.body?.title,
+      body: req.body?.body,
+      url: req.body?.url || "/me",
+      payload: {},
+      source: "admin_single_device_test",
+    });
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    const code = error?.code || "push_internal_error";
+    const status = code === "push_hidden_for_user"
+      ? 404
+      : code === "push_test_subscription_not_found_or_inactive"
+      ? 404
+      : code.includes("required") || code.includes("invalid") || code.includes("too_long")
+        ? 400
+        : code.startsWith("push_")
+          ? 403
+          : 500;
+    return res.status(status).json({
+      ok: false,
+      ...(code === "push_hidden_for_user" && { visible: false }),
+      error: code,
+    });
+  }
+});
 
 function toInt(v, def) {
   const n = Number(v);

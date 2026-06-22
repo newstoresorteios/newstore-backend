@@ -77,32 +77,54 @@ async function loadStats(drawId) {
     blocked,
     total,
     remaining: Math.max(0, available),
+    sold_count: sold,
+    available_count: available,
+    reserved_count: reserved,
+    total_numbers: total,
   };
 }
 
 async function loadBuyers(drawId) {
   const buyers = await query(
-    `WITH paid_numbers AS (
+    `WITH paid_payments AS (
        SELECT p.id AS payment_id,
               p.user_id,
+              p.numbers,
+              p.amount_cents,
               u.name,
-              u.email,
-              num.n::int AS n
+              u.email
          FROM public.payments p
     LEFT JOIN public.users u ON u.id = p.user_id
-   CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
         WHERE p.draw_id = $1
           AND lower(p.status) IN ('approved', 'paid', 'pago', 'sold')
+     ),
+     paid_numbers AS (
+       SELECT p.payment_id,
+              p.user_id,
+              p.name,
+              p.email,
+              num.n::int AS n
+         FROM paid_payments p
+    CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
+     ),
+     payment_totals AS (
+       SELECT user_id,
+              COALESCE(SUM(amount_cents), 0)::int AS total_cents,
+              array_agg(DISTINCT payment_id ORDER BY payment_id) AS payments
+         FROM paid_payments
+        GROUP BY user_id
      )
-     SELECT user_id,
-            max(name) AS name,
-            max(email) AS email,
+     SELECT pn.user_id,
+            max(pn.name) AS name,
+            max(pn.email) AS email,
             COUNT(DISTINCT n)::int AS numbers_count,
             array_agg(DISTINCT n ORDER BY n) AS numbers,
-            array_agg(DISTINCT payment_id ORDER BY payment_id) AS payments
-       FROM paid_numbers
-      GROUP BY user_id
-      ORDER BY max(name) ASC NULLS LAST, max(email) ASC NULLS LAST, user_id ASC NULLS LAST`,
+            COALESCE(pt.total_cents, 0)::int AS total_cents,
+            pt.payments AS payments
+       FROM paid_numbers pn
+  LEFT JOIN payment_totals pt ON pt.user_id IS NOT DISTINCT FROM pn.user_id
+      GROUP BY pn.user_id, pt.total_cents, pt.payments
+      ORDER BY max(pn.name) ASC NULLS LAST, max(pn.email) ASC NULLS LAST, pn.user_id ASC NULLS LAST`,
     [drawId]
   );
 
@@ -112,6 +134,7 @@ async function loadBuyers(drawId) {
     email: row.email || null,
     numbers_count: Number(row.numbers_count || 0),
     numbers: (row.numbers || []).map(Number),
+    total_cents: Number(row.total_cents || 0),
     payments: row.payments || [],
   }));
 }
@@ -176,11 +199,12 @@ router.get("/", async (_req, res) => {
     const items = [];
     for (const draw of draws.rows || []) {
       const config = await loadConfig(draw.id);
+      const buyers = await loadBuyers(draw.id);
       items.push({
         draw: await formatAdditionalDraw(draw, config),
         config,
-        stats: await loadStats(draw.id),
-        buyers: await loadBuyers(draw.id),
+        stats: { ...(await loadStats(draw.id)), buyers_count: buyers.length },
+        buyers,
       });
     }
 

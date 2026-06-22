@@ -54,6 +54,8 @@ import autopayRunnerRoute from "./routes/autopay_runner.js";
 import adminAnalyticsRouter from "./routes/analytics.js";
 import adminNotificationsRouter from "./routes/adminNotifications.js";
 import brevoWebhooksRouter from "./routes/brevoWebhooks.js";
+import pushRouter from "./routes/push.js";
+import internalNotificationsRouter from "./routes/internalNotifications.js";
 
 import { autoReconcile } from './middleware/autoReconcile.js';
 
@@ -106,10 +108,23 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-app.use(autoReconcile);
+// Push nunca passa pela reconciliação de pagamentos/reservas.
+app.use((req, res, next) => {
+  const path = String(req.path || "");
+  if (
+    path.startsWith("/api/push") ||
+    path.startsWith("/api/internal/notifications") ||
+    path.startsWith("/api/admin/notifications/push")
+  ) {
+    return next();
+  }
+  return autoReconcile(req, res, next);
+});
 
 // ── Rotas públicas/gerais ───────────────────────────────────
 app.use("/api/auth", authRoutes);
+app.use("/api/push", pushRouter);
+app.use("/api/internal/notifications", internalNotificationsRouter);
 app.use("/api/numbers", numbersRoutes);
 app.use("/api/reservations", reservationsRoutes);
 
