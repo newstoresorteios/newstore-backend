@@ -24,6 +24,12 @@ import {
   getTestRecipient,
   isAdminTestCustomRecipientsEnabled,
 } from "../services/notifications/brevoWhatsApp.js";
+import {
+  getAllowedTestUserIds,
+  isPushTestMode,
+  isPushProductionEnabled,
+} from "../services/notifications/pushSafetyGuard.js";
+import { sendPushToUser } from "../services/notifications/pushNotifications.js";
 
 const router = express.Router();
 
@@ -865,6 +871,102 @@ router.post("/manual-send", async (req, res) => {
     );
   } catch (e) {
     console.error("[admin/notifications] manual-send error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+router.get("/push/test-status", async (_req, res) => {
+  try {
+    const subsCount = await query(
+      `SELECT COUNT(*)::int AS c
+         FROM public.push_subscriptions
+        WHERE is_active = true`
+    );
+
+    const recentDispatches = await query(
+      `SELECT id, user_id, event_key, category, title, body, url, mode, source, status, error_message, sent_at, created_at
+         FROM public.notification_push_dispatches
+        ORDER BY created_at DESC
+        LIMIT 20`
+    );
+
+    const recentErrors = await query(
+      `SELECT id, user_id, event_key, category, status, error_message, created_at
+         FROM public.notification_push_dispatches
+        WHERE status = 'failed'
+        ORDER BY created_at DESC
+        LIMIT 20`
+    );
+
+    return res.json({
+      enabled: process.env.PUSH_ENABLED === "true",
+      test_mode: isPushTestMode(),
+      production_send_enabled: isPushProductionEnabled(),
+      allowed_test_user_ids: getAllowedTestUserIds(),
+      total_active_subscriptions: subsCount.rows[0]?.c || 0,
+      recent_dispatches: recentDispatches.rows || [],
+      recent_errors: recentErrors.rows || [],
+    });
+  } catch (e) {
+    console.error("[admin/notifications] push test-status error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+router.post("/push/test", async (req, res) => {
+  try {
+    const {
+      user_id: userId,
+      title,
+      body,
+      url,
+      category,
+      channel,
+      audience,
+      recipients,
+    } = req.body || {};
+
+    if (channel === "whatsapp" || audience || recipients) {
+      return res.status(400).json({ error: "invalid_push_test_request" });
+    }
+
+    if (!userId) {
+      return res.status(400).json({ error: "user_id_required" });
+    }
+
+    const uid = Number(userId);
+    const allowedIds = getAllowedTestUserIds();
+
+    if (isPushTestMode() && allowedIds.length > 0 && !allowedIds.includes(uid)) {
+      return res.status(403).json({ error: "push_user_not_allowed_for_test" });
+    }
+
+    const result = await sendPushToUser({
+      userId: uid,
+      title: title || "New Store",
+      body: body || "Push de teste enviado pelo admin.",
+      url: url || "/me",
+      eventKey: "PUSH_ADMIN_TEST",
+      category: category || "operational",
+      source: "admin_test",
+      isAdminTest: true,
+    });
+
+    return res.json({
+      ok: true,
+      mode: "test",
+      sent: result.sent || 0,
+      failed: result.failed || 0,
+      skipped: result.skipped || 0,
+    });
+  } catch (e) {
+    if (e?.code === "push_user_not_allowed_for_test") {
+      return res.status(403).json({ error: e.code });
+    }
+    if (e?.code === "push_disabled") {
+      return res.status(503).json({ error: e.code });
+    }
+    console.error("[admin/notifications] push test error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });

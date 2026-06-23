@@ -1,6 +1,8 @@
 // src/services/notifications/brevoWhatsApp.js
 // ESM — envio WhatsApp via Brevo (sem expor BREVO_API_KEY)
 
+import { assertWhatsAppAllowed } from "./whatsappSafetyGuard.js";
+
 export function normalizePhoneBR(phone) {
   if (phone == null) return null;
   const digits = String(phone).replace(/\D/g, "");
@@ -163,8 +165,37 @@ export async function sendBrevoWhatsAppTemplate({
   correlationId,
   allowAdminTestCustomRecipient = false,
   context = "system",
+  source,
+  isAutomation = false,
+  isCampaign = false,
 }) {
   void correlationId;
+
+  const resolvedSource = source || context || "system";
+  const resolvedIsCampaign =
+    isCampaign ||
+    context === "manual_send" ||
+    context === "manual_send_selected";
+
+  try {
+    assertWhatsAppAllowed({
+      source: resolvedSource,
+      isAutomation,
+      isCampaign: resolvedIsCampaign,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: err.code || err.message,
+      provider: "brevo",
+      channel: "whatsapp",
+      recipient: null,
+      recipient_original: null,
+      recipient_forced: false,
+      recipient_mode: null,
+    };
+  }
 
   let recipient = null;
   let recipient_original = null;
