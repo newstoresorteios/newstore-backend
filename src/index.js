@@ -63,6 +63,7 @@ import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
 import { ensureAppConfig } from "./services/config.js";
 import { validateTrayConfigAtStartup } from "./services/trayConfig.js";
+import { configureWebPush } from "./services/notifications/pushNotifications.js";
 
 const app = express();
 // Importante para rodar atrás de proxy (Render/Nginx/Cloudflare/etc):
@@ -71,6 +72,7 @@ app.set("trust proxy", 1);
 
 // Validação de config Tray no boot (sem imprimir segredos)
 try { validateTrayConfigAtStartup(); } catch {}
+try { configureWebPush(); } catch {}
 
 const PORT = process.env.PORT || 4000;
 
@@ -139,6 +141,7 @@ app.use("/api/orders", paymentsRoutes); // aliases
 app.use("/api/participations", paymentsRoutes); // aliases
 
 app.use("/api/me", meRoutes);
+app.use("/api/push", pushRouter);
 app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
 
@@ -160,6 +163,7 @@ app.use("/api/admin/analytics", adminAnalyticsRouter);
 app.use("/api/admin/notifications", adminNotificationsRouter);
 
 app.use("/api/webhooks/brevo", brevoWebhooksRouter);
+app.use("/api/internal/notifications", internalNotificationsRouter);
 
 // ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);
