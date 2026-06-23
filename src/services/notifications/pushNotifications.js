@@ -1,7 +1,9 @@
+import crypto from "crypto";
 import webpush from "web-push";
 import { query } from "../../db.js";
 import {
   assertAllowedTestSubscription,
+  getAllowedTestSubscriptionIds,
   assertPushSingleDeviceMode,
   coded,
 } from "./pushSingleDeviceGuard.js";
@@ -49,11 +51,30 @@ function safeErrorMessage(error) {
   return trimmed(error?.body || error?.message || error?.code || "push_send_failed", 500);
 }
 
-export function configureWebPush() {
+function readVapidEnv() {
   const publicKey = String(process.env.PUSH_VAPID_PUBLIC_KEY || "").trim();
   const privateKey = String(process.env.PUSH_VAPID_PRIVATE_KEY || "").trim();
   const subject = String(process.env.PUSH_VAPID_SUBJECT || "").trim();
+  const subjectValid = !subject || subject.startsWith("mailto:") || subject.startsWith("https://");
+  return { publicKey, privateKey, subject, subjectValid };
+}
+
+function publicKeyFingerprint(publicKey) {
+  if (!publicKey) return null;
+  return crypto.createHash("sha256").update(publicKey).digest("hex").slice(0, 12);
+}
+
+function providerErrorCode(statusCode) {
+  if (statusCode === 400) return "push_provider_bad_request";
+  if (statusCode === 403) return "push_provider_forbidden_or_vapid_mismatch";
+  if (statusCode === 404 || statusCode === 410) return "push_subscription_gone_or_expired";
+  return "push_send_failed";
+}
+
+export function configureWebPush() {
+  const { publicKey, privateKey, subject, subjectValid } = readVapidEnv();
   if (!publicKey || !privateKey || !subject) throw coded("push_vapid_configuration_missing");
+  if (!subjectValid) throw coded("push_vapid_subject_invalid");
 
   const signature = `${subject}:${publicKey.length}:${privateKey.length}`;
   if (configuredSignature !== signature) {
@@ -64,7 +85,38 @@ export function configureWebPush() {
 }
 
 export function getVapidPublicKey() {
-  return String(process.env.PUSH_VAPID_PUBLIC_KEY || "").trim() || null;
+  return readVapidEnv().publicKey || null;
+}
+
+export function getPushVapidConfigStatus() {
+  const { publicKey, privateKey, subject, subjectValid } = readVapidEnv();
+  const hasPushEnabled = process.env.PUSH_ENABLED === "true";
+  const mode = String(process.env.PUSH_MODE || "").trim() || null;
+  const hasPublicKey = Boolean(publicKey);
+  const hasPrivateKey = Boolean(privateKey);
+  const hasSubject = Boolean(subject);
+  const enabled =
+    hasPushEnabled &&
+    mode === "single_device_test" &&
+    process.env.PUSH_TEST_ONLY === "true" &&
+    hasPublicKey &&
+    hasPrivateKey &&
+    hasSubject &&
+    subjectValid;
+
+  return {
+    enabled,
+    hasPushEnabled,
+    mode,
+    hasPublicKey,
+    hasPrivateKey,
+    hasSubject,
+    publicKeyLength: publicKey.length,
+    privateKeyLength: privateKey.length,
+    subjectValueSafe: subject || null,
+    publicKeyFingerprint: publicKeyFingerprint(publicKey),
+    error: hasSubject && !subjectValid ? "push_vapid_subject_invalid" : null,
+  };
 }
 
 export async function savePushSubscription({
@@ -260,7 +312,19 @@ export async function sendPushToSubscriptionRow({
       throw error;
     }
     const statusCode = Number(error?.statusCode || error?.status || 0);
-    const errorMessage = safeErrorMessage(error);
+    const providerCode = providerErrorCode(statusCode);
+    const providerMessage = safeErrorMessage(error);
+    const errorMessage = `${providerCode}${statusCode ? `:${statusCode}` : ""}`;
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[push.test] provider-error", {
+        statusCode: statusCode || null,
+        errorName: error?.name || null,
+        message: providerMessage,
+        subscription_id: subscriptionRow.id,
+        user_id: subscriptionRow.user_id || null,
+        event_key: "PUSH_SINGLE_DEVICE_TEST",
+      });
+    }
     await query(
       `INSERT INTO public.notification_push_dispatches (
          user_id, subscription_id, event_key, category, title, body, url,
@@ -284,8 +348,17 @@ export async function sendPushToSubscriptionRow({
         WHERE id = $1`,
       [subscriptionRow.id, errorMessage, statusCode]
     ).catch(() => {});
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[push.test] send:failed", {
+        statusCode: statusCode || null,
+        error: providerCode,
+        subscription_id: subscriptionRow.id,
+      });
+    }
     console.log("[push.single-device] send:failed");
-    throw coded("push_send_failed");
+    const out = coded(providerCode);
+    out.provider_status = statusCode || null;
+    throw out;
   }
 }
 
@@ -296,6 +369,9 @@ export async function sendTestPushToConfiguredSubscription({
   payload = {},
   source = "manual_test",
 }) {
+  if (process.env.NODE_ENV !== "production") {
+    console.log("[push.test] send:start");
+  }
   assertPushSingleDeviceMode({
     source,
     isAudience: false,
@@ -303,20 +379,29 @@ export async function sendTestPushToConfiguredSubscription({
     isMassSend: false,
     isCampaign: false,
   });
-  const subscriptionId = String(process.env.PUSH_TEST_SUBSCRIPTION_ID || "").trim();
+  const subscriptionIds = getAllowedTestSubscriptionIds();
   const result = await query(
     `SELECT * FROM public.push_subscriptions
-      WHERE id = $1
+      WHERE id = ANY($1::uuid[])
         AND is_active = true`,
-    [subscriptionId]
+    [subscriptionIds]
   );
   if (!result.rows[0]) throw coded("push_test_subscription_not_found_or_inactive");
-  return sendPushToSubscriptionRow({
-    subscriptionRow: result.rows[0],
-    title,
-    body,
-    url,
-    payload,
-    source,
-  });
+  const dispatches = [];
+  for (const row of result.rows) {
+    // each subscription is validated again immediately before delivery
+    const out = await sendPushToSubscriptionRow({
+      subscriptionRow: row,
+      title,
+      body,
+      url,
+      payload,
+      source,
+    });
+    dispatches.push(out);
+  }
+  if (process.env.NODE_ENV !== "production") {
+    console.log("[push.test] send:done", { count: dispatches.length });
+  }
+  return { ok: true, sent: dispatches, count: dispatches.length };
 }
