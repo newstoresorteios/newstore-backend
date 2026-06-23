@@ -32,7 +32,12 @@ router.get('/', async (_req, res) => {
   try {
     // 1) draw aberto
     const dr = await query(
-      `SELECT id FROM draws WHERE status = 'open' ORDER BY id DESC LIMIT 1`
+      `SELECT id
+         FROM draws
+        WHERE status = 'open'
+          AND COALESCE(draw_type, 'principal') = 'principal'
+        ORDER BY id DESC
+        LIMIT 1`
     );
     if (!dr.rows.length) return res.json({ drawId: null, numbers: [] });
     const drawId = dr.rows[0].id;

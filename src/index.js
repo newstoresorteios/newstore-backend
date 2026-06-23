@@ -1,5 +1,5 @@
 // backend/src/index.js
-import "dotenv/config";
+import "./config/env.js";
 import dns from "dns";
 try { dns.setDefaultResultOrder("ipv4first"); } catch {}
 
@@ -12,6 +12,10 @@ import numbersRoutes from "./routes/numbers.js";
 import reservationsRoutes from "./routes/reservations.js";
 import paymentsRoutes from "./routes/payments.js";
 import paymentsVindiRoutes from "./routes/payments_vindi.js";
+import additionalDrawsRoutes from "./routes/additional_draws.js";
+import additionalPaymentsRoutes from "./routes/additional_payments.js";
+import secondaryDrawsRoutes from "./routes/secondary_draws.js";
+import secondaryPaymentsRoutes from "./routes/secondary_payments.js";
 import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
@@ -20,8 +24,11 @@ import drawsExtRoutes from "./routes/draws_ext.js";
 import adminDrawsRouter from "./routes/admin_draws.js";
 import adminClientsRouter from "./routes/admin_clients.js";
 import adminWinnersRouter from "./routes/admin_winners.js";
+import adminAdditionalDrawsRouter from "./routes/admin_additional_draws.js";
+import adminSecondaryWinnersRouter from "./routes/admin_secondary_winners.js";
 import adminDashboardRouter from "./routes/admin_dashboard.js";
 import adminBalanceHistoryRouter from "./routes/admin_balance_history.js";
+import adminSecondaryDrawsRouter from "./routes/admin_secondary_draws.js";
 
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
@@ -103,16 +110,33 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-app.use(autoReconcile);
+// Push nunca passa pela reconciliação de pagamentos/reservas.
+app.use((req, res, next) => {
+  const path = String(req.path || "");
+  if (
+    path.startsWith("/api/push") ||
+    path.startsWith("/api/internal/notifications") ||
+    path.startsWith("/api/admin/notifications/push")
+  ) {
+    return next();
+  }
+  return autoReconcile(req, res, next);
+});
 
 // ── Rotas públicas/gerais ───────────────────────────────────
 app.use("/api/auth", authRoutes);
+app.use("/api/push", pushRouter);
+app.use("/api/internal/notifications", internalNotificationsRouter);
 app.use("/api/numbers", numbersRoutes);
 app.use("/api/reservations", reservationsRoutes);
 
 // Pagamentos
 app.use("/api/payments", paymentsRoutes);
 app.use("/api/payments", paymentsVindiRoutes);
+app.use("/api/additional-draws", additionalDrawsRoutes);
+app.use("/api/additional-payments", additionalPaymentsRoutes);
+app.use("/api/secondary-draws", secondaryDrawsRoutes);
+app.use("/api/secondary-payments", secondaryPaymentsRoutes);
 app.use("/api/orders", paymentsRoutes); // aliases
 app.use("/api/participations", paymentsRoutes); // aliases
 
@@ -125,8 +149,11 @@ app.use("/api/draws-ext", drawsExtRoutes);
 app.use("/api/admin/draws", adminDrawsRouter);
 app.use("/api/admin/clients", adminClientsRouter);
 app.use("/api/admin/winners", adminWinnersRouter);
+app.use("/api/admin/additional-draws", adminAdditionalDrawsRouter);
+app.use("/api/admin/secondary-winners", adminSecondaryWinnersRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
 app.use("/api/admin/balance-history", adminBalanceHistoryRouter);
+app.use("/api/admin/secondary-draws", adminSecondaryDrawsRouter);
 
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza
