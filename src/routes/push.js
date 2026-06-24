@@ -4,7 +4,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { query } from "../db.js";
 import {
   assertPushTestAccountAllowed,
-  isPushTestAccountAllowed,
+  getPushAccessDecision,
 } from "../services/notifications/pushAccessGuard.js";
 import {
   deactivatePushSubscription,
@@ -71,13 +71,19 @@ function assertOnlyTestFields(body) {
   }
 }
 
-function logAccessCheck(req, visible) {
-  if (process.env.NODE_ENV === "production") return;
-  console.log("[push.access] check", {
-    user_id: req.user?.id || null,
-    allowed_user_id: process.env.PUSH_TEST_ALLOWED_USER_ID || null,
-    has_allowed_email: Boolean(String(process.env.PUSH_TEST_ALLOWED_EMAIL || "").trim()),
-    visible: Boolean(visible),
+function logAccessCheck(decision) {
+  console.log("[push.access] decision", {
+    user_id: decision.userId,
+    has_email: decision.hasEmail,
+    allowed_user_id_configured: decision.allowedUserIdConfigured,
+    allowed_email_configured: decision.allowedEmailConfigured,
+    matches_user_id: decision.matchesUserId,
+    matches_email: decision.matchesEmail,
+    push_enabled: decision.pushEnabled,
+    mode: decision.mode || null,
+    test_only: decision.testOnly,
+    visible: decision.visible,
+    reason: decision.reason || null,
   });
 }
 
@@ -114,9 +120,9 @@ function logConfigStatus() {
 router.use(requireAuth);
 
 router.get("/access", (req, res) => {
-  const visible = isPushTestAccountAllowed({ user: req.user });
-  logAccessCheck(req, visible);
-  if (!visible) {
+  const decision = getPushAccessDecision({ user: req.user });
+  logAccessCheck(decision);
+  if (!decision.visible) {
     return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
   }
   return res.json({
