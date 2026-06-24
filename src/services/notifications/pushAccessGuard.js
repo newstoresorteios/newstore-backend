@@ -17,12 +17,12 @@ export function assertPushTestAccountAllowed({ user } = {}) {
     throw coded("push_mode_not_single_device_test");
   }
   if (process.env.PUSH_TEST_ONLY !== "true") throw coded("push_test_only_required");
-  if (!allowedUserId) throw coded("push_test_allowed_user_id_missing");
+  if (!allowedUserId && !allowedEmail) throw coded("push_test_allowed_user_missing");
   if (!user || !user.id) throw coded("push_user_not_authenticated");
-  if (String(user.id) !== allowedUserId) throw coded("push_hidden_for_user");
-  if (allowedEmail && normalizeEmail(user.email) !== allowedEmail) {
-    throw coded("push_hidden_for_user");
-  }
+
+  const idAllowed = Boolean(allowedUserId && String(user.id) === allowedUserId);
+  const emailAllowed = Boolean(allowedEmail && normalizeEmail(user.email) === allowedEmail);
+  if (!idAllowed && !emailAllowed) throw coded("push_hidden_for_user");
   return true;
 }
 
