@@ -4,6 +4,7 @@ import { query } from "../../db.js";
 import {
   assertAllowedTestSubscription,
   getAllowedTestSubscriptionIds,
+  assertPushCurrentDeviceMode,
   assertPushSingleDeviceMode,
   coded,
 } from "./pushSingleDeviceGuard.js";
@@ -241,12 +242,18 @@ export async function sendPushToSubscriptionRow({
   url,
   payload,
   source = "manual_test",
+  eventKey = "PUSH_SINGLE_DEVICE_TEST",
+  category = "test",
+  requireConfiguredSubscription = true,
 }) {
   const message = validateMessage({ title, body, url });
   const extraPayload = safePayload(payload);
 
   try {
-    assertPushSingleDeviceMode({
+    const assertMode = requireConfiguredSubscription
+      ? assertPushSingleDeviceMode
+      : assertPushCurrentDeviceMode;
+    assertMode({
       source,
       isAudience: false,
       isEngine: false,
@@ -268,8 +275,8 @@ export async function sendPushToSubscriptionRow({
     title: message.title,
     body: message.body,
     url: message.url,
-    event_key: "PUSH_SINGLE_DEVICE_TEST",
-    category: "test",
+    event_key: eventKey,
+    category,
     test_label: process.env.PUSH_TEST_PHONE_LABEL || DEFAULT_TEST_LABEL,
     created_at: new Date().toISOString(),
   };
@@ -280,18 +287,22 @@ export async function sendPushToSubscriptionRow({
 
   console.log("[push.single-device] send:start");
   try {
-    assertAllowedTestSubscription({ subscriptionId: subscriptionRow.id });
+    if (requireConfiguredSubscription) {
+      assertAllowedTestSubscription({ subscriptionId: subscriptionRow.id });
+    }
     await webpush.sendNotification(pushSubscription, JSON.stringify(browserPayload));
 
     const dispatch = await query(
       `INSERT INTO public.notification_push_dispatches (
          user_id, subscription_id, event_key, category, title, body, url,
          payload, status, sent_at
-       ) VALUES ($1, $2, 'PUSH_SINGLE_DEVICE_TEST', 'test', $3, $4, $5, $6::jsonb, 'sent', now())
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'sent', now())
        RETURNING id, status, sent_at`,
       [
         subscriptionRow.user_id || null,
         subscriptionRow.id,
+        eventKey,
+        category,
         message.title,
         message.body,
         message.url,
@@ -322,17 +333,19 @@ export async function sendPushToSubscriptionRow({
         message: providerMessage,
         subscription_id: subscriptionRow.id,
         user_id: subscriptionRow.user_id || null,
-        event_key: "PUSH_SINGLE_DEVICE_TEST",
+        event_key: eventKey,
       });
     }
     await query(
       `INSERT INTO public.notification_push_dispatches (
          user_id, subscription_id, event_key, category, title, body, url,
          payload, status, error_message
-       ) VALUES ($1, $2, 'PUSH_SINGLE_DEVICE_TEST', 'test', $3, $4, $5, $6::jsonb, 'failed', $7)`,
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'failed', $9)`,
       [
         subscriptionRow.user_id || null,
         subscriptionRow.id,
+        eventKey,
+        category,
         message.title,
         message.body,
         message.url,

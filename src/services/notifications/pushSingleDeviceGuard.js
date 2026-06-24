@@ -77,6 +77,59 @@ export function assertPushSingleDeviceMode({
   return true;
 }
 
+export function assertPushCurrentDeviceMode({
+  source = "current_device_test",
+  isAudience = false,
+  isEngine = false,
+  isMassSend = false,
+  isCampaign = false,
+} = {}) {
+  if (process.env.PUSH_ENABLED !== "true") throw coded("push_disabled");
+  if (process.env.PUSH_MODE !== "single_device_test") {
+    throw coded("push_mode_not_single_device_test");
+  }
+  if (process.env.PUSH_TEST_ONLY !== "true") throw coded("push_test_only_required");
+  if (
+    process.env.NODE_ENV === "production" &&
+    process.env.PUSH_ALLOW_PRODUCTION_SEND !== "true"
+  ) {
+    throw coded("push_production_send_blocked");
+  }
+  if (
+    process.env.NODE_ENV === "production" &&
+    [
+      process.env.PUSH_ALLOW_DB_RECIPIENT_LOOKUP,
+      process.env.PUSH_ALLOW_AUDIENCE,
+      process.env.PUSH_ALLOW_ENGINE_EVENTS,
+      process.env.PUSH_ALLOW_ADMIN_MASS_SEND,
+      process.env.PUSH_ALLOW_CAMPAIGNS,
+    ].some((value) => value === "true")
+  ) {
+    throw coded("push_production_unsafe_flags_blocked");
+  }
+
+  const normalizedSource = String(source || "").trim().toLowerCase();
+  if (
+    process.env.PUSH_ALLOW_DB_RECIPIENT_LOOKUP !== "true" &&
+    ["db_lookup", "audience", "campaign", "engine"].includes(normalizedSource)
+  ) {
+    throw coded("push_db_recipient_lookup_blocked");
+  }
+  if (isAudience && process.env.PUSH_ALLOW_AUDIENCE !== "true") {
+    throw coded("push_audience_blocked");
+  }
+  if (isEngine && process.env.PUSH_ALLOW_ENGINE_EVENTS !== "true") {
+    throw coded("push_engine_blocked");
+  }
+  if (isMassSend && process.env.PUSH_ALLOW_ADMIN_MASS_SEND !== "true") {
+    throw coded("push_mass_send_blocked");
+  }
+  if (isCampaign && process.env.PUSH_ALLOW_CAMPAIGNS !== "true") {
+    throw coded("push_campaign_blocked");
+  }
+  return true;
+}
+
 export function assertPushSubscribeMode() {
   if (process.env.PUSH_ENABLED !== "true") throw coded("push_disabled");
   if (process.env.PUSH_MODE !== "single_device_test") {

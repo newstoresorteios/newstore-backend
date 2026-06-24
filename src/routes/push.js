@@ -4,6 +4,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { query } from "../db.js";
 import {
   assertPushTestAccountAllowed,
+  getAuthenticatedUserId,
   getPushAccessDecision,
 } from "../services/notifications/pushAccessGuard.js";
 import {
@@ -12,6 +13,7 @@ import {
   getPushVapidConfigStatus,
   getVapidPublicKey,
   savePushSubscription,
+  sendPushToSubscriptionRow,
   sendTestPushToConfiguredSubscription,
   updatePushPreferences,
 } from "../services/notifications/pushNotifications.js";
@@ -24,6 +26,20 @@ const router = express.Router();
 const TEST_LABEL = "43998640480";
 const TEST_FIELDS = new Set(["title", "body", "url"]);
 
+function getRequestUserId(req) {
+  return getAuthenticatedUserId({ user: req.user, auth: req.auth });
+}
+
+function requireRequestUserId(req) {
+  const userId = getRequestUserId(req);
+  if (userId == null) {
+    const error = new Error("push_user_not_authenticated");
+    error.code = "push_user_not_authenticated";
+    throw error;
+  }
+  return userId;
+}
+
 function sameSecret(value, expected) {
   const a = Buffer.from(String(value || ""));
   const b = Buffer.from(String(expected || ""));
@@ -34,6 +50,7 @@ function statusFor(code) {
   if (code === "push_hidden_for_user") return 404;
   if (code === "push_user_not_authenticated") return 401;
   if (code === "push_test_subscription_not_found_or_inactive") return 404;
+  if (code === "push_current_device_subscription_not_found") return 404;
   if (code === "push_tables_missing") return 500;
   if (code === "push_test_setup_code_required") return 403;
   if (code === "push_test_setup_code_not_configured") return 500;
@@ -73,7 +90,7 @@ function assertOnlyTestFields(body) {
 
 function logAccessCheck(decision) {
   console.log("[push.access] decision", {
-    user_id: decision.userId,
+    resolved_user_id: decision.userId,
     has_email: decision.hasEmail,
     allowed_user_id_configured: decision.allowedUserIdConfigured,
     allowed_email_configured: decision.allowedEmailConfigured,
@@ -120,7 +137,7 @@ function logConfigStatus() {
 router.use(requireAuth);
 
 router.get("/access", (req, res) => {
-  const decision = getPushAccessDecision({ user: req.user });
+  const decision = getPushAccessDecision({ user: req.user, auth: req.auth });
   logAccessCheck(decision);
   if (!decision.visible) {
     return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
@@ -140,7 +157,7 @@ router.get("/access", (req, res) => {
 
 router.use((req, res, next) => {
   try {
-    assertPushTestAccountAllowed({ user: req.user });
+    assertPushTestAccountAllowed({ user: req.user, auth: req.auth });
     return next();
   } catch (error) {
     return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
@@ -182,7 +199,7 @@ router.get("/debug-config", (_req, res) => {
 
 router.get("/preferences", async (req, res) => {
   try {
-    return res.json(await getPushPreferences({ userId: req.user.id }));
+    return res.json(await getPushPreferences({ userId: requireRequestUserId(req) }));
   } catch (error) {
     return sendError(res, error);
   }
@@ -197,7 +214,7 @@ router.put("/preferences", async (req, res) => {
       throw error;
     }
     const preferences = await updatePushPreferences({
-      userId: req.user.id,
+      userId: requireRequestUserId(req),
       operationalOptIn: req.body?.push_operational_opt_in,
       marketingOptIn: req.body?.push_marketing_opt_in,
     });
@@ -210,9 +227,10 @@ router.put("/preferences", async (req, res) => {
 router.post("/subscribe", async (req, res) => {
   try {
     assertPushSubscribeMode();
+    const userId = requireRequestUserId(req);
     if (process.env.NODE_ENV !== "production") {
       console.log("[push.subscribe] start", {
-        user_id: req.user?.id || null,
+        user_id: userId,
       });
     }
     const allowed = new Set(["subscription", "deviceLabel", "setupCode"]);
@@ -251,14 +269,14 @@ router.post("/subscribe", async (req, res) => {
              FROM public.push_subscriptions
             WHERE user_id = $1 AND endpoint = $2
             LIMIT 1`,
-          [req.user.id, incomingEndpoint]
+          [userId, incomingEndpoint]
         )
       : null;
     const activeCountResult = await query(
       `SELECT COUNT(*)::int AS count
          FROM public.push_subscriptions
         WHERE user_id = $1 AND is_active = true`,
-      [req.user.id]
+      [userId]
     );
     const activeCount = Number(activeCountResult?.rows?.[0]?.count || 0);
     const maxDevices = Math.max(1, Number(process.env.PUSH_TEST_MAX_DEVICES || 2) || 2);
@@ -274,7 +292,7 @@ router.post("/subscribe", async (req, res) => {
     }
 
     const saved = await savePushSubscription({
-      userId: req.user.id,
+      userId,
       subscription: req.body?.subscription,
       userAgent: req.get("user-agent") || null,
       deviceLabel: req.body?.deviceLabel,
@@ -313,8 +331,60 @@ router.post("/unsubscribe", async (req, res) => {
       throw error;
     }
     return res.json(
-      await deactivatePushSubscription({ userId: req.user.id, endpoint: req.body?.endpoint })
+      await deactivatePushSubscription({ userId: requireRequestUserId(req), endpoint: req.body?.endpoint })
     );
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
+router.post("/test-current-device", async (req, res) => {
+  try {
+    const allowed = new Set(["subscription"]);
+    if (Object.keys(req.body || {}).some((key) => !allowed.has(key))) {
+      const error = new Error("push_test_payload_not_allowed");
+      error.code = "push_test_payload_not_allowed";
+      throw error;
+    }
+
+    const userId = requireRequestUserId(req);
+    const endpoint = String(req.body?.subscription?.endpoint || "").trim();
+    if (!endpoint) {
+      const error = new Error("push_endpoint_required");
+      error.code = "push_endpoint_required";
+      throw error;
+    }
+
+    const result = await query(
+      `SELECT *
+         FROM public.push_subscriptions
+        WHERE endpoint = $1
+          AND user_id = $2
+          AND is_active = true
+        LIMIT 1`,
+      [endpoint, userId]
+    );
+
+    const subscriptionRow = result.rows?.[0];
+    if (!subscriptionRow) {
+      const error = new Error("push_current_device_subscription_not_found");
+      error.code = "push_current_device_subscription_not_found";
+      throw error;
+    }
+
+    const out = await sendPushToSubscriptionRow({
+      subscriptionRow,
+      title: "New Store",
+      body: "Teste controlado de Push enviado para este dispositivo.",
+      url: "/conta",
+      payload: {},
+      source: "current_device_test",
+      eventKey: "PUSH_TEST_CURRENT_DEVICE",
+      category: "operational",
+      requireConfiguredSubscription: false,
+    });
+
+    return res.json({ ok: true, ...out });
   } catch (error) {
     return sendError(res, error);
   }
