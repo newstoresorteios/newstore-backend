@@ -122,6 +122,7 @@ router.get("/access", (req, res) => {
   return res.json({
     ok: true,
     visible: true,
+    allowed: true,
     mode: "single_device_test",
     test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
   });
