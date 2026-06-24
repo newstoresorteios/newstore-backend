@@ -117,14 +117,18 @@ router.get("/access", (req, res) => {
   const visible = isPushTestAccountAllowed({ user: req.user });
   logAccessCheck(req, visible);
   if (!visible) {
-    return res.status(404).json({ ok: false, visible: false, error: "push_hidden_for_user" });
+    return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
   }
   return res.json({
     ok: true,
     visible: true,
     allowed: true,
     mode: "single_device_test",
+    test_only: true,
     test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
+    production_send_enabled: process.env.PUSH_ALLOW_PRODUCTION_SEND === "true",
+    configured_subscription_count: getAllowedTestSubscriptionIds().length,
+    allowed_user_id_loaded: Boolean(String(process.env.PUSH_TEST_ALLOWED_USER_ID || "").trim()),
   });
 });
 
@@ -133,7 +137,7 @@ router.use((req, res, next) => {
     assertPushTestAccountAllowed({ user: req.user });
     return next();
   } catch (error) {
-    return res.status(404).json({ ok: false, visible: false, error: "push_hidden_for_user" });
+    return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
   }
 });
 
