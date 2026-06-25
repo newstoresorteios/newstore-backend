@@ -301,7 +301,7 @@ export async function getActivePushRuleByEventKey(eventKey) {
   const key = String(eventKey || "").trim();
   if (!EVENT_SET.has(key)) throw coded("push_rule_event_key_invalid");
   const result = await query(
-    `SELECT event_key, name, title_template, body_template, url_template,
+    `SELECT id, event_key, name, title_template, body_template, url_template,
             category, cooldown_minutes, threshold_value, last_triggered_at
        FROM public.notification_push_rules
       WHERE event_key = $1
