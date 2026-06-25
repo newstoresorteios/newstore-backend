@@ -95,6 +95,8 @@ router.get("/logs", async (req, res) => {
           d.error_message,
           d.sent_at,
           d.created_at,
+          d.payload->>'reference_type' AS reference_type,
+          d.payload->>'reference_key' AS reference_key,
           ps.device_label,
           ps.is_active AS subscription_active,
           ps.last_success_at,
