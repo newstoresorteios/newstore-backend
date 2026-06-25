@@ -32,39 +32,56 @@ export function getPushAccessDecision({ user, auth } = {}) {
   const pushEnabled = process.env.PUSH_ENABLED === "true";
   const mode = String(process.env.PUSH_MODE || "");
   const testOnly = process.env.PUSH_TEST_ONLY === "true";
+  const publicSubscribe = process.env.PUSH_ALLOW_PUBLIC_SUBSCRIBE === "true";
   const matchesUserId = Boolean(allowedUserId && userId != null && String(userId) === allowedUserId);
   const matchesEmail = Boolean(allowedEmail && userEmail && userEmail === allowedEmail);
+  const authenticated = userId != null || Boolean(userEmail);
+  const isTestAccount = matchesUserId || matchesEmail;
 
   let reason = null;
   if (!pushEnabled) reason = "push_disabled";
   else if (mode !== "single_device_test") reason = "push_mode_not_single_device_test";
   else if (!testOnly) reason = "push_test_only_required";
-  else if (!allowedUserId && !allowedEmail) reason = "push_test_allowed_user_missing";
-  else if (userId == null && !userEmail) reason = "push_user_not_authenticated";
-  else if (!matchesUserId && !matchesEmail) reason = "push_hidden_for_user";
+  else if (!authenticated) reason = "push_user_not_authenticated";
+  else if (!isTestAccount && !publicSubscribe) reason = "push_hidden_for_user";
+
+  const visible = !reason;
+  const canSubscribe = visible;
+  const canSendTest = !reason && isTestAccount;
 
   return {
-    visible: !reason,
+    visible,
+    allowed: visible,
+    canSubscribe,
+    canSendTest,
     reason,
     userId,
     hasEmail: Boolean(userEmail),
     pushEnabled,
     mode,
     testOnly,
+    publicSubscribe,
     allowedUserIdConfigured: Boolean(allowedUserId),
     allowedEmailConfigured: Boolean(allowedEmail),
     matchesUserId,
     matchesEmail,
+    isTestAccount,
   };
 }
 
 export function assertPushTestAccountAllowed({ user, auth } = {}) {
   const decision = getPushAccessDecision({ user, auth });
-  if (!decision.visible) throw coded(decision.reason || "push_hidden_for_user");
+  if (!decision.canSendTest) throw coded(decision.reason || "push_hidden_for_user");
+  return true;
+}
+
+export function assertPushSubscribeAllowed({ user, auth } = {}) {
+  const decision = getPushAccessDecision({ user, auth });
+  if (!decision.canSubscribe) throw coded(decision.reason || "push_hidden_for_user");
   return true;
 }
 
 export function isPushTestAccountAllowed({ user, auth } = {}) {
-  return getPushAccessDecision({ user, auth }).visible;
+  return getPushAccessDecision({ user, auth }).canSendTest;
 }
 
