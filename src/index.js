@@ -53,6 +53,7 @@ import autopayRunnerRoute from "./routes/autopay_runner.js";
 
 import adminAnalyticsRouter from "./routes/analytics.js";
 import adminNotificationsRouter from "./routes/adminNotifications.js";
+import adminPushLogsRouter from "./routes/admin_push_logs.js";
 import brevoWebhooksRouter from "./routes/brevoWebhooks.js";
 import pushRouter from "./routes/push.js";
 import internalNotificationsRouter from "./routes/internalNotifications.js";
@@ -116,6 +117,7 @@ app.use((req, res, next) => {
   if (
     path.startsWith("/api/push") ||
     path.startsWith("/api/internal/notifications") ||
+    path.startsWith("/api/admin/push") ||
     path.startsWith("/api/admin/notifications/push")
   ) {
     return next();
@@ -161,6 +163,7 @@ app.use("/api/admin/config", adminConfigRouter);
 
 app.use("/api/admin/analytics", adminAnalyticsRouter);
 app.use("/api/admin/notifications", adminNotificationsRouter);
+app.use("/api/admin/push", adminPushLogsRouter);
 
 app.use("/api/webhooks/brevo", brevoWebhooksRouter);
 app.use("/api/internal/notifications", internalNotificationsRouter);
