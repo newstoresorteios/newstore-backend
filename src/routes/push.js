@@ -26,6 +26,10 @@ const router = express.Router();
 const TEST_LABEL = "43998640480";
 const TEST_FIELDS = new Set(["title", "body", "url"]);
 
+function requiresSetupCode() {
+  return process.env.PUSH_REQUIRE_SETUP_CODE === "true";
+}
+
 function getRequestUserId(req) {
   return getAuthenticatedUserId({ user: req.user, auth: req.auth });
 }
@@ -152,6 +156,7 @@ router.get("/access", (req, res) => {
     production_send_enabled: process.env.PUSH_ALLOW_PRODUCTION_SEND === "true",
     configured_subscription_count: getAllowedTestSubscriptionIds().length,
     allowed_user_id_loaded: Boolean(String(process.env.PUSH_TEST_ALLOWED_USER_ID || "").trim()),
+    requires_setup_code: requiresSetupCode(),
   });
 });
 
@@ -239,7 +244,7 @@ router.post("/subscribe", async (req, res) => {
       error.code = "push_subscription_invalid";
       throw error;
     }
-    if (process.env.PUSH_ALLOW_PUBLIC_SUBSCRIBE !== "true") {
+    if (requiresSetupCode()) {
       const setupCode = String(req.body?.setupCode || "").trim();
       const expectedSetupCode = String(process.env.PUSH_TEST_SETUP_CODE || "").trim();
       if (process.env.NODE_ENV !== "production") {
@@ -263,40 +268,26 @@ router.post("/subscribe", async (req, res) => {
     }
 
     const incomingEndpoint = String(req.body?.subscription?.endpoint || "").trim();
-    const existing = incomingEndpoint
-      ? await query(
-          `SELECT id, is_active
-             FROM public.push_subscriptions
-            WHERE user_id = $1 AND endpoint = $2
-            LIMIT 1`,
-          [userId, incomingEndpoint]
-        )
-      : null;
-    const activeCountResult = await query(
-      `SELECT COUNT(*)::int AS count
-         FROM public.push_subscriptions
-        WHERE user_id = $1 AND is_active = true`,
-      [userId]
-    );
-    const activeCount = Number(activeCountResult?.rows?.[0]?.count || 0);
-    const maxDevices = Math.max(1, Number(process.env.PUSH_TEST_MAX_DEVICES || 2) || 2);
-    if (!existing?.rows?.[0] && activeCount >= maxDevices) {
-      const error = new Error("push_test_device_limit_reached");
-      error.code = "push_test_device_limit_reached";
-      throw error;
-    }
-    if (existing?.rows?.[0] && existing.rows[0].is_active !== true && activeCount >= maxDevices) {
-      const error = new Error("push_test_device_limit_reached");
-      error.code = "push_test_device_limit_reached";
-      throw error;
-    }
-
     const saved = await savePushSubscription({
       userId,
       subscription: req.body?.subscription,
       userAgent: req.get("user-agent") || null,
       deviceLabel: req.body?.deviceLabel,
     });
+    if (
+      process.env.PUSH_SINGLE_ACTIVE_DEVICE_PER_TEST_USER === "true" &&
+      incomingEndpoint
+    ) {
+      await query(
+        `UPDATE public.push_subscriptions
+            SET is_active = false,
+                updated_at = now()
+          WHERE user_id = $1
+            AND endpoint <> $2
+            AND is_active = true`,
+        [userId, incomingEndpoint]
+      );
+    }
     if (process.env.NODE_ENV !== "production") {
       console.log("[push.subscribe] saved", {
         subscription_id: saved.subscription_id || null,
@@ -307,7 +298,7 @@ router.post("/subscribe", async (req, res) => {
       subscription_id: saved.subscription_id,
       test_mode: true,
       test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
-      message: "Copie este subscription_id para PUSH_TEST_SUBSCRIPTION_ID para liberar envio de teste.",
+      message: "Notificações ativadas neste dispositivo.",
     });
   } catch (error) {
     if (isMissingTableError(error)) {
