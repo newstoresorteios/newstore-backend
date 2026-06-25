@@ -3,6 +3,7 @@ import express from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { query } from "../db.js";
 import {
+  assertPushSubscribeAllowed,
   assertPushTestAccountAllowed,
   getAuthenticatedUserId,
   getPushAccessDecision,
@@ -104,6 +105,8 @@ function logAccessCheck(decision) {
     mode: decision.mode || null,
     test_only: decision.testOnly,
     visible: decision.visible,
+    can_subscribe: decision.canSubscribe,
+    can_send_test: decision.canSendTest,
     reason: decision.reason || null,
   });
 }
@@ -144,12 +147,21 @@ router.get("/access", (req, res) => {
   const decision = getPushAccessDecision({ user: req.user, auth: req.auth });
   logAccessCheck(decision);
   if (!decision.visible) {
-    return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
+    return res.status(404).json({
+      ok: false,
+      visible: false,
+      allowed: false,
+      can_subscribe: false,
+      can_send_test: false,
+      error: "push_hidden_for_user",
+    });
   }
   return res.json({
     ok: true,
-    visible: true,
-    allowed: true,
+    visible: decision.visible,
+    allowed: decision.allowed,
+    can_subscribe: decision.canSubscribe,
+    can_send_test: decision.canSendTest,
     mode: "single_device_test",
     test_only: true,
     test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
@@ -162,7 +174,7 @@ router.get("/access", (req, res) => {
 
 router.use((req, res, next) => {
   try {
-    assertPushTestAccountAllowed({ user: req.user, auth: req.auth });
+    assertPushSubscribeAllowed({ user: req.user, auth: req.auth });
     return next();
   } catch (error) {
     return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
@@ -183,9 +195,14 @@ router.get("/vapid-public-key", (_req, res) => {
   });
 });
 
-router.get("/debug-config", (_req, res) => {
+router.get("/debug-config", (req, res) => {
   if (process.env.NODE_ENV === "production") {
     return res.status(404).json({ ok: false, error: "push_debug_not_available" });
+  }
+  try {
+    assertPushTestAccountAllowed({ user: req.user, auth: req.auth });
+  } catch (error) {
+    return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
   }
   const subscriptionIds = getAllowedTestSubscriptionIds();
   return res.json({
@@ -331,6 +348,7 @@ router.post("/unsubscribe", async (req, res) => {
 
 router.post("/test-current-device", async (req, res) => {
   try {
+    assertPushTestAccountAllowed({ user: req.user, auth: req.auth });
     const allowed = new Set(["subscription"]);
     if (Object.keys(req.body || {}).some((key) => !allowed.has(key))) {
       const error = new Error("push_test_payload_not_allowed");
@@ -383,6 +401,7 @@ router.post("/test-current-device", async (req, res) => {
 
 async function handleTest(req, res) {
   try {
+    assertPushTestAccountAllowed({ user: req.user, auth: req.auth });
     assertOnlyTestFields(req.body || {});
     const result = await sendTestPushToConfiguredSubscription({
       title: req.body?.title,
