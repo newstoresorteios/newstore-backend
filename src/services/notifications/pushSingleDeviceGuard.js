@@ -132,10 +132,14 @@ export function assertPushCurrentDeviceMode({
 
 export function assertPushSubscribeMode() {
   if (process.env.PUSH_ENABLED !== "true") throw coded("push_disabled");
-  if (process.env.PUSH_MODE !== "single_device_test") {
+  const testOnly = process.env.PUSH_TEST_ONLY === "true";
+  const mode = String(process.env.PUSH_MODE || "").trim();
+  if (testOnly && mode !== "single_device_test") {
     throw coded("push_mode_not_single_device_test");
   }
-  if (process.env.PUSH_TEST_ONLY !== "true") throw coded("push_test_only_required");
+  if (!testOnly && mode !== "production") {
+    throw coded("push_mode_not_production");
+  }
   return true;
 }
 

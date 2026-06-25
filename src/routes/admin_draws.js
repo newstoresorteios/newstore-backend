@@ -3,8 +3,33 @@ import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { runAutopayForDraw } from "../services/autopayRunner.js";
+import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
 
 const router = Router();
+
+async function emitAdminNewDrawPublished(drawId) {
+  if (process.env.PUSH_ALLOW_ENGINE_EVENTS !== "true") return;
+  try {
+    await handlePushAutomationEvent({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      source: "admin",
+      referenceType: "draw",
+      referenceKey: `draw:${drawId}`,
+      metadata: {
+        draw_id: Number(drawId),
+        origin: "admin",
+      },
+      actor: { type: "admin_draws" },
+      dryRun: process.env.PUSH_ENGINE_DRY_RUN !== "false",
+    });
+  } catch (error) {
+    console.warn("[admin/draws] push automation event skipped", {
+      draw_id: drawId,
+      code: error?.code || null,
+      message: error?.message || null,
+    });
+  }
+}
 
 async function requireAdmin(req, res, next) {
   try {
@@ -67,6 +92,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
         autopay: result || null,
       });
     }
+    await emitAdminNewDrawPublished(draw.id);
     return res.json({ ok: true, draw_id: draw.id, draw, autopay: result });
   } catch (e) {
     console.error("[admin/draws/new] error", e);
@@ -198,6 +224,7 @@ router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
 
   const result = await runAutopayForDraw(drawId);
   if (!result?.ok) return res.status(500).json(result);
+  await emitAdminNewDrawPublished(drawId);
   return res.json(result);
 });
 

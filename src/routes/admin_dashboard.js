@@ -4,11 +4,36 @@ import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents, setTicketPriceCents } from "../services/config.js";
 import { runAutopayForDraw } from "../services/autopayRunner.js";
+import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
 
 const router = Router();
 
 function log(...a) {
   console.log("[admin/dashboard]", ...a);
+}
+
+async function emitAdminNewDrawPublished(drawId) {
+  if (process.env.PUSH_ALLOW_ENGINE_EVENTS !== "true") return;
+  try {
+    await handlePushAutomationEvent({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      source: "admin",
+      referenceType: "draw",
+      referenceKey: `draw:${drawId}`,
+      metadata: {
+        draw_id: Number(drawId),
+        origin: "admin",
+      },
+      actor: { type: "admin_dashboard" },
+      dryRun: process.env.PUSH_ENGINE_DRY_RUN !== "false",
+    });
+  } catch (error) {
+    console.warn("[admin/dashboard] push automation event skipped", {
+      draw_id: drawId,
+      code: error?.code || null,
+      message: error?.message || null,
+    });
+  }
 }
 
 /**
@@ -155,6 +180,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
       return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: numberCount, autopay });
     }
 
+    await emitAdminNewDrawPublished(newId);
     return res.json({ ok: true, draw_id: newId, sold: 0, remaining: numberCount, autopay });
   } catch (e) {
     console.error("[admin/dashboard] /new error:", e);

@@ -93,13 +93,14 @@ export function getPushVapidConfigStatus() {
   const { publicKey, privateKey, subject, subjectValid } = readVapidEnv();
   const hasPushEnabled = process.env.PUSH_ENABLED === "true";
   const mode = String(process.env.PUSH_MODE || "").trim() || null;
+  const testOnly = process.env.PUSH_TEST_ONLY === "true";
+  const validMode = (testOnly && mode === "single_device_test") || (!testOnly && mode === "production");
   const hasPublicKey = Boolean(publicKey);
   const hasPrivateKey = Boolean(privateKey);
   const hasSubject = Boolean(subject);
   const enabled =
     hasPushEnabled &&
-    mode === "single_device_test" &&
-    process.env.PUSH_TEST_ONLY === "true" &&
+    validMode &&
     hasPublicKey &&
     hasPrivateKey &&
     hasSubject &&
@@ -109,6 +110,7 @@ export function getPushVapidConfigStatus() {
     enabled,
     hasPushEnabled,
     mode,
+    testOnly,
     hasPublicKey,
     hasPrivateKey,
     hasSubject,

@@ -162,8 +162,8 @@ router.get("/access", (req, res) => {
     allowed: decision.allowed,
     can_subscribe: decision.canSubscribe,
     can_send_test: decision.canSendTest,
-    mode: "single_device_test",
-    test_only: true,
+    mode: decision.mode,
+    test_only: decision.testOnly,
     test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
     production_send_enabled: process.env.PUSH_ALLOW_PRODUCTION_SEND === "true",
     configured_subscription_count: getAllowedTestSubscriptionIds().length,
@@ -186,8 +186,8 @@ router.get("/vapid-public-key", (_req, res) => {
   logConfigStatus();
   return res.json({
     enabled: status.enabled,
-    mode: "single_device_test",
-    test_only: true,
+    mode: status.mode,
+    test_only: status.testOnly,
     publicKey: status.enabled ? getVapidPublicKey() : null,
     test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
     publicKeyFingerprint: status.publicKeyFingerprint,

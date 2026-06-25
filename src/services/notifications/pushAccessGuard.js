@@ -58,6 +58,8 @@ export function getPushAccessDecision({ user, auth } = {}) {
   const mode = String(process.env.PUSH_MODE || "");
   const testOnly = process.env.PUSH_TEST_ONLY === "true";
   const publicSubscribe = process.env.PUSH_ALLOW_PUBLIC_SUBSCRIBE === "true";
+  const testMode = testOnly && mode === "single_device_test";
+  const productionMode = !testOnly && mode === "production";
   const matchesUserId = Boolean(userId != null && allowedUserIds.includes(String(userId)));
   const matchesEmail = Boolean(userEmail && allowedEmails.includes(userEmail));
   const authenticated = userId != null || Boolean(userEmail);
@@ -65,14 +67,14 @@ export function getPushAccessDecision({ user, auth } = {}) {
 
   let reason = null;
   if (!pushEnabled) reason = "push_disabled";
-  else if (mode !== "single_device_test") reason = "push_mode_not_single_device_test";
-  else if (!testOnly) reason = "push_test_only_required";
   else if (!authenticated) reason = "push_user_not_authenticated";
+  else if (testOnly && !testMode) reason = "push_mode_not_single_device_test";
+  else if (!testOnly && !productionMode) reason = "push_mode_not_production";
   else if (!isTestAccount && !publicSubscribe) reason = "push_hidden_for_user";
 
   const visible = !reason;
   const canSubscribe = visible;
-  const canSendTest = !reason && isTestAccount;
+  const canSendTest = !reason && isTestAccount && testOnly;
 
   return {
     visible,
