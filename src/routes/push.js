@@ -1,5 +1,7 @@
 import crypto from "crypto";
 import express from "express";
+import jwt from "jsonwebtoken";
+import { JWT_SECRET } from "../config/auth.js";
 import { requireAuth } from "../middleware/auth.js";
 import { query } from "../db.js";
 import {
@@ -26,6 +28,12 @@ import {
 const router = express.Router();
 const TEST_LABEL = "43998640480";
 const TEST_FIELDS = new Set(["title", "body", "url"]);
+const AUTH_COOKIE_NAMES = [
+  process.env.AUTH_COOKIE_NAME || "ns_auth",
+  "ns_auth_token",
+  "token",
+  "jwt",
+];
 
 function requiresSetupCode() {
   return process.env.PUSH_REQUIRE_SETUP_CODE === "true";
@@ -33,6 +41,40 @@ function requiresSetupCode() {
 
 function getRequestUserId(req) {
   return getAuthenticatedUserId({ user: req.user, auth: req.auth });
+}
+
+function sanitizeAuthToken(value) {
+  if (!value) return "";
+  return String(value)
+    .trim()
+    .replace(/^Bearer\s+/i, "")
+    .replace(/^[\'"]|[\'"]$/g, "");
+}
+
+function extractOptionalAuthToken(req) {
+  const headerToken = sanitizeAuthToken(req.headers?.authorization);
+  if (headerToken) return headerToken;
+  const cookies = req.cookies || {};
+  for (const name of AUTH_COOKIE_NAMES) {
+    const cookieToken = sanitizeAuthToken(cookies[name]);
+    if (cookieToken) return cookieToken;
+  }
+  return "";
+}
+
+function optionalPushAuth(req, _res, next) {
+  const token = extractOptionalAuthToken(req);
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = {
+      id: payload.id || payload.sub,
+      email: payload.email || payload.user?.email,
+      role: payload.role || payload.user?.role,
+      ...payload,
+    };
+  } catch {}
+  return next();
 }
 
 function requireRequestUserId(req) {
@@ -93,7 +135,7 @@ function assertOnlyTestFields(body) {
   }
 }
 
-function logAccessCheck(decision) {
+function logAccessCheck(decision, vapidStatus) {
   console.log("[push.access] decision", {
     resolved_user_id: decision.userId,
     has_email: decision.hasEmail,
@@ -105,9 +147,11 @@ function logAccessCheck(decision) {
     mode: decision.mode || null,
     test_only: decision.testOnly,
     visible: decision.visible,
-    can_subscribe: decision.canSubscribe,
+    can_subscribe: decision.canSubscribe && vapidStatus.enabled,
     can_send_test: decision.canSendTest,
     reason: decision.reason || null,
+    vapid_enabled: vapidStatus.enabled,
+    vapid_error: vapidStatus.error || null,
   });
 }
 
@@ -141,29 +185,26 @@ function logConfigStatus() {
   }
 }
 
-router.use(requireAuth);
-
-router.get("/access", (req, res) => {
+router.get("/access", optionalPushAuth, (req, res) => {
   const decision = getPushAccessDecision({ user: req.user, auth: req.auth });
-  logAccessCheck(decision);
-  if (!decision.visible) {
-    return res.status(404).json({
-      ok: false,
-      visible: false,
-      allowed: false,
-      can_subscribe: false,
-      can_send_test: false,
-      error: "push_hidden_for_user",
-    });
-  }
+  const vapidStatus = getPushVapidConfigStatus();
+  const canSubscribe = Boolean(decision.canSubscribe && vapidStatus.enabled);
+  const reason = canSubscribe
+    ? null
+    : decision.reason === "push_user_not_authenticated"
+      ? "auth_required"
+      : decision.reason || vapidStatus.error || "push_unavailable";
+  logAccessCheck(decision, vapidStatus);
   return res.json({
     ok: true,
-    visible: decision.visible,
-    allowed: decision.allowed,
-    can_subscribe: decision.canSubscribe,
-    can_send_test: decision.canSendTest,
+    enabled: vapidStatus.enabled,
+    visible: canSubscribe,
+    allowed: canSubscribe,
+    can_subscribe: canSubscribe,
+    can_send_test: Boolean(decision.canSendTest && vapidStatus.enabled),
     mode: decision.mode,
     test_only: decision.testOnly,
+    ...(reason ? { reason } : {}),
     test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
     production_send_enabled: process.env.PUSH_ALLOW_PRODUCTION_SEND === "true",
     configured_subscription_count: getAllowedTestSubscriptionIds().length,
@@ -172,19 +213,11 @@ router.get("/access", (req, res) => {
   });
 });
 
-router.use((req, res, next) => {
-  try {
-    assertPushSubscribeAllowed({ user: req.user, auth: req.auth });
-    return next();
-  } catch (error) {
-    return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
-  }
-});
-
-router.get("/vapid-public-key", (_req, res) => {
+router.get("/vapid-public-key", optionalPushAuth, (_req, res) => {
   const status = getPushVapidConfigStatus();
   logConfigStatus();
   return res.json({
+    ok: true,
     enabled: status.enabled,
     mode: status.mode,
     test_only: status.testOnly,
@@ -195,6 +228,16 @@ router.get("/vapid-public-key", (_req, res) => {
   });
 });
 
+router.use(requireAuth);
+
+router.use((req, res, next) => {
+  try {
+    assertPushSubscribeAllowed({ user: req.user, auth: req.auth });
+    return next();
+  } catch (error) {
+    return res.status(404).json({ ok: false, visible: false, allowed: false, error: "push_hidden_for_user" });
+  }
+});
 router.get("/debug-config", (req, res) => {
   if (process.env.NODE_ENV === "production") {
     return res.status(404).json({ ok: false, error: "push_debug_not_available" });
