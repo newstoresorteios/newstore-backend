@@ -16,10 +16,14 @@ function internalTokenAllowed(req) {
 function statusFor(code) {
   if (code === "internal_push_event_unauthorized") return 401;
   if (code === "push_engine_events_disabled") return 403;
-  if (code === "push_engine_dry_run_required") return 403;
   if (code === "push_engine_real_send_not_supported_in_this_phase") return 403;
+  if (code === "push_engine_real_send_disabled") return 403;
+  if (code === "push_engine_event_not_allowed_for_real_send") return 403;
+  if (code === "push_production_send_blocked") return 403;
   if (String(code || "").startsWith("push_event_")) return 400;
+  if (String(code || "").startsWith("push_reference_")) return 400;
   if (String(code || "").startsWith("push_rule_")) return 400;
+  if (String(code || "").startsWith("push_")) return 403;
   return 500;
 }
 
@@ -35,25 +39,32 @@ router.post("/events", async (req, res) => {
     if (!isTrue(process.env.PUSH_ALLOW_ENGINE_EVENTS)) {
       return sendError(res, "push_engine_events_disabled");
     }
-    if (!isTrue(process.env.PUSH_ENGINE_DRY_RUN)) {
-      return sendError(res, "push_engine_dry_run_required");
-    }
-    if (isTrue(process.env.PUSH_ENGINE_ALLOW_REAL_SEND)) {
-      return sendError(res, "push_engine_real_send_not_supported_in_this_phase");
+    const dryRun = isTrue(process.env.PUSH_ENGINE_DRY_RUN);
+    const realSend = isTrue(process.env.PUSH_ENGINE_ALLOW_REAL_SEND);
+    if (!dryRun && !realSend) {
+      return sendError(res, "push_engine_real_send_disabled");
     }
 
     const body = req.body || {};
     const result = await handlePushAutomationEvent({
       eventKey: body.event_key,
       source: body.source || "engine",
+      referenceType: body.reference_type || null,
+      referenceKey: body.reference_key || null,
       metadata: body.metadata || {},
       actor: { type: "internal_push_events" },
+      dryRun,
     });
 
     return res.json({
       ok: true,
       event_key: result.event_key,
       status: result.status,
+      deduped: Boolean(result.deduped),
+      attempted: result.attempted,
+      sent: result.sent,
+      failed: result.failed,
+      reference_key: result.reference_key,
     });
   } catch (error) {
     const code = error?.code || "push_engine_event_failed";

@@ -245,24 +245,27 @@ export async function sendPushToSubscriptionRow({
   eventKey = "PUSH_SINGLE_DEVICE_TEST",
   category = "test",
   requireConfiguredSubscription = true,
+  skipModeAssert = false,
 }) {
   const message = validateMessage({ title, body, url });
   const extraPayload = safePayload(payload);
 
-  try {
-    const assertMode = requireConfiguredSubscription
-      ? assertPushSingleDeviceMode
-      : assertPushCurrentDeviceMode;
-    assertMode({
-      source,
-      isAudience: false,
-      isEngine: false,
-      isMassSend: false,
-      isCampaign: false,
-    });
-  } catch (error) {
-    console.log("[push.single-device] send:blocked");
-    throw error;
+  if (!skipModeAssert) {
+    try {
+      const assertMode = requireConfiguredSubscription
+        ? assertPushSingleDeviceMode
+        : assertPushCurrentDeviceMode;
+      assertMode({
+        source,
+        isAudience: false,
+        isEngine: false,
+        isMassSend: false,
+        isCampaign: false,
+      });
+    } catch (error) {
+      console.log("[push.single-device] send:blocked");
+      throw error;
+    }
   }
 
   if (!subscriptionRow?.id || !subscriptionRow?.endpoint) {
