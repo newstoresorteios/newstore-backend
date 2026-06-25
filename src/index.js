@@ -147,7 +147,6 @@ app.use("/api/orders", paymentsRoutes); // aliases
 app.use("/api/participations", paymentsRoutes); // aliases
 
 app.use("/api/me", meRoutes);
-app.use("/api/push", pushRouter);
 app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
 
