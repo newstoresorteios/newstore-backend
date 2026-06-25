@@ -210,6 +210,36 @@ export async function handlePushAutomationEvent({
         ORDER BY updated_at DESC, created_at DESC`
     );
 
+    if (!recipients.rows?.length) {
+      const dispatch = await insertAutomationDispatch({
+        eventKey: key,
+        status: "skipped",
+        category: rule.category || "operational",
+        title: rule.title_template,
+        body: "Nenhuma subscription ativa com opt-in operacional.",
+        url: rule.url_template || null,
+        payload: {
+          source: safeSource,
+          reference_type: safeReferenceType,
+          reference_key: safeReferenceKey,
+          metadata: safeMetadata,
+          automation: true,
+          real_send: true,
+          reason: "no_active_operational_subscriptions",
+        },
+      });
+      return {
+        ok: true,
+        event_key: key,
+        status: "skipped",
+        attempted: 0,
+        sent: 0,
+        failed: 0,
+        reference_key: safeReferenceKey,
+        dispatch,
+      };
+    }
+
     let sent = 0;
     let failed = 0;
     for (const row of recipients.rows || []) {
