@@ -8,6 +8,31 @@ function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function parseCsvEnv(value) {
+  return String(value || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function getAllowedTestUserIds() {
+  return [
+    process.env.PUSH_TEST_ALLOWED_USER_ID,
+    ...parseCsvEnv(process.env.PUSH_TEST_ALLOWED_USER_IDS),
+  ]
+    .map((v) => String(v || "").trim())
+    .filter(Boolean);
+}
+
+function getAllowedTestEmails() {
+  return [
+    process.env.PUSH_TEST_ALLOWED_EMAIL,
+    ...parseCsvEnv(process.env.PUSH_TEST_ALLOWED_EMAILS),
+  ]
+    .map((v) => normalizeEmail(v))
+    .filter(Boolean);
+}
+
 export function getAuthenticatedUserId({ user, auth } = {}) {
   return (
     user?.id ??
@@ -25,16 +50,16 @@ export function getAuthenticatedUserEmail({ user, auth } = {}) {
 }
 
 export function getPushAccessDecision({ user, auth } = {}) {
-  const allowedUserId = String(process.env.PUSH_TEST_ALLOWED_USER_ID || "").trim();
-  const allowedEmail = normalizeEmail(process.env.PUSH_TEST_ALLOWED_EMAIL || "");
+  const allowedUserIds = getAllowedTestUserIds();
+  const allowedEmails = getAllowedTestEmails();
   const userId = getAuthenticatedUserId({ user, auth });
   const userEmail = getAuthenticatedUserEmail({ user, auth });
   const pushEnabled = process.env.PUSH_ENABLED === "true";
   const mode = String(process.env.PUSH_MODE || "");
   const testOnly = process.env.PUSH_TEST_ONLY === "true";
   const publicSubscribe = process.env.PUSH_ALLOW_PUBLIC_SUBSCRIBE === "true";
-  const matchesUserId = Boolean(allowedUserId && userId != null && String(userId) === allowedUserId);
-  const matchesEmail = Boolean(allowedEmail && userEmail && userEmail === allowedEmail);
+  const matchesUserId = Boolean(userId != null && allowedUserIds.includes(String(userId)));
+  const matchesEmail = Boolean(userEmail && allowedEmails.includes(userEmail));
   const authenticated = userId != null || Boolean(userEmail);
   const isTestAccount = matchesUserId || matchesEmail;
 
@@ -61,8 +86,8 @@ export function getPushAccessDecision({ user, auth } = {}) {
     mode,
     testOnly,
     publicSubscribe,
-    allowedUserIdConfigured: Boolean(allowedUserId),
-    allowedEmailConfigured: Boolean(allowedEmail),
+    allowedUserIdConfigured: allowedUserIds.length > 0,
+    allowedEmailConfigured: allowedEmails.length > 0,
     matchesUserId,
     matchesEmail,
     isTestAccount,
