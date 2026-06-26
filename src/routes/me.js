@@ -15,7 +15,7 @@ router.get('/', requireAuth, async (req, res) => {
     const userId = req.user.id;
     // busca no banco pra garantir dados atualizados
     const r = await query(
-      'select id, name, email, is_admin from users where id = $1',
+      'select id, name, email, phone, is_admin from users where id = $1',
       [userId]
     );
     const u = r.rows[0] || req.user;
@@ -25,12 +25,64 @@ router.get('/', requireAuth, async (req, res) => {
         id: u.id,
         name: u.name || null,
         email: u.email || null,
+        phone: u.phone || null,
         is_admin: !!u.is_admin,
       },
     });
   } catch (e) {
     console.error('[me] error:', e);
     return res.status(500).json({ error: 'me_failed' });
+  }
+});
+
+function normalizePhoneInput(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function isValidBrazilianPhone(phone) {
+  if (phone.length === 10 || phone.length === 11) return true;
+  return (phone.length === 12 || phone.length === 13) && phone.startsWith('55');
+}
+
+/**
+ * PATCH /api/me/phone
+ * Atualiza somente o telefone do usuario autenticado.
+ */
+router.patch('/phone', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const phone = normalizePhoneInput(req.body?.phone);
+
+    if (!isValidBrazilianPhone(phone)) {
+      return res.status(400).json({ ok: false, error: 'invalid_phone' });
+    }
+
+    const r = await query(
+      `update users
+          set phone = $2
+        where id = $1
+        returning id, name, email, phone, is_admin`,
+      [userId, phone]
+    );
+
+    const u = r.rows[0];
+    if (!u) {
+      return res.status(404).json({ ok: false, error: 'user_not_found' });
+    }
+
+    return res.json({
+      ok: true,
+      user: {
+        id: u.id,
+        name: u.name || null,
+        email: u.email || null,
+        phone: u.phone || null,
+        is_admin: !!u.is_admin,
+      },
+    });
+  } catch (e) {
+    console.error('[me/phone] error:', e);
+    return res.status(500).json({ ok: false, error: 'phone_update_failed' });
   }
 });
 
