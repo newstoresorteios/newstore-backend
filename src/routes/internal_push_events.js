@@ -24,6 +24,7 @@ function statusFor(code) {
   if (String(code || "").startsWith("push_reference_")) return 400;
   if (String(code || "").startsWith("push_recipient_")) return 400;
   if (String(code || "").startsWith("push_rule_")) return 400;
+  if (String(code || "").startsWith("push_scan_")) return 400;
   if (String(code || "").startsWith("push_")) return 403;
   return 500;
 }
@@ -47,12 +48,20 @@ router.post("/events", async (req, res) => {
     }
 
     const body = req.body || {};
+    const payload = body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+      ? body.payload
+      : {};
+    const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+      ? body.metadata
+      : {};
     const result = await handlePushAutomationEvent({
       eventKey: body.event_key,
-      source: body.source || "engine",
-      referenceType: body.reference_type || null,
-      referenceKey: body.reference_key || null,
-      metadata: body.metadata || {},
+      source: body.source || payload.source || "engine",
+      referenceType: body.reference_type || payload.reference_type || null,
+      referenceKey: body.reference_key || payload.reference_key || null,
+      scanId: body.scan_id || payload.scan_id || metadata.scan_id || null,
+      occurredAt: body.occurred_at || payload.occurred_at || metadata.occurred_at || null,
+      metadata,
       recipientUserIds: body.recipient_user_ids,
       actor: { type: "internal_push_events" },
       dryRun,
@@ -67,6 +76,7 @@ router.post("/events", async (req, res) => {
       sent: result.sent,
       failed: result.failed,
       reference_key: result.reference_key,
+      reason: result.reason,
     });
   } catch (error) {
     const code = error?.code || "push_engine_event_failed";
