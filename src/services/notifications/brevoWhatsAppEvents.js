@@ -6,6 +6,29 @@ import {
   updateDispatchDeliveryStatus,
 } from "./notificationLog.js";
 
+const DELIVERY_EVENT_NAMES = new Set([
+  "accepted",
+  "sent",
+  "delivered",
+  "read",
+  "failed",
+  "failure",
+  "undelivered",
+  "rejected",
+  "reject",
+  "blocked",
+  "error",
+]);
+
+const INBOUND_EVENT_NAMES = new Set([
+  "inbound",
+  "incoming",
+  "message",
+  "message_received",
+  "received",
+  "reply",
+]);
+
 export function maskPhone(phone) {
   if (phone == null) return null;
   const d = String(phone).replace(/\D/g, "");
@@ -62,6 +85,23 @@ export function extractBrevoEvents(raw) {
   return [];
 }
 
+function pickFirst(obj, paths) {
+  for (const path of paths) {
+    const parts = String(path).split(".");
+    let cur = obj;
+    let found = true;
+    for (const part of parts) {
+      if (cur == null || typeof cur !== "object" || !(part in cur)) {
+        found = false;
+        break;
+      }
+      cur = cur[part];
+    }
+    if (found && cur != null && cur !== "") return cur;
+  }
+  return null;
+}
+
 export function classifyBrevoReason(reason) {
   const text = String(reason || "");
   if (text.includes("131049")) {
@@ -80,21 +120,38 @@ export function classifyBrevoReason(reason) {
 }
 
 export function normalizeBrevoEvent(e) {
-  const event = e?.event || e?.type || e?.status || e?.eventType || null;
-  let messageId = e?.messageId || e?.message_id || e?.id || null;
-  if (messageId == null && e?.message?.id != null) {
-    messageId = e.message.id;
-  }
+  const event = pickFirst(e, [
+    "event",
+    "eventName",
+    "event_name",
+    "status",
+    "type",
+    "deliveryStatus",
+    "delivery_status",
+    "eventType",
+  ]);
+  const messageId = pickFirst(e, [
+    "messageId",
+    "message_id",
+    "message-id",
+    "message.id",
+    "id",
+    "uuid",
+  ]);
 
   const contactRaw =
-    e?.contactNumber ||
-    e?.contact_number ||
-    e?.recipient ||
-    e?.to ||
-    e?.contact_number_to ||
+    pickFirst(e, [
+      "contactNumber",
+      "contact_number",
+      "recipient",
+      "to",
+      "contact_number_to",
+      "visitor.phone",
+      "contact.phone",
+    ]) ||
     null;
 
-  const reason = e?.reason || e?.error || e?.message || e?.description || null;
+  const reason = pickFirst(e, ["reason", "error", "message", "description"]);
   const classification = classifyBrevoReason(reason);
 
   return {
@@ -102,11 +159,14 @@ export function normalizeBrevoEvent(e) {
     messageId: messageId != null ? String(messageId) : null,
     contactNumber: contactRaw != null ? normalizePhoneBR(contactRaw) : null,
     date:
-      e?.date ||
-      e?.createdAt ||
-      e?.created_at ||
-      e?.timestamp ||
-      e?.eventDate ||
+      pickFirst(e, [
+        "date",
+        "timestamp",
+        "eventDate",
+        "event_date",
+        "createdAt",
+        "created_at",
+      ]) ||
       null,
     reason: reason != null ? String(reason) : null,
     errorCode: classification.code,
@@ -120,19 +180,21 @@ export function normalizeBrevoEvent(e) {
 
 export function mapBrevoEventToDeliveryStatus(eventName) {
   const e = String(eventName || "").toLowerCase();
+  if (e === "accepted") return "accepted";
   if (e === "delivered" || e === "delivery") return "delivered";
   if (e === "read") return "read";
-  if (e === "sent") return "sent_to_provider";
-  if (e === "failed" || e === "failure" || e === "undelivered") return "failed";
-  if (e === "rejected" || e === "reject") return "rejected";
+  if (e === "sent") return "sent";
+  if (e === "failed" || e === "failure") return "failed";
+  if (e === "undelivered") return "undelivered";
+  if (e === "rejected" || e === "reject") return "failed";
   if (e === "error") return "failed";
-  if (e === "blocked") return "rejected";
+  if (e === "blocked") return "undelivered";
   return "unknown";
 }
 
 function isProviderFailureEvent(matchedEvent) {
   const deliveryStatus = mapBrevoEventToDeliveryStatus(matchedEvent?.event);
-  return deliveryStatus === "failed" || deliveryStatus === "rejected";
+  return deliveryStatus === "failed" || deliveryStatus === "undelivered";
 }
 
 function buildDeliveryFailureErrorMessage(matchedEvent) {
@@ -190,6 +252,143 @@ export function findEventForMessageId(events, messageId) {
     ) ||
     null
   );
+}
+
+export function classifyBrevoWebhookPayload(payload = {}) {
+  const event = normalizeBrevoEvent(payload);
+  const eventLower = String(event.event || "").toLowerCase();
+  const hasText = Boolean(
+    pickFirst(payload, ["message.text", "text", "message.content", "content"])
+  );
+  const hasDeliveryMessageId = Boolean(event.messageId);
+  const isDelivery =
+    DELIVERY_EVENT_NAMES.has(eventLower) ||
+    Boolean(pickFirst(payload, ["deliveryStatus", "delivery_status"]));
+  const isInbound =
+    INBOUND_EVENT_NAMES.has(eventLower) ||
+    hasText ||
+    Boolean(pickFirst(payload, ["visitor.phone", "sender", "from", "contact.phone"]));
+
+  if (isDelivery && hasDeliveryMessageId) return { kind: "delivery", event };
+  if (isInbound && !isDelivery) return { kind: "inbound", event };
+  if (isDelivery) return { kind: "delivery", event };
+  return { kind: "unknown", event };
+}
+
+export function extractBrevoInboundFields(payload = {}) {
+  const event = normalizeBrevoEvent(payload);
+  const text = pickFirst(payload, [
+    "message.text",
+    "text",
+    "message.content",
+    "content",
+  ]);
+  const fromPhone = pickFirst(payload, [
+    "visitor.phone",
+    "from",
+    "contact.phone",
+    "sender",
+  ]);
+  const toPhone = pickFirst(payload, ["to", "receiver", "agent.phone"]);
+  const conversationId = pickFirst(payload, [
+    "conversationId",
+    "conversation_id",
+    "conversation.id",
+  ]);
+
+  return {
+    eventName: event.event,
+    conversationId: conversationId != null ? String(conversationId) : null,
+    messageId: event.messageId,
+    text: text != null ? String(text) : null,
+    fromPhone: fromPhone != null ? String(fromPhone) : null,
+    toPhone: toPhone != null ? String(toPhone) : null,
+  };
+}
+
+export async function updateDispatchDeliveryStatusByProviderMessageId({
+  pgClient,
+  providerMessageId,
+  matchedEvent,
+  rawPayload,
+} = {}) {
+  const messageId = String(providerMessageId || "").trim();
+  if (!messageId) {
+    return { ok: false, error: "missing_provider_message_id", matched: false };
+  }
+
+  const db = pgClient || { query };
+  const found = await db.query(
+    `SELECT *
+       FROM public.notification_dispatches
+      WHERE provider_message_id = $1
+        AND channel = 'whatsapp'
+        AND provider = 'brevo'
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [messageId]
+  );
+  const dispatch = found.rows?.[0] || null;
+  if (!dispatch) {
+    return {
+      ok: true,
+      matched: false,
+      error: "dispatch_not_found",
+      provider_message_id: messageId,
+    };
+  }
+
+  const deliveryStatus = mapBrevoEventToDeliveryStatus(matchedEvent?.event);
+  const rawEvents = {
+    webhook_payload: rawPayload || null,
+    event_normalized: matchedEvent || null,
+    received_at: new Date().toISOString(),
+    source: "brevo_webhook",
+  };
+  const errorMessage = isProviderFailureEvent(matchedEvent)
+    ? buildDeliveryFailureErrorMessage(matchedEvent)
+    : null;
+
+  const updated = await updateDispatchDeliveryStatus({
+    pgClient,
+    dispatchId: dispatch.id,
+    deliveryStatus,
+    matchedEvent,
+    rawEvents,
+    errorMessage,
+  });
+
+  return {
+    ok: true,
+    matched: true,
+    dispatch: updated,
+    dispatch_id: dispatch.id,
+    provider_message_id: messageId,
+    delivery_status: updated?.delivery_status || deliveryStatus,
+  };
+}
+
+async function findStoredInboundEventsForMessageId({ pgClient, providerMessageId }) {
+  const db = pgClient || { query };
+  try {
+    const result = await db.query(
+      `SELECT message_id, event_name, raw_payload, created_at
+         FROM public.notification_inbound_messages
+        WHERE provider = 'brevo'
+          AND channel = 'whatsapp'
+          AND message_id = $1
+        ORDER BY created_at DESC
+        LIMIT 20`,
+      [providerMessageId]
+    );
+    return (result.rows || []).map((row) => ({
+      ...normalizeBrevoEvent(row.raw_payload || row),
+      raw: row.raw_payload || row,
+    }));
+  } catch (error) {
+    if (error?.code === "42P01" || error?.code === "42703") return [];
+    throw error;
+  }
 }
 
 export async function fetchBrevoWhatsAppEvents({
@@ -374,6 +573,46 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7, pgClien
     };
   }
 
+  const storedEvents = await findStoredInboundEventsForMessageId({
+    pgClient,
+    providerMessageId: dispatch.provider_message_id,
+  });
+  const storedMatched = findEventForMessageId(storedEvents, dispatch.provider_message_id);
+
+  if (storedMatched) {
+    const deliveryStatus = mapBrevoEventToDeliveryStatus(storedMatched.event);
+    const updated = await updateDispatchDeliveryStatus({
+      pgClient,
+      dispatchId,
+      deliveryStatus,
+      matchedEvent: storedMatched,
+      rawEvents: {
+        events_normalized: storedEvents,
+        events_checked: storedEvents.length,
+        source: "notification_inbound_messages",
+        synced_at: new Date().toISOString(),
+      },
+      errorMessage: isProviderFailureEvent(storedMatched)
+        ? buildDeliveryFailureErrorMessage(storedMatched)
+        : null,
+    });
+
+    return {
+      ok: true,
+      matched: true,
+      dispatch: updated,
+      matched_event: storedMatched,
+      events_checked: storedEvents.length,
+      events_found: storedEvents.length,
+      events: storedEvents,
+      status_updated_to: updated?.status,
+      delivery_status_updated_to: updated?.delivery_status,
+      delivery_status: updated?.delivery_status || deliveryStatus,
+      provider_message_id: dispatch.provider_message_id,
+      message: `Evento encontrado no banco: ${storedMatched.event}`,
+    };
+  }
+
   const contactNumber =
     normalizePhoneBR(dispatch.recipient) ||
     String(dispatch.recipient || "").replace(/\D/g, "");
@@ -418,9 +657,12 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7, pgClien
       dispatch: updated,
       matched_event: null,
       events_checked: events.length,
+      events_found: 0,
       events,
       status_updated_to: updated?.status,
-      message: "Nenhum evento correspondente encontrado na Brevo.",
+      delivery_status: updated?.delivery_status || "unknown",
+      provider_message_id: dispatch.provider_message_id,
+      message: "Nenhum evento de entrega encontrado ainda.",
     };
   }
 
@@ -454,9 +696,12 @@ export async function syncDispatchDeliveryStatus(dispatchId, { days = 7, pgClien
     dispatch: updated,
     matched_event: matched,
     events_checked: events.length,
+    events_found: 1,
     events,
     status_updated_to: updated?.status,
     delivery_status_updated_to: updated?.delivery_status,
+    delivery_status: updated?.delivery_status || deliveryStatus,
+    provider_message_id: dispatch.provider_message_id,
     message: userMessage,
   };
 }
