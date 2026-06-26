@@ -150,11 +150,21 @@ function logAccessCheck(decision, vapidStatus) {
     can_subscribe: decision.canSubscribe && vapidStatus.enabled,
     can_send_test: decision.canSendTest,
     reason: decision.reason || null,
+    authenticated: Boolean(decision.userId != null || decision.hasEmail),
     vapid_enabled: vapidStatus.enabled,
     vapid_error: vapidStatus.error || null,
   });
 }
 
+function getSafeAccessReason(decision, vapidStatus) {
+  if (decision.reason === "push_user_not_authenticated") return "auth_required";
+  if (decision.reason === "push_hidden_for_user") return "public_subscribe_disabled";
+  if (decision.reason === "push_mode_not_single_device_test") return "test_only_not_allowed";
+  if (decision.reason === "push_mode_not_production") return "test_only_not_allowed";
+  if (decision.reason === "push_disabled") return "push_disabled";
+  if (!vapidStatus.enabled) return "vapid_missing";
+  return decision.reason || vapidStatus.error || "push_unavailable";
+}
 function logConfigStatus() {
   if (process.env.NODE_ENV === "production") return;
   const status = getPushVapidConfigStatus();
@@ -189,11 +199,8 @@ router.get("/access", optionalPushAuth, (req, res) => {
   const decision = getPushAccessDecision({ user: req.user, auth: req.auth });
   const vapidStatus = getPushVapidConfigStatus();
   const canSubscribe = Boolean(decision.canSubscribe && vapidStatus.enabled);
-  const reason = canSubscribe
-    ? null
-    : decision.reason === "push_user_not_authenticated"
-      ? "auth_required"
-      : decision.reason || vapidStatus.error || "push_unavailable";
+  const authenticated = Boolean(decision.userId != null || decision.hasEmail);
+  const reason = canSubscribe ? null : getSafeAccessReason(decision, vapidStatus);
   logAccessCheck(decision, vapidStatus);
   return res.json({
     ok: true,
@@ -202,6 +209,7 @@ router.get("/access", optionalPushAuth, (req, res) => {
     allowed: canSubscribe,
     can_subscribe: canSubscribe,
     can_send_test: Boolean(decision.canSendTest && vapidStatus.enabled),
+    authenticated,
     mode: decision.mode,
     test_only: decision.testOnly,
     ...(reason ? { reason } : {}),
@@ -358,7 +366,7 @@ router.post("/subscribe", async (req, res) => {
       subscription_id: saved.subscription_id,
       test_mode: true,
       test_label: process.env.PUSH_TEST_PHONE_LABEL || TEST_LABEL,
-      message: "Notificações ativadas neste dispositivo.",
+      message: "Notifica\u00e7\u00f5es ativadas neste dispositivo.",
     });
   } catch (error) {
     if (isMissingTableError(error)) {
