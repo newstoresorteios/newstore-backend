@@ -22,6 +22,7 @@ function statusFor(code) {
   if (code === "push_production_send_blocked") return 403;
   if (String(code || "").startsWith("push_event_")) return 400;
   if (String(code || "").startsWith("push_reference_")) return 400;
+  if (String(code || "").startsWith("push_recipient_")) return 400;
   if (String(code || "").startsWith("push_rule_")) return 400;
   if (String(code || "").startsWith("push_")) return 403;
   return 500;
@@ -52,6 +53,7 @@ router.post("/events", async (req, res) => {
       referenceType: body.reference_type || null,
       referenceKey: body.reference_key || null,
       metadata: body.metadata || {},
+      recipientUserIds: body.recipient_user_ids,
       actor: { type: "internal_push_events" },
       dryRun,
     });
