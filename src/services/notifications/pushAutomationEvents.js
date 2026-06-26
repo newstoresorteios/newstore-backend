@@ -6,7 +6,22 @@ import {
 import { sendPushToSubscriptionRow } from "./pushNotifications.js";
 
 const MAX_METADATA_BYTES = 4096;
+const MAX_RECIPIENT_USER_IDS = 500;
 const SENSITIVE_KEY_RE = /(password|secret|token|authorization|cookie|endpoint|p256dh|auth|vapid|private|cpf|document|phone|telefone|whatsapp)/i;
+
+const PUBLIC_EVENT_KEYS = new Set([
+  "NEW_DRAW_PUBLISHED",
+  "DRAW_REMAINING_NUMBERS_20",
+  "DRAW_REMAINING_NUMBERS_10",
+  "WINNER_DEFINED",
+]);
+
+const USER_EVENT_KEYS = new Set([
+  "BALANCE_EXPIRING_30_DAYS",
+  "BALANCE_EXPIRING_10_DAYS",
+  "BALANCE_EXPIRING_7_DAYS",
+  "BALANCE_EXPIRED",
+]);
 
 function coded(code) {
   const err = new Error(code);
@@ -16,6 +31,22 @@ function coded(code) {
 
 function cleanText(value, fallback = "") {
   return String(value ?? fallback).trim();
+}
+
+function sanitizeRecipientUserIds(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw coded("push_recipient_user_ids_invalid");
+  const seen = new Set();
+  const out = [];
+  for (const item of value) {
+    const n = Number(item);
+    if (!Number.isInteger(n) || n <= 0) continue;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+    if (out.length >= MAX_RECIPIENT_USER_IDS) break;
+  }
+  return out;
 }
 
 function sanitizeMetadataValue(value, depth = 0) {
@@ -51,6 +82,21 @@ function sanitizeMetadata(metadata) {
   return sanitized;
 }
 
+function escapeTemplateValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value).replace(/[<>]/g, "").slice(0, 500);
+  }
+  return "";
+}
+
+function renderTemplate(template, metadata = {}) {
+  return String(template || "").replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_match, key) => {
+    if (!Object.prototype.hasOwnProperty.call(metadata, key)) return "";
+    return escapeTemplateValue(metadata[key]);
+  });
+}
+
 function validateEventKey(eventKey) {
   const key = cleanText(eventKey);
   if (!key) throw coded("push_event_key_required");
@@ -84,14 +130,9 @@ function validateReferenceType(referenceType) {
 
 function assertAutomationRealSendAllowed(eventKey) {
   if (process.env.PUSH_ENABLED !== "true") throw coded("push_disabled");
-  if (process.env.PUSH_MODE !== "single_device_test") {
-    throw coded("push_mode_not_single_device_test");
-  }
-  if (process.env.PUSH_TEST_ONLY !== "true") throw coded("push_test_only_required");
-  if (
-    process.env.NODE_ENV === "production" &&
-    process.env.PUSH_ALLOW_PRODUCTION_SEND !== "true"
-  ) {
+  if (process.env.PUSH_MODE !== "production") throw coded("push_mode_not_production");
+  if (process.env.PUSH_TEST_ONLY === "true") throw coded("push_test_only_required");
+  if (process.env.PUSH_ALLOW_PRODUCTION_SEND !== "true") {
     throw coded("push_production_send_blocked");
   }
   if (!isTrue(process.env.PUSH_ENGINE_ALLOW_REAL_SEND)) {
@@ -102,9 +143,6 @@ function assertAutomationRealSendAllowed(eventKey) {
   }
   const allowed = parseCsvEnv(process.env.PUSH_ENGINE_REAL_SEND_EVENT_KEYS);
   if (!allowed.includes(eventKey)) throw coded("push_engine_event_not_allowed_for_real_send");
-  if (process.env.PUSH_ALLOW_DB_RECIPIENT_LOOKUP === "true") {
-    throw coded("push_db_recipient_lookup_must_remain_disabled");
-  }
   if (process.env.PUSH_ALLOW_AUDIENCE === "true") throw coded("push_audience_blocked");
   if (process.env.PUSH_ALLOW_ADMIN_MASS_SEND === "true") throw coded("push_mass_send_blocked");
   if (process.env.PUSH_ALLOW_CAMPAIGNS === "true") throw coded("push_campaign_blocked");
@@ -118,11 +156,12 @@ async function insertAutomationDispatch({
   body,
   url,
   payload,
+  errorMessage = null,
 }) {
   const result = await query(
     `INSERT INTO public.notification_push_dispatches (
-       event_key, category, title, body, url, payload, status
-     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+       event_key, category, title, body, url, payload, status, error_message
+     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
      RETURNING id, event_key, status, created_at`,
     [
       eventKey,
@@ -132,9 +171,49 @@ async function insertAutomationDispatch({
       url || null,
       JSON.stringify(payload || {}),
       status,
+      errorMessage,
     ]
   );
   return result.rows?.[0] || null;
+}
+
+async function findSentDispatch({ eventKey, referenceKey }) {
+  const result = await query(
+    `SELECT id
+       FROM public.notification_push_dispatches
+      WHERE event_key = $1
+        AND payload->>'reference_key' = $2
+        AND status = 'sent'
+      LIMIT 1`,
+    [eventKey, referenceKey]
+  );
+  return result.rows?.[0] || null;
+}
+
+async function getRecipients({ eventKey, recipientUserIds }) {
+  if (PUBLIC_EVENT_KEYS.has(eventKey)) {
+    return query(
+      `SELECT *
+         FROM public.push_subscriptions
+        WHERE is_active = true
+          AND operational_opt_in = true
+        ORDER BY updated_at DESC, created_at DESC`
+    );
+  }
+
+  if (USER_EVENT_KEYS.has(eventKey) && recipientUserIds.length) {
+    return query(
+      `SELECT *
+         FROM public.push_subscriptions
+        WHERE is_active = true
+          AND operational_opt_in = true
+          AND user_id = ANY($1::bigint[])
+        ORDER BY updated_at DESC, created_at DESC`,
+      [recipientUserIds]
+    );
+  }
+
+  return { rows: [] };
 }
 
 export async function handlePushAutomationEvent({
@@ -143,12 +222,14 @@ export async function handlePushAutomationEvent({
   referenceType = null,
   referenceKey = null,
   metadata = {},
+  recipientUserIds = [],
   actor = null,
   dryRun = true,
 } = {}) {
   const key = validateEventKey(eventKey);
   const safeSource = cleanText(source, "engine").slice(0, 80) || "engine";
   const safeMetadata = sanitizeMetadata(metadata);
+  const safeRecipientUserIds = sanitizeRecipientUserIds(recipientUserIds);
   const safeReferenceType = validateReferenceType(referenceType);
   const requireReferenceKey = !dryRun && isTrue(process.env.PUSH_AUTOMATION_REQUIRE_REFERENCE_KEY);
   const safeReferenceKey = validateReference({ referenceKey, requireReferenceKey });
@@ -158,22 +239,34 @@ export async function handlePushAutomationEvent({
 
   if (!dryRun) {
     assertAutomationRealSendAllowed(key);
-    const dedupe = await query(
-      `SELECT id
-         FROM public.notification_push_dispatches
-        WHERE event_key = $1
-          AND payload->>'reference_key' = $2
-          AND status = 'sent'
-        LIMIT 1`,
-      [key, safeReferenceKey]
-    );
-    if (dedupe.rows?.[0]) {
+    const dedupe = await findSentDispatch({ eventKey: key, referenceKey: safeReferenceKey });
+    if (dedupe) {
+      const dispatch = await insertAutomationDispatch({
+        eventKey: key,
+        status: "deduped",
+        category: "operational",
+        title: "Push duplicado",
+        body: "Evento ja enviado para esta referencia.",
+        url: null,
+        payload: {
+          source: safeSource,
+          reference_type: safeReferenceType,
+          reference_key: safeReferenceKey,
+          metadata: safeMetadata,
+          recipient_user_ids: safeRecipientUserIds,
+          automation: true,
+          real_send: true,
+          deduped: true,
+          deduped_dispatch_id: dedupe.id,
+        },
+      });
       return {
         ok: true,
         event_key: key,
         status: "deduped",
         deduped: true,
         reference_key: safeReferenceKey,
+        dispatch,
       };
     }
   }
@@ -185,8 +278,8 @@ export async function handlePushAutomationEvent({
       eventKey: key,
       status: "skipped",
       category: "operational",
-      title: "Push automático ignorado",
-      body: "Regra inativa ou não encontrada.",
+      title: "Push automatico ignorado",
+      body: "Regra inativa ou nao encontrada.",
       url: null,
       payload: {
         dry_run: dryRun,
@@ -195,37 +288,41 @@ export async function handlePushAutomationEvent({
         reference_key: safeReferenceKey,
         reason: "rule_inactive_or_not_found",
         metadata: safeMetadata,
+        recipient_user_ids: safeRecipientUserIds,
         actor: safeActor,
       },
     });
     return { ok: true, event_key: key, status: "skipped", dispatch };
   }
 
+  const renderedTitle = renderTemplate(rule.title_template, safeMetadata);
+  const renderedBody = renderTemplate(rule.body_template, safeMetadata);
+  const renderedUrl = renderTemplate(rule.url_template || "", safeMetadata) || "/";
+
   if (!dryRun) {
-    const recipients = await query(
-      `SELECT *
-         FROM public.push_subscriptions
-        WHERE is_active = true
-          AND operational_opt_in = true
-        ORDER BY updated_at DESC, created_at DESC`
-    );
+    const recipients = await getRecipients({
+      eventKey: key,
+      recipientUserIds: safeRecipientUserIds,
+    });
 
     if (!recipients.rows?.length) {
       const dispatch = await insertAutomationDispatch({
         eventKey: key,
         status: "skipped",
         category: rule.category || "operational",
-        title: rule.title_template,
-        body: "Nenhuma subscription ativa com opt-in operacional.",
-        url: rule.url_template || null,
+        title: renderedTitle || rule.title_template,
+        body: renderedBody || "Nenhuma subscription ativa com opt-in operacional.",
+        url: renderedUrl,
+        errorMessage: "no_active_push_recipients",
         payload: {
           source: safeSource,
           reference_type: safeReferenceType,
           reference_key: safeReferenceKey,
           metadata: safeMetadata,
+          recipient_user_ids: safeRecipientUserIds,
           automation: true,
           real_send: true,
-          reason: "no_active_operational_subscriptions",
+          no_recipients: true,
         },
       });
       return {
@@ -246,14 +343,15 @@ export async function handlePushAutomationEvent({
       try {
         await sendPushToSubscriptionRow({
           subscriptionRow: row,
-          title: rule.title_template,
-          body: rule.body_template,
-          url: rule.url_template || "/",
+          title: renderedTitle,
+          body: renderedBody,
+          url: renderedUrl,
           payload: {
             source: safeSource,
             reference_type: safeReferenceType,
             reference_key: safeReferenceKey,
             metadata: safeMetadata,
+            recipient_user_ids: safeRecipientUserIds,
             automation: true,
             real_send: true,
           },
@@ -283,9 +381,9 @@ export async function handlePushAutomationEvent({
     eventKey: key,
     status: "dry_run",
     category: rule.category || "operational",
-    title: rule.title_template,
-    body: rule.body_template,
-    url: rule.url_template || null,
+    title: renderedTitle,
+    body: renderedBody,
+    url: renderedUrl || null,
     payload: {
       dry_run: true,
       source: safeSource,
@@ -293,6 +391,7 @@ export async function handlePushAutomationEvent({
       reference_key: safeReferenceKey,
       rule_id: rule.id,
       metadata: safeMetadata,
+      recipient_user_ids: safeRecipientUserIds,
       actor: safeActor,
     },
   });
