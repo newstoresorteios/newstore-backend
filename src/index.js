@@ -17,6 +17,7 @@ import additionalPaymentsRoutes from "./routes/additional_payments.js";
 import secondaryDrawsRoutes from "./routes/secondary_draws.js";
 import secondaryPaymentsRoutes from "./routes/secondary_payments.js";
 import meRoutes from "./routes/me.js";
+import communicationConsentsRoutes from "./routes/communication_consents.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
 
@@ -147,6 +148,7 @@ app.use("/api/orders", paymentsRoutes); // aliases
 app.use("/api/participations", paymentsRoutes); // aliases
 
 app.use("/api/me", meRoutes);
+app.use("/api/me/communication-consents", communicationConsentsRoutes);
 app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
 

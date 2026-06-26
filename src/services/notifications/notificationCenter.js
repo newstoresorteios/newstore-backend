@@ -20,6 +20,14 @@ import {
   markDispatchFailed,
   extractDispatchErrorMessage,
 } from "./notificationLog.js";
+import {
+  WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+  assertWhatsAppConsent,
+  countWhatsAppConsentForAudience,
+  getWhatsappConsentStatusForUser,
+  isWhatsAppConsentRequired,
+  isUnlinkedWhatsAppPhoneAllowed,
+} from "./communicationConsent.js";
 
 export const DELIVERY_NOTE_ACCEPTED =
   "accepted_by_brevo_not_delivery_confirmed";
@@ -71,6 +79,8 @@ export function getNotificationHealth() {
     adminTestAllowedRecipientsConfigured: Boolean(
       String(process.env.NOTIFICATION_ADMIN_TEST_ALLOWED_RECIPIENTS || "").trim()
     ),
+    whatsappConsentRequired: isWhatsAppConsentRequired(),
+    whatsappAllowUnlinkedPhone: isUnlinkedWhatsAppPhoneAllowed(),
   };
 }
 
@@ -195,7 +205,17 @@ export async function searchNotificationRecipients({
       LIMIT $2`,
     [pattern, maxLimit]
   );
-  return r.rows || [];
+  const rows = r.rows || [];
+  return Promise.all(
+    rows.map(async (row) => ({
+      ...row,
+      ...(await getWhatsappConsentStatusForUser({
+        pgClient,
+        userId: row.id,
+        category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+      })),
+    }))
+  );
 }
 
 const TEMPLATE_PATCH_FIELDS = new Set([
@@ -393,6 +413,25 @@ function buildAdminResult(dispatch, result, { includeTestModeWarning = true } = 
   };
 }
 
+async function markDispatchSkippedForConsent({ pgClient, dispatch, consent }) {
+  const skipped = {
+    ok: false,
+    skipped: true,
+    reason: consent?.reason || "whatsapp_consent_missing",
+    provider: "brevo",
+    channel: "whatsapp",
+    whatsapp_consent_status: consent?.whatsapp_consent_status || "missing",
+    whatsapp_consent_category:
+      consent?.whatsapp_consent_category || WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+  };
+  return markDispatchFailed({
+    pgClient,
+    dispatchId: dispatch.id,
+    result: skipped,
+    status: "skipped",
+  });
+}
+
 export async function sendTestWhatsApp({
   pgClient,
   userId = null,
@@ -506,6 +545,30 @@ export async function sendTestWhatsApp({
     return buildAdminResult(updated, skipped);
   }
 
+  const consent = await assertWhatsAppConsent({
+    pgClient,
+    userId: userId || null,
+    phone: originalRecipient,
+    category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+    source: "admin_test",
+    recipientForced: preResolved.recipient_forced === true,
+  });
+
+  recipientSnapshot.whatsapp_consent_status = consent.whatsapp_consent_status || null;
+  recipientSnapshot.whatsapp_consent_category = consent.whatsapp_consent_category || null;
+  recipientSnapshot.whatsapp_can_send = consent.whatsapp_can_send === true;
+
+  if (!consent.ok) {
+    const updated = await markDispatchSkippedForConsent({ pgClient, dispatch, consent });
+    return buildAdminResult(updated, {
+      ok: false,
+      skipped: true,
+      reason: consent.reason || "whatsapp_consent_missing",
+      provider: "brevo",
+      channel: "whatsapp",
+    });
+  }
+
   const result = await sendBrevoWhatsAppTemplate({
     to: originalRecipient,
     templateId: resolvedTemplateId,
@@ -514,6 +577,7 @@ export async function sendTestWhatsApp({
     correlationId: String(dispatch.id),
     context: "admin_test",
     allowAdminTestCustomRecipient: useCustomRecipient === true,
+    consentChecked: true,
   });
 
   recipientSnapshot.recipient_mode = result.recipient_mode || preResolved.recipient_mode;
@@ -527,29 +591,31 @@ export async function estimateAudience({ pgClient, filter, userId = null, phone 
   const allow_real_recipients = isAllowRealRecipients();
   let estimated_count = 0;
   let message = "";
+  let consentStats = {
+    total_candidates: 0,
+    allowed_by_whatsapp_consent: 0,
+    blocked_by_whatsapp_consent: 0,
+    whatsapp_consent_category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+  };
 
   switch (filter) {
     case "all_users": {
-      const r = await runQuery(
+      consentStats = await countWhatsAppConsentForAudience({
         pgClient,
-        `SELECT COUNT(*)::int AS c
-           FROM public.users
-          WHERE NULLIF(TRIM(email), '') IS NOT NULL
-             OR NULLIF(TRIM(phone), '') IS NOT NULL`
-      );
-      estimated_count = Number(r.rows[0]?.c || 0);
-      message = "Usuários com e-mail ou telefone cadastrado";
+        whereSql: `WHERE NULLIF(TRIM(u.phone), '') IS NOT NULL`,
+      });
+      estimated_count = consentStats.total_candidates;
+      message = "Usuarios com telefone cadastrado";
       break;
     }
     case "active_balance": {
-      const r = await runQuery(
+      consentStats = await countWhatsAppConsentForAudience({
         pgClient,
-        `SELECT COUNT(*)::int AS c
-           FROM public.users
-          WHERE COALESCE(coupon_value_cents, 0) > 0`
-      );
-      estimated_count = Number(r.rows[0]?.c || 0);
-      message = "Usuários com saldo de cupom maior que zero";
+        whereSql: `WHERE NULLIF(TRIM(u.phone), '') IS NOT NULL
+                     AND COALESCE(u.coupon_value_cents, 0) > 0`,
+      });
+      estimated_count = consentStats.total_candidates;
+      message = "Usuarios com saldo de cupom maior que zero";
       break;
     }
     case "specific_user": {
@@ -560,21 +626,41 @@ export async function estimateAudience({ pgClient, filter, userId = null, phone 
       }
       const r = await runQuery(
         pgClient,
-        `SELECT 1 FROM public.users WHERE id = $1 LIMIT 1`,
+        `SELECT 1 FROM public.users WHERE id = $1 AND NULLIF(TRIM(phone), '') IS NOT NULL LIMIT 1`,
         [userId]
       );
       estimated_count = r.rows.length ? 1 : 0;
+      const consent = estimated_count
+        ? await getWhatsappConsentStatusForUser({
+            pgClient,
+            userId,
+            category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+          })
+        : { whatsapp_can_send: false };
+      consentStats = {
+        total_candidates: estimated_count,
+        allowed_by_whatsapp_consent: consent.whatsapp_can_send ? 1 : 0,
+        blocked_by_whatsapp_consent: consent.whatsapp_can_send ? 0 : estimated_count,
+        whatsapp_consent_category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+      };
       message = estimated_count
-        ? "Um usuário específico"
-        : "Usuário não encontrado";
+        ? "Um usuario especifico"
+        : "Usuario nao encontrado ou sem telefone";
       break;
     }
     case "specific_phone": {
       const normalized = normalizePhoneBR(phone);
       estimated_count = normalized ? 1 : 0;
+      const unlinkedAllowed = isUnlinkedWhatsAppPhoneAllowed();
+      consentStats = {
+        total_candidates: estimated_count,
+        allowed_by_whatsapp_consent: estimated_count && unlinkedAllowed ? 1 : 0,
+        blocked_by_whatsapp_consent: estimated_count && !unlinkedAllowed ? 1 : 0,
+        whatsapp_consent_category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+      };
       message = normalized
-        ? "Um telefone específico (válido)"
-        : "Telefone inválido ou ausente";
+        ? "Um telefone especifico valido, sem consentimento auditavel por usuario"
+        : "Telefone invalido ou ausente";
       break;
     }
     default:
@@ -589,6 +675,7 @@ export async function estimateAudience({ pgClient, filter, userId = null, phone 
   return {
     filter,
     estimated_count,
+    ...consentStats,
     test_mode,
     allow_real_recipients,
     message,
@@ -784,6 +871,46 @@ export async function manualSendNotification({
     };
   }
 
+  const consent = await assertWhatsAppConsent({
+    pgClient,
+    userId: userId || null,
+    phone: phone || null,
+    category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+    source: "manual_send",
+    recipientForced: forced === true,
+  });
+
+  recipientSnapshot.whatsapp_consent_status = consent.whatsapp_consent_status || null;
+  recipientSnapshot.whatsapp_consent_category = consent.whatsapp_consent_category || null;
+  recipientSnapshot.whatsapp_can_send = consent.whatsapp_can_send === true;
+
+  if (!consent.ok) {
+    const updated = await markDispatchSkippedForConsent({ pgClient, dispatch, consent });
+    if (campaign?.id) {
+      await updateCampaignAudienceCounts(pgClient, campaign.id, {
+        created: 1,
+        skipped: 1,
+      });
+      campaign = await runQuery(
+        pgClient,
+        `SELECT * FROM public.notification_campaigns WHERE id = $1`,
+        [campaign.id]
+      ).then((r) => r.rows[0]);
+    }
+    return {
+      ok: false,
+      campaign,
+      ...buildAdminResult(updated, {
+        ok: false,
+        skipped: true,
+        reason: consent.reason || "whatsapp_consent_missing",
+        provider: "brevo",
+        channel: "whatsapp",
+      }),
+      message: consent.reason || TEST_MODE_WARNING,
+    };
+  }
+
   const result = await sendBrevoWhatsAppTemplate({
     to: testRecipient,
     templateId: resolvedTemplateId,
@@ -792,6 +919,7 @@ export async function manualSendNotification({
     correlationId: String(dispatch.id),
     context: "manual_send",
     allowAdminTestCustomRecipient: false,
+    consentChecked: true,
   });
 
   const updated = await finalizeDispatch({ pgClient, dispatch, result });
@@ -1064,6 +1192,26 @@ export async function manualSendSelected({
       continue;
     }
 
+    const consent = await assertWhatsAppConsent({
+      pgClient,
+      userId: userRow?.id || item.user_id || null,
+      phone: userRow?.phone || item.phone || null,
+      category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+      source: "manual_send_selected",
+      recipientForced: preResolved.recipient_forced === true,
+    });
+
+    recipientSnapshot.whatsapp_consent_status = consent.whatsapp_consent_status || null;
+    recipientSnapshot.whatsapp_consent_category = consent.whatsapp_consent_category || null;
+    recipientSnapshot.whatsapp_can_send = consent.whatsapp_can_send === true;
+
+    if (!consent.ok) {
+      const updated = await markDispatchSkippedForConsent({ pgClient, dispatch, consent });
+      summary.skipped_count += 1;
+      dispatches.push(updated);
+      continue;
+    }
+
     const result = await sendBrevoWhatsAppTemplate({
       to: originalRecipient,
       templateId: resolvedTemplateId,
@@ -1072,6 +1220,7 @@ export async function manualSendSelected({
       correlationId: String(dispatch.id),
       context: brevoContext,
       allowAdminTestCustomRecipient: allowAdminTestCustom,
+      consentChecked: true,
     });
 
     recipientSnapshot.recipient_mode =

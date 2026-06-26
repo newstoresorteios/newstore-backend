@@ -2,6 +2,7 @@
 // ESM — envio WhatsApp via Brevo (sem expor BREVO_API_KEY)
 
 import { assertWhatsAppAllowed } from "./whatsappSafetyGuard.js";
+import { isWhatsAppConsentRequired } from "./communicationConsent.js";
 
 export function normalizePhoneBR(phone) {
   if (phone == null) return null;
@@ -168,6 +169,7 @@ export async function sendBrevoWhatsAppTemplate({
   source,
   isAutomation = false,
   isCampaign = false,
+  consentChecked = false,
 }) {
   void correlationId;
 
@@ -238,6 +240,24 @@ export async function sendBrevoWhatsAppTemplate({
       ok: false,
       skipped: true,
       reason: resolved.reason || "invalid_recipient",
+      provider: "brevo",
+      channel: "whatsapp",
+      recipient,
+      recipient_original,
+      recipient_forced,
+      recipient_mode,
+    };
+  }
+
+  if (
+    isWhatsAppConsentRequired() &&
+    resolved.recipient_forced !== true &&
+    consentChecked !== true
+  ) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: "whatsapp_consent_unknown",
       provider: "brevo",
       channel: "whatsapp",
       recipient,
