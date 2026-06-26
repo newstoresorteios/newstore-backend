@@ -1,6 +1,13 @@
 // src/routes/brevoWebhooks.js
 import express from "express";
 import { recordInboundMessage } from "../services/notifications/notificationLog.js";
+import {
+  classifyBrevoWebhookPayload,
+  extractBrevoEvents,
+  extractBrevoInboundFields,
+  maskPhone,
+  updateDispatchDeliveryStatusByProviderMessageId,
+} from "../services/notifications/brevoWhatsAppEvents.js";
 
 const router = express.Router();
 
@@ -9,67 +16,6 @@ function getWebhookSecret(req) {
   if (header) return String(header).trim();
   if (req.query?.secret) return String(req.query.secret).trim();
   return null;
-}
-
-function pickFirst(obj, paths) {
-  for (const path of paths) {
-    const parts = path.split(".");
-    let cur = obj;
-    let found = true;
-    for (const p of parts) {
-      if (cur == null || typeof cur !== "object" || !(p in cur)) {
-        found = false;
-        break;
-      }
-      cur = cur[p];
-    }
-    if (found && cur != null && cur !== "") return cur;
-  }
-  return null;
-}
-
-function extractInboundFields(payload) {
-  const eventName = pickFirst(payload, [
-    "eventName",
-    "event_name",
-    "type",
-  ]);
-
-  const conversationId = pickFirst(payload, [
-    "conversationId",
-    "conversation_id",
-  ]);
-
-  const messageId = pickFirst(payload, [
-    "messageId",
-    "message.id",
-    "id",
-  ]);
-
-  const text = pickFirst(payload, [
-    "message.text",
-    "text",
-    "message.content",
-    "content",
-  ]);
-
-  const fromPhone = pickFirst(payload, [
-    "visitor.phone",
-    "from",
-    "contact.phone",
-    "sender",
-  ]);
-
-  const toPhone = pickFirst(payload, ["to", "receiver", "agent.phone"]);
-
-  return {
-    eventName: eventName != null ? String(eventName) : null,
-    conversationId: conversationId != null ? String(conversationId) : null,
-    messageId: messageId != null ? String(messageId) : null,
-    text: text != null ? String(text) : null,
-    fromPhone: fromPhone != null ? String(fromPhone) : null,
-    toPhone: toPhone != null ? String(toPhone) : null,
-  };
 }
 
 router.post("/whatsapp", async (req, res) => {
@@ -85,23 +31,122 @@ router.post("/whatsapp", async (req, res) => {
 
   try {
     const payload = req.body || {};
-    const extracted = extractInboundFields(payload);
+    const payloadItems = extractBrevoEvents(payload);
+    const items = payloadItems.length ? payloadItems : [payload];
+    const results = [];
 
-    await recordInboundMessage({
-      provider: "brevo",
-      channel: "whatsapp",
-      rawPayload: payload,
-      extracted: {
-        eventName: extracted.eventName,
-        conversationId: extracted.conversationId,
-        messageId: extracted.messageId,
-        fromPhone: extracted.fromPhone,
-        toPhone: extracted.toPhone,
-        text: extracted.text,
-      },
+    for (const item of items) {
+      const classified = classifyBrevoWebhookPayload(item);
+      const event = classified.event;
+
+      console.log("[brevo-webhook] received", {
+        kind: classified.kind,
+        event: event?.event || null,
+        has_message_id: Boolean(event?.messageId),
+        contact_masked: event?.contactNumber ? maskPhone(event.contactNumber) : null,
+      });
+
+      if (classified.kind === "delivery") {
+        if (!event?.messageId) {
+          console.warn("[brevo-webhook] missing_message_id", {
+            event: event?.event || null,
+          });
+          results.push({
+            kind: "delivery",
+            correlated: false,
+            reason: "delivery_event_missing_message_id",
+          });
+          continue;
+        }
+
+        console.log("[brevo-webhook] delivery_event", {
+          event: event.event || null,
+          message_id_present: true,
+        });
+
+        const result = await updateDispatchDeliveryStatusByProviderMessageId({
+          providerMessageId: event.messageId,
+          matchedEvent: event,
+          rawPayload: item,
+        });
+
+        if (result.matched) {
+          console.log("[brevo-webhook] dispatch_matched", {
+            dispatch_id: result.dispatch_id || result.dispatch?.id || null,
+            delivery_status: result.delivery_status || null,
+          });
+        } else {
+          console.warn("[brevo-webhook] dispatch_not_found", {
+            message_id_present: true,
+            event: event.event || null,
+          });
+        }
+
+        results.push({
+          kind: "delivery",
+          correlated: result.matched === true,
+          dispatch_id: result.dispatch_id || result.dispatch?.id || null,
+          delivery_status: result.delivery_status || null,
+        });
+        continue;
+      }
+
+      if (classified.kind !== "inbound") {
+        if (!event?.messageId) {
+          console.warn("[brevo-webhook] missing_message_id", {
+            event: event?.event || null,
+            kind: classified.kind,
+          });
+        }
+        results.push({
+          kind: classified.kind,
+          ignored: true,
+          reason: "unknown_webhook_payload",
+        });
+        continue;
+      }
+
+      const extracted = extractBrevoInboundFields(item);
+
+      console.log("[brevo-webhook] inbound_message", {
+        event: extracted.eventName || null,
+        from_masked: extracted.fromPhone ? maskPhone(extracted.fromPhone) : null,
+        to_masked: extracted.toPhone ? maskPhone(extracted.toPhone) : null,
+        has_text: Boolean(extracted.text),
+      });
+
+      await recordInboundMessage({
+        provider: "brevo",
+        channel: "whatsapp",
+        rawPayload: item,
+        extracted: {
+          eventName: extracted.eventName,
+          conversationId: extracted.conversationId,
+          messageId: extracted.messageId,
+          fromPhone: extracted.fromPhone,
+          toPhone: extracted.toPhone,
+          text: extracted.text,
+        },
+      });
+      results.push({ kind: "inbound", stored: true });
+    }
+
+    if (!results.length) {
+      console.warn("[brevo-webhook] missing_message_id", {
+        kind: "empty_payload",
+      });
+      return res.json({
+        ok: true,
+        correlated: false,
+        message: "webhook_payload_empty",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      processed: results.length,
+      results,
     });
-
-    return res.json({ ok: true });
   } catch (e) {
     console.error("[brevo/webhook] whatsapp inbound error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });

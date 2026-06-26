@@ -229,8 +229,6 @@ function parseEventTimestamp(dateValue) {
 function dispatchStatusFromDelivery(deliveryStatus) {
   if (deliveryStatus === "read") return "read";
   if (deliveryStatus === "delivered") return "delivered";
-  if (deliveryStatus === "failed") return "failed";
-  if (deliveryStatus === "rejected") return "rejected";
   return null;
 }
 
@@ -273,7 +271,7 @@ export async function updateDispatchDeliveryStatus({
   const confirmed =
     deliveryStatus === "delivered" || deliveryStatus === "read";
   const isFailure =
-    deliveryStatus === "failed" || deliveryStatus === "rejected";
+    deliveryStatus === "failed" || deliveryStatus === "undelivered";
 
   const finalErrorMessage = isFailure
     ? errorMessage ||
@@ -289,6 +287,7 @@ export async function updateDispatchDeliveryStatus({
             delivery_event = $3::jsonb,
             delivery_events_raw = $4::jsonb,
             delivery_checked_at = NOW(),
+            provider_status = COALESCE($9, provider_status),
             last_provider_event_at = COALESCE($5::timestamptz, last_provider_event_at),
             delivery_confirmed_at = CASE
               WHEN $6 THEN NOW()
@@ -307,6 +306,7 @@ export async function updateDispatchDeliveryStatus({
       confirmed,
       newStatus,
       finalErrorMessage,
+      matchedEvent?.event ? String(matchedEvent.event).toLowerCase() : null,
     ]
   );
   return r.rows[0];

@@ -516,7 +516,13 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
         error: result.error,
         reason: result.reason || null,
       });
-      return res.status(502).json({
+      const status = [
+        "invalid_dispatch_provider",
+        "missing_provider_message_id",
+      ].includes(result.error)
+        ? 400
+        : 502;
+      return res.status(status).json({
         ok: false,
         error: result.error,
         reason: result.reason || null,
@@ -560,6 +566,12 @@ router.post("/dispatches/:id/sync-delivery-status", async (req, res) => {
 
     return res.json({
       ok: true,
+      dispatch_id: id,
+      provider_message_id:
+        result.provider_message_id || result.dispatch?.provider_message_id || null,
+      delivery_status:
+        result.delivery_status || result.dispatch?.delivery_status || "unknown",
+      events_found: result.events_found ?? (result.matched ? 1 : 0),
       matched: result.matched,
       dispatch: result.dispatch,
       matched_event: result.matched_event,
