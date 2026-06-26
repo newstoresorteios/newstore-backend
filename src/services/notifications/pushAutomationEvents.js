@@ -115,11 +115,37 @@ function isTrue(value) {
   return String(value || "").trim() === "true";
 }
 
+function envBool(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return defaultValue;
+  return String(raw).trim() === "true";
+}
+
+function envPositiveInt(name, defaultValue) {
+  const n = Number(process.env[name]);
+  if (!Number.isFinite(n) || n <= 0) return defaultValue;
+  return Math.trunc(n);
+}
+
 function validateReference({ referenceKey, requireReferenceKey }) {
   const key = cleanText(referenceKey).slice(0, 200);
   if (requireReferenceKey && !key) throw coded("push_reference_key_required");
   if (key && !/^[a-zA-Z0-9:_./-]+$/.test(key)) throw coded("push_reference_key_invalid");
   return key || null;
+}
+
+function validateScanId(scanId) {
+  const clean = cleanText(scanId).slice(0, 120);
+  if (clean && !/^[a-zA-Z0-9:_./-]+$/.test(clean)) throw coded("push_scan_id_invalid");
+  return clean || null;
+}
+
+function validateOccurredAt(value) {
+  const clean = cleanText(value).slice(0, 80);
+  if (!clean) return { value: null, date: null, valid: false };
+  const date = new Date(clean);
+  if (Number.isNaN(date.getTime())) return { value: clean, date: null, valid: false };
+  return { value: date.toISOString(), date, valid: true };
 }
 
 function validateReferenceType(referenceType) {
@@ -146,6 +172,21 @@ function assertAutomationRealSendAllowed(eventKey) {
   if (process.env.PUSH_ALLOW_AUDIENCE === "true") throw coded("push_audience_blocked");
   if (process.env.PUSH_ALLOW_ADMIN_MASS_SEND === "true") throw coded("push_mass_send_blocked");
   if (process.env.PUSH_ALLOW_CAMPAIGNS === "true") throw coded("push_campaign_blocked");
+}
+
+function isEngineSource(source) {
+  const normalized = String(source || "").trim().toLowerCase();
+  return normalized === "engine" || normalized.startsWith("engine-");
+}
+
+function logSafetyBlock({ eventKey, referenceKey, reason, source, scanId }) {
+  console.warn("[push-internal] safety:block", {
+    event_key: eventKey || null,
+    reference_key: referenceKey || null,
+    reason,
+    source: source || null,
+    scan_id: scanId || null,
+  });
 }
 
 async function insertAutomationDispatch({
@@ -190,6 +231,59 @@ async function findSentDispatch({ eventKey, referenceKey }) {
   return result.rows?.[0] || null;
 }
 
+async function countReferencesForScan({ eventKey, scanId, referenceKey }) {
+  if (!scanId) return 0;
+  const result = await query(
+    `SELECT COUNT(DISTINCT payload->>'reference_key')::int AS count
+       FROM public.notification_push_dispatches
+      WHERE event_key = $1
+        AND payload->>'scan_id' = $2
+        AND payload->>'reference_key' IS NOT NULL
+        AND ($3::text IS NULL OR payload->>'reference_key' <> $3)
+        AND status IN ('sent', 'dry_run')`,
+    [eventKey, scanId, referenceKey || null]
+  );
+  return Number(result.rows?.[0]?.count || 0);
+}
+
+async function insertSafetySkipped({
+  eventKey,
+  source,
+  referenceType,
+  referenceKey,
+  scanId,
+  occurredAt,
+  metadata,
+  recipientUserIds,
+  actor,
+  reason,
+}) {
+  logSafetyBlock({ eventKey, referenceKey, reason, source, scanId });
+  const dispatch = await insertAutomationDispatch({
+    eventKey,
+    status: "skipped",
+    category: "operational",
+    title: "Push automatico bloqueado por seguranca",
+    body: "Evento automatico bloqueado por regra de seguranca.",
+    url: null,
+    errorMessage: reason,
+    payload: {
+      dry_run: true,
+      safety_block: true,
+      source,
+      scan_id: scanId,
+      occurred_at: occurredAt,
+      reference_type: referenceType,
+      reference_key: referenceKey,
+      reason,
+      metadata,
+      recipient_user_ids: recipientUserIds,
+      actor,
+    },
+  });
+  return { ok: true, event_key: eventKey, status: "skipped", reason, dispatch };
+}
+
 async function getRecipients({ eventKey, recipientUserIds }) {
   if (PUBLIC_EVENT_KEYS.has(eventKey)) {
     return query(
@@ -221,6 +315,8 @@ export async function handlePushAutomationEvent({
   source = "engine",
   referenceType = null,
   referenceKey = null,
+  scanId = null,
+  occurredAt = null,
   metadata = {},
   recipientUserIds = [],
   actor = null,
@@ -233,9 +329,56 @@ export async function handlePushAutomationEvent({
   const safeReferenceType = validateReferenceType(referenceType);
   const requireReferenceKey = !dryRun && isTrue(process.env.PUSH_AUTOMATION_REQUIRE_REFERENCE_KEY);
   const safeReferenceKey = validateReference({ referenceKey, requireReferenceKey });
+  const safeScanId = validateScanId(scanId || safeMetadata.scan_id);
+  const occurred = validateOccurredAt(occurredAt || safeMetadata.occurred_at);
   const safeActor = actor && typeof actor === "object"
     ? sanitizeMetadataValue(actor)
     : null;
+  const engineSource = isEngineSource(safeSource);
+
+  if (engineSource) {
+    const skippedArgs = {
+      eventKey: key,
+      source: safeSource,
+      referenceType: safeReferenceType,
+      referenceKey: safeReferenceKey,
+      scanId: safeScanId,
+      occurredAt: occurred.value,
+      metadata: safeMetadata,
+      recipientUserIds: safeRecipientUserIds,
+      actor: safeActor,
+    };
+
+    if (envBool("PUSH_ENGINE_REQUIRE_OCCURRED_AT", true) && !occurred.valid) {
+      return insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_occurred_at" });
+    }
+
+    if (occurred.valid && envBool("PUSH_ENGINE_SAFETY_NO_BACKFILL", true)) {
+      const maxAgeHours = envPositiveInt("PUSH_ENGINE_MAX_EVENT_AGE_HOURS", 24);
+      if (Date.now() - occurred.date.getTime() > maxAgeHours * 60 * 60 * 1000) {
+        return insertSafetySkipped({ ...skippedArgs, reason: "safety_event_too_old" });
+      }
+    }
+
+    if (envBool("PUSH_ENGINE_REQUIRE_SCAN_ID", true) && !safeScanId) {
+      return insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_scan_id" });
+    }
+
+    if (!dryRun && safeScanId && !envBool("PUSH_ENGINE_ALLOW_LARGE_BATCH", false)) {
+      const existingSent = safeReferenceKey
+        ? await findSentDispatch({ eventKey: key, referenceKey: safeReferenceKey })
+        : null;
+      const maxReferences = envPositiveInt("PUSH_ENGINE_MAX_REFERENCES_PER_SCAN_PER_EVENT", 2);
+      const acceptedReferences = await countReferencesForScan({
+        eventKey: key,
+        scanId: safeScanId,
+        referenceKey: safeReferenceKey,
+      });
+      if (!existingSent && acceptedReferences >= maxReferences) {
+        return insertSafetySkipped({ ...skippedArgs, reason: "safety_scan_event_limit_exceeded" });
+      }
+    }
+  }
 
   if (!dryRun) {
     assertAutomationRealSendAllowed(key);
@@ -250,6 +393,8 @@ export async function handlePushAutomationEvent({
         url: null,
         payload: {
           source: safeSource,
+          scan_id: safeScanId,
+          occurred_at: occurred.value,
           reference_type: safeReferenceType,
           reference_key: safeReferenceKey,
           metadata: safeMetadata,
@@ -284,6 +429,8 @@ export async function handlePushAutomationEvent({
       payload: {
         dry_run: dryRun,
         source: safeSource,
+        scan_id: safeScanId,
+        occurred_at: occurred.value,
         reference_type: safeReferenceType,
         reference_key: safeReferenceKey,
         reason: "rule_inactive_or_not_found",
@@ -316,6 +463,8 @@ export async function handlePushAutomationEvent({
         errorMessage: "no_active_push_recipients",
         payload: {
           source: safeSource,
+          scan_id: safeScanId,
+          occurred_at: occurred.value,
           reference_type: safeReferenceType,
           reference_key: safeReferenceKey,
           metadata: safeMetadata,
@@ -348,6 +497,8 @@ export async function handlePushAutomationEvent({
           url: renderedUrl,
           payload: {
             source: safeSource,
+            scan_id: safeScanId,
+            occurred_at: occurred.value,
             reference_type: safeReferenceType,
             reference_key: safeReferenceKey,
             metadata: safeMetadata,
@@ -387,6 +538,8 @@ export async function handlePushAutomationEvent({
     payload: {
       dry_run: true,
       source: safeSource,
+      scan_id: safeScanId,
+      occurred_at: occurred.value,
       reference_type: safeReferenceType,
       reference_key: safeReferenceKey,
       rule_id: rule.id,
