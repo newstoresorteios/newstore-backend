@@ -30,6 +30,7 @@ import adminSecondaryWinnersRouter from "./routes/admin_secondary_winners.js";
 import adminDashboardRouter from "./routes/admin_dashboard.js";
 import adminBalanceHistoryRouter from "./routes/admin_balance_history.js";
 import adminSecondaryDrawsRouter from "./routes/admin_secondary_draws.js";
+import adminCaptivesRouter from "./routes/admin_captives.js";
 
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
@@ -161,6 +162,7 @@ app.use("/api/admin/secondary-winners", adminSecondaryWinnersRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
 app.use("/api/admin/balance-history", adminBalanceHistoryRouter);
 app.use("/api/admin/secondary-draws", adminSecondaryDrawsRouter);
+app.use("/api/admin/captives", adminCaptivesRouter);
 
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza

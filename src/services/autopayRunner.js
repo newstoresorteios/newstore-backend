@@ -202,6 +202,18 @@ async function getTicketPriceCents(client) {
   return 300; // fallback seguro
 }
 
+async function hasAutopayNumberActiveColumn(client) {
+  const { rows } = await client.query(
+    `select 1
+       from information_schema.columns
+      where table_schema='public'
+        and table_name='autopay_numbers'
+        and column_name='active'
+      limit 1`
+  );
+  return rows.length > 0;
+}
+
 /* ------------------------------------------------------- *
  * Ensure números 00..99 existem para o draw
  * ------------------------------------------------------- */
@@ -544,10 +556,13 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
     await ensureNumbersForDraw(client, draw_id);
     await client.query("COMMIT");
 
+    const hasNumberActive = await hasAutopayNumberActiveColumn(client);
+
     // 4) Scan de candidatos (inclui active=false) + números agregados
     // Regras de elegibilidade (em JS):
     // - hasVindi = vindi_customer_id && vindi_payment_profile_id
     // - eligible = hasVindi && active=true && preferred.length>0
+    // - se autopay_numbers.active existir, números pausados ficam fora de preferred
     const { rows: scanned } = await client.query(
       `select
           ap.id as autopay_id,
@@ -555,7 +570,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           ap.active as active,
           ap.vindi_customer_id,
           ap.vindi_payment_profile_id,
-          coalesce(array_agg(an.n order by an.n) filter (where an.n is not null), '{}') as numbers
+          coalesce(array_agg(an.n order by an.n) filter (where an.n is not null ${hasNumberActive ? "and an.active = true" : ""}), '{}') as numbers
         from public.autopay_profiles ap
         left join public.autopay_numbers an on an.autopay_id = ap.id
        group by ap.id, ap.user_id, ap.active, ap.vindi_customer_id, ap.vindi_payment_profile_id`
