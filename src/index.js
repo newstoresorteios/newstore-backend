@@ -31,6 +31,8 @@ import adminDashboardRouter from "./routes/admin_dashboard.js";
 import adminBalanceHistoryRouter from "./routes/admin_balance_history.js";
 import adminSecondaryDrawsRouter from "./routes/admin_secondary_draws.js";
 import adminCaptivesRouter from "./routes/admin_captives.js";
+import adminCaptivePreauthRouter from "./routes/admin_captive_preauth.js";
+import captivePreauthRouter from "./routes/captive_preauth.js";
 
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
@@ -123,7 +125,10 @@ app.use((req, res, next) => {
     path.startsWith("/api/internal/push") ||
     path.startsWith("/api/internal/notifications") ||
     path.startsWith("/api/admin/push") ||
-    path.startsWith("/api/admin/notifications/push")
+    path.startsWith("/api/admin/notifications/push") ||
+    path.startsWith("/api/captive-preauth") ||
+    path.startsWith("/api/admin/captive-preauth") ||
+    path.startsWith("/cativo")
   ) {
     return next();
   }
@@ -163,6 +168,7 @@ app.use("/api/admin/dashboard", adminDashboardRouter);
 app.use("/api/admin/balance-history", adminBalanceHistoryRouter);
 app.use("/api/admin/secondary-draws", adminSecondaryDrawsRouter);
 app.use("/api/admin/captives", adminCaptivesRouter);
+app.use("/api/admin/captive-preauth", adminCaptivePreauthRouter);
 
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza
@@ -175,6 +181,8 @@ app.use("/api/admin/push/rules", adminPushRulesRouter);
 
 app.use("/api/webhooks/brevo", brevoWebhooksRouter);
 app.use("/api/internal/notifications", internalNotificationsRouter);
+app.use("/api/captive-preauth", captivePreauthRouter);
+app.use("/cativo", captivePreauthRouter);
 
 // ── Router ADMIN genérico (DEIXAR POR ÚLTIMO) ──────────────
 app.use("/api/admin", adminRoutes);

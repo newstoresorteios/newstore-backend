@@ -214,6 +214,18 @@ async function hasAutopayNumberActiveColumn(client) {
   return rows.length > 0;
 }
 
+async function hasAutopayProfileAuthorizationModeColumn(client) {
+  const { rows } = await client.query(
+    `select 1
+       from information_schema.columns
+      where table_schema='public'
+        and table_name='autopay_profiles'
+        and column_name='authorization_mode'
+      limit 1`
+  );
+  return rows.length > 0;
+}
+
 /* ------------------------------------------------------- *
  * Ensure números 00..99 existem para o draw
  * ------------------------------------------------------- */
@@ -557,23 +569,25 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
     await client.query("COMMIT");
 
     const hasNumberActive = await hasAutopayNumberActiveColumn(client);
+    const hasAuthorizationMode = await hasAutopayProfileAuthorizationModeColumn(client);
 
     // 4) Scan de candidatos (inclui active=false) + números agregados
     // Regras de elegibilidade (em JS):
     // - hasVindi = vindi_customer_id && vindi_payment_profile_id
-    // - eligible = hasVindi && active=true && preferred.length>0
+    // - eligible = hasVindi && active=true && authorization_mode=false && preferred.length>0
     // - se autopay_numbers.active existir, números pausados ficam fora de preferred
     const { rows: scanned } = await client.query(
       `select
           ap.id as autopay_id,
           ap.user_id as user_id,
           ap.active as active,
+          ${hasAuthorizationMode ? "coalesce(ap.authorization_mode, false)" : "false"} as authorization_mode,
           ap.vindi_customer_id,
           ap.vindi_payment_profile_id,
           coalesce(array_agg(an.n order by an.n) filter (where an.n is not null ${hasNumberActive ? "and an.active = true" : ""}), '{}') as numbers
         from public.autopay_profiles ap
         left join public.autopay_numbers an on an.autopay_id = ap.id
-       group by ap.id, ap.user_id, ap.active, ap.vindi_customer_id, ap.vindi_payment_profile_id`
+       group by ap.id, ap.user_id, ap.active, ${hasAuthorizationMode ? "ap.authorization_mode," : ""} ap.vindi_customer_id, ap.vindi_payment_profile_id`
     );
 
     let eligible = 0;
@@ -617,6 +631,19 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         });
         // opcional: registrar em autopay_runs
         // (opcional) não gravamos em autopay_runs aqui para evitar poluição fora do attempt
+        continue;
+      }
+
+      if (p.authorization_mode === true) {
+        inactive++;
+        console.warn("[autopay] skipped_authorization_mode", {
+          runTraceId,
+          autopay_id: p.autopay_id,
+          user_id: p.user_id,
+          active: true,
+          preferred,
+          reason: "requires_preauth",
+        });
         continue;
       }
 
