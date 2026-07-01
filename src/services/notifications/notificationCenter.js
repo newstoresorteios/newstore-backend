@@ -56,7 +56,48 @@ export function getTestModeWarning() {
   return shouldForceTestRecipient() ? TEST_MODE_WARNING : null;
 }
 
-export function getNotificationHealth() {
+export async function resolveCaptivePreauthTemplateHealth({ pgClient } = {}) {
+  const envTemplateId = String(process.env.CAPTIVE_PREAUTH_BREVO_TEMPLATE_ID || "").trim();
+  if (envTemplateId) {
+    return {
+      configured: true,
+      id: envTemplateId,
+      source: "env",
+      key: "CAPTIVE_PREAUTH_REQUEST",
+    };
+  }
+
+  try {
+    const row = await getTemplateByKey({
+      pgClient,
+      templateKey: "CAPTIVE_PREAUTH_REQUEST",
+      channel: "whatsapp",
+      provider: "brevo",
+      activeOnly: true,
+    });
+    const id = row?.provider_template_id != null ? String(row.provider_template_id).trim() : "";
+    if (id) {
+      return {
+        configured: true,
+        id,
+        source: "database",
+        key: "CAPTIVE_PREAUTH_REQUEST",
+      };
+    }
+  } catch (err) {
+    if (err?.code !== "42P01" && err?.code !== "42703") throw err;
+  }
+
+  return {
+    configured: false,
+    id: null,
+    source: "missing",
+    key: "CAPTIVE_PREAUTH_REQUEST",
+  };
+}
+
+export async function getNotificationHealth() {
+  const captiveTemplate = await resolveCaptivePreauthTemplateHealth();
   return {
     ok: true,
     notificationCenterEnabled: isTruthy(process.env.NOTIFICATION_CENTER_ENABLED),
@@ -73,8 +114,13 @@ export function getNotificationHealth() {
         process.env.BREVO_WHATSAPP_TEMPLATE_ID
     ),
     captiveTemplateEnvConfigured: Boolean(
-      process.env.BREVO_WHATSAPP_CAPTIVE_AUTH_TEMPLATE_ID
+      process.env.BREVO_WHATSAPP_CAPTIVE_AUTH_TEMPLATE_ID ||
+        process.env.CAPTIVE_PREAUTH_BREVO_TEMPLATE_ID
     ),
+    captive_preauth_template_configured: captiveTemplate.configured,
+    captive_preauth_template_id: captiveTemplate.id,
+    captive_preauth_template_source: captiveTemplate.source,
+    captive_preauth_template_key: captiveTemplate.key,
     adminTestCustomRecipientsEnabled: isAdminTestCustomRecipientsEnabled(),
     adminTestAllowedRecipientsConfigured: Boolean(
       String(process.env.NOTIFICATION_ADMIN_TEST_ALLOWED_RECIPIENTS || "").trim()

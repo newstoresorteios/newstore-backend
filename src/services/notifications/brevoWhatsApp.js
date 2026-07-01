@@ -30,6 +30,24 @@ function isExplicitlyFalse(value) {
   return s === "false" || s === "0" || s === "no" || s === "off";
 }
 
+function last4(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  return digits ? digits.slice(-4) : null;
+}
+
+function shortProviderError(value) {
+  const text = String(value || "brevo_request_failed").trim();
+  return text.replace(/[\r\n\t]+/g, " ").slice(0, 180);
+}
+
+function safeUrlHost(value) {
+  try {
+    return new URL(String(value || "")).host || null;
+  } catch {
+    return null;
+  }
+}
+
 export function isTestModeActive() {
   const v = process.env.NOTIFICATION_TEST_MODE;
   if (v === undefined || v === null || String(v).trim() === "") return true;
@@ -44,12 +62,33 @@ export function shouldForceTestRecipient() {
   return isTestModeActive() || !isAllowRealRecipients();
 }
 
+export function getWhatsAppProviderReadiness() {
+  const brevoWhatsappEnabled = isTruthy(process.env.BREVO_WHATSAPP_ENABLED);
+  const hasBrevoApiKey = !!String(process.env.BREVO_API_KEY || "").trim();
+  const hasSenderNumber = !!normalizePhoneBR(process.env.BREVO_WHATSAPP_SENDER_NUMBER);
+  const notificationWhatsappCampaignEnabled = isTruthy(process.env.NOTIFICATION_WHATSAPP_CAMPAIGN_ENABLED);
+  const testMode = isTestModeActive();
+  const hasTestTo = !!getTestRecipient();
+
+  let reason = null;
+  if (!brevoWhatsappEnabled) reason = "whatsapp_provider_disabled";
+  else if (!hasBrevoApiKey) reason = "brevo_api_key_missing";
+  else if (!hasSenderNumber) reason = "brevo_sender_number_missing";
+
+  return {
+    ok: !reason,
+    reason,
+    brevo_whatsapp_enabled: brevoWhatsappEnabled,
+    notification_whatsapp_campaign_enabled: notificationWhatsappCampaignEnabled,
+    test_mode: testMode,
+    has_test_to: hasTestTo,
+    has_brevo_api_key: hasBrevoApiKey,
+    has_sender_number: hasSenderNumber,
+  };
+}
+
 export function isWhatsAppEnabled() {
-  return (
-    isTruthy(process.env.BREVO_WHATSAPP_ENABLED) &&
-    !!String(process.env.BREVO_API_KEY || "").trim() &&
-    !!String(process.env.BREVO_WHATSAPP_SENDER_NUMBER || "").trim()
-  );
+  return getWhatsAppProviderReadiness().ok;
 }
 
 export function getTestRecipient() {
@@ -126,7 +165,7 @@ export function resolveRecipientForCurrentMode(originalRecipient, options = {}) 
   if (!testRecipient) {
     return {
       ok: false,
-      reason: "missing_test_recipient",
+      reason: "whatsapp_test_number_missing",
       recipient: null,
       recipient_original: normalizedOriginal || originalRaw,
       recipient_forced: true,
@@ -204,11 +243,12 @@ export async function sendBrevoWhatsAppTemplate({
   let recipient_forced = false;
   let recipient_mode = null;
 
-  if (!isWhatsAppEnabled()) {
+  const readiness = getWhatsAppProviderReadiness();
+  if (!readiness.ok) {
     return {
       ok: false,
       skipped: true,
-      reason: "whatsapp_disabled",
+      reason: readiness.reason,
       provider: "brevo",
       channel: "whatsapp",
       recipient,
@@ -271,7 +311,7 @@ export async function sendBrevoWhatsAppTemplate({
     return {
       ok: false,
       skipped: true,
-      reason: "missing_template_id",
+      reason: "brevo_template_id_missing",
       provider: "brevo",
       channel: "whatsapp",
       recipient,
@@ -305,6 +345,22 @@ export async function sendBrevoWhatsAppTemplate({
     senderConfigured: Boolean(process.env.BREVO_WHATSAPP_SENDER_NUMBER),
   });
 
+  console.log("[brevo-whatsapp] prepared_request", {
+    template_key: templateKey || null,
+    provider_template_id: Number(templateId),
+    has_api_key: Boolean(process.env.BREVO_API_KEY),
+    has_sender_number: Boolean(senderNumber),
+    sender_last4: last4(senderNumber),
+    recipient_forced: resolved.recipient_forced,
+    recipient_last4: last4(recipient),
+    test_mode: isTestModeActive(),
+    params_keys: params && typeof params === "object" ? Object.keys(params) : [],
+    has_authorize_url: Boolean(params?.authorize_url),
+    has_decline_url: Boolean(params?.decline_url),
+    authorize_host: safeUrlHost(params?.authorize_url),
+    decline_host: safeUrlHost(params?.decline_url),
+  });
+
   try {
     const res = await fetch(`${baseUrl}/whatsapp/sendMessage`, {
       method: "POST",
@@ -323,18 +379,12 @@ export async function sendBrevoWhatsAppTemplate({
 
     if (statusCode === 200 || statusCode === 201 || statusCode === 202) {
       const messageId = body?.messageId || body?.id || null;
-      console.log("[brevo.whatsapp] send:accepted", {
-        statusCode,
-        messageId,
-        templateId: Number(templateId),
-        templateKey: templateKey || null,
+      console.log("[brevo-whatsapp] accepted", {
+        provider_message_id_present: Boolean(messageId),
+        provider_template_id: Number(templateId),
         recipient_forced: resolved.recipient_forced,
-        provider_status: "accepted",
-        delivery_status: "unknown",
-        error: null,
-        reason: null,
-        response_keys:
-          body && typeof body === "object" ? Object.keys(body) : [],
+        recipient_last4: last4(recipient),
+        sent_at_present: true,
       });
       return {
         ok: true,
@@ -356,15 +406,27 @@ export async function sendBrevoWhatsAppTemplate({
       };
     }
 
-    const httpError = body?.message || body?.code || "brevo_request_failed";
+    const httpError = shortProviderError(body?.message || body?.code || "brevo_request_failed");
+    const providerReason = shortProviderError(body?.reason || httpError);
+    console.warn("[brevo-whatsapp] provider_rejected", {
+      http_status: statusCode,
+      reason: httpError,
+      provider_template_id: Number(templateId),
+      sender_last4: last4(senderNumber),
+      recipient_forced: resolved.recipient_forced,
+      recipient_last4: last4(recipient),
+      test_mode: isTestModeActive(),
+      has_api_key: Boolean(process.env.BREVO_API_KEY),
+      has_sender_number: Boolean(senderNumber),
+    });
     console.warn("[brevo.whatsapp] send:failed", {
       statusCode,
       templateId: Number(templateId),
       templateKey: templateKey || null,
       recipient_forced: resolved.recipient_forced,
       error: httpError,
-      reason: body?.reason || null,
-      response: body,
+      reason: providerReason,
+      response_keys: body && typeof body === "object" ? Object.keys(body) : [],
     });
 
     return {
@@ -374,8 +436,8 @@ export async function sendBrevoWhatsAppTemplate({
       channel: "whatsapp",
       statusCode,
       error: httpError,
-      reason: body?.reason || null,
-      response: body,
+      reason: body?.reason ? providerReason : null,
+      response: { statusCode, body },
       recipient,
       recipient_original,
       recipient_forced,

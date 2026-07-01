@@ -63,6 +63,9 @@ function mapRow(row) {
     participation_active: profileActive && numberActive,
     profile_active: profileActive,
     number_active: numberActive,
+    authorization_mode: row.authorization_mode === true,
+    requires_preauth: row.authorization_mode === true,
+    authorization_mode_label: row.authorization_mode === true ? "Pré-autorização" : "Automático",
     autopay_profile_id: String(row.autopay_profile_id),
     card_status: row.has_card ? "configured" : "missing",
     whatsapp_consent_status: normalizeConsentStatus(row.whatsapp_consent_status),
@@ -97,6 +100,14 @@ async function getAdminCaptivesSchema() {
         AND column_name IN ('status', 'created_at', 'updated_at')`
   );
   const runColumns = new Set((runColumnsResult.rows || []).map((row) => row.column_name));
+  const profileColumnsResult = await query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'autopay_profiles'
+        AND column_name IN ('authorization_mode', 'updated_at')`
+  );
+  const profileColumns = new Set((profileColumnsResult.rows || []).map((row) => row.column_name));
   return {
     numberColumns: {
       active: columns.has("active"),
@@ -110,17 +121,23 @@ async function getAdminCaptivesSchema() {
       created_at: runColumns.has("created_at"),
       updated_at: runColumns.has("updated_at"),
     },
+    profileColumns: {
+      authorization_mode: profileColumns.has("authorization_mode"),
+      updated_at: profileColumns.has("updated_at"),
+    },
   };
 }
 
 function buildCaptivesBaseSql({
   numberColumns,
+  profileColumns = { authorization_mode: false, updated_at: true },
   hasCommunicationConsents = true,
   hasAutopayRuns = true,
   runColumns = { status: true, created_at: true, updated_at: true },
   includeWhere = "",
 } = {}) {
   const numberActiveExpr = numberColumns.active ? "an.active" : "true";
+  const authorizationModeExpr = profileColumns.authorization_mode ? "COALESCE(ap.authorization_mode, false)" : "false";
   const createdAtExpr = numberColumns.created_at ? "COALESCE(an.created_at, ap.created_at)" : "ap.created_at";
   const updatedAtExpr = numberColumns.updated_at
     ? `COALESCE(an.updated_at, ap.updated_at, ${createdAtExpr})`
@@ -161,6 +178,7 @@ function buildCaptivesBaseSql({
       an.autopay_id AS autopay_profile_id,
       an.n AS captive_number,
       ${numberActiveExpr} AS number_active,
+      ${authorizationModeExpr} AS authorization_mode,
       ${createdAtExpr} AS created_at,
       ${updatedAtExpr} AS updated_at,
       ap.user_id,
@@ -312,6 +330,66 @@ router.patch("/:id/participation", requireAuth, requireAdmin, async (req, res) =
       code: error?.code || null,
     });
     return res.status(500).json({ ok: false, error: "admin_captives_toggle_failed" });
+  }
+});
+
+router.patch("/:id/authorization-mode", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (typeof req.body?.authorization_mode !== "boolean") {
+      return res.status(400).json({ ok: false, error: "invalid_authorization_mode" });
+    }
+
+    const schema = await getAdminCaptivesSchema();
+    const { profileColumns } = schema;
+    if (!profileColumns.authorization_mode) {
+      console.warn(`${LOG_PREFIX} update_authorization_mode_failed`, {
+        admin_user_id: req.user?.id || null,
+        reason: "missing_autopay_profiles_authorization_mode_column",
+      });
+      return res.status(409).json({ ok: false, error: "migration_required" });
+    }
+
+    const id = String(req.params.id || "").trim();
+    const updatedAtSet = profileColumns.updated_at ? ", updated_at = now()" : "";
+    const updated = await query(
+      `UPDATE public.autopay_profiles ap
+          SET authorization_mode = $2${updatedAtSet}
+         FROM public.autopay_numbers an
+        WHERE an.id = $1
+          AND an.autopay_id = ap.id
+        RETURNING ap.id`,
+      [id, req.body.authorization_mode]
+    );
+
+    if (!updated.rowCount) {
+      console.warn(`${LOG_PREFIX} update_authorization_mode_failed`, {
+        admin_user_id: req.user?.id || null,
+        reason: "not_found",
+      });
+      return res.status(404).json({ ok: false, error: "captive_not_found" });
+    }
+
+    const itemResult = await query(
+      buildCaptivesBaseSql({
+        ...schema,
+        includeWhere: "WHERE an.id = $1",
+      }),
+      [id]
+    );
+
+    console.log(`${LOG_PREFIX} update_authorization_mode`, {
+      admin_user_id: req.user?.id || null,
+      authorization_mode: req.body.authorization_mode,
+    });
+
+    return res.json({ ok: true, item: mapRow(itemResult.rows[0]) });
+  } catch (error) {
+    console.error(`${LOG_PREFIX} update_authorization_mode_failed`, {
+      admin_user_id: req.user?.id || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "admin_captives_authorization_mode_failed" });
   }
 });
 

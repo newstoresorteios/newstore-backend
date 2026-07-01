@@ -136,7 +136,7 @@ router.get("/diagnostics/schema", async (_req, res) => {
 
 router.get("/health", async (_req, res) => {
   try {
-    const health = getNotificationHealth();
+    const health = await getNotificationHealth();
     console.log("[admin/notifications] health", {
       testMode: health?.testMode,
       allowRealRecipients: health?.allowRealRecipients,
