@@ -52,8 +52,10 @@ function mapLastRunStatus(status) {
 function mapRow(row) {
   const profileActive = row.profile_active === true;
   const numberActive = row.number_active !== false;
+  const preauthNotificationsEnabled = row.preauth_notifications_enabled !== false;
   return {
     id: String(row.id),
+    autopay_number_id: String(row.id),
     user_id: Number(row.user_id),
     user_name: row.user_name || null,
     user_email: row.user_email || null,
@@ -66,6 +68,8 @@ function mapRow(row) {
     authorization_mode: row.authorization_mode === true,
     requires_preauth: row.authorization_mode === true,
     authorization_mode_label: row.authorization_mode === true ? "Pré-autorização" : "Automático",
+    preauth_notifications_enabled: preauthNotificationsEnabled,
+    preauth_notifications_label: preauthNotificationsEnabled ? "Ativas" : "Pausadas",
     autopay_profile_id: String(row.autopay_profile_id),
     card_status: row.has_card ? "configured" : "missing",
     whatsapp_consent_status: normalizeConsentStatus(row.whatsapp_consent_status),
@@ -79,10 +83,10 @@ function mapRow(row) {
 async function getAdminCaptivesSchema() {
   const result = await query(
     `SELECT column_name
-       FROM information_schema.columns
+      FROM information_schema.columns
       WHERE table_schema = 'public'
         AND table_name = 'autopay_numbers'
-        AND column_name IN ('active', 'created_at', 'updated_at')`
+        AND column_name IN ('active', 'created_at', 'updated_at', 'preauth_notifications_enabled')`
   );
   const columns = new Set((result.rows || []).map((row) => row.column_name));
   const tables = await query(
@@ -113,6 +117,7 @@ async function getAdminCaptivesSchema() {
       active: columns.has("active"),
       created_at: columns.has("created_at"),
       updated_at: columns.has("updated_at"),
+      preauth_notifications_enabled: columns.has("preauth_notifications_enabled"),
     },
     hasCommunicationConsents: tableNames.has("communication_consents"),
     hasAutopayRuns: tableNames.has("autopay_runs"),
@@ -138,6 +143,9 @@ function buildCaptivesBaseSql({
 } = {}) {
   const numberActiveExpr = numberColumns.active ? "an.active" : "true";
   const authorizationModeExpr = profileColumns.authorization_mode ? "COALESCE(ap.authorization_mode, false)" : "false";
+  const preauthNotificationsExpr = numberColumns.preauth_notifications_enabled
+    ? "COALESCE(an.preauth_notifications_enabled, true)"
+    : "true";
   const createdAtExpr = numberColumns.created_at ? "COALESCE(an.created_at, ap.created_at)" : "ap.created_at";
   const updatedAtExpr = numberColumns.updated_at
     ? `COALESCE(an.updated_at, ap.updated_at, ${createdAtExpr})`
@@ -179,6 +187,7 @@ function buildCaptivesBaseSql({
       an.n AS captive_number,
       ${numberActiveExpr} AS number_active,
       ${authorizationModeExpr} AS authorization_mode,
+      ${preauthNotificationsExpr} AS preauth_notifications_enabled,
       ${createdAtExpr} AS created_at,
       ${updatedAtExpr} AS updated_at,
       ap.user_id,
@@ -390,6 +399,73 @@ router.patch("/:id/authorization-mode", requireAuth, requireAdmin, async (req, r
       code: error?.code || null,
     });
     return res.status(500).json({ ok: false, error: "admin_captives_authorization_mode_failed" });
+  }
+});
+
+router.patch("/:id/preauth-notifications", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (typeof req.body?.preauth_notifications_enabled !== "boolean") {
+      return res.status(400).json({ ok: false, error: "invalid_preauth_notifications_enabled" });
+    }
+
+    const schema = await getAdminCaptivesSchema();
+    const { numberColumns } = schema;
+    if (!numberColumns.preauth_notifications_enabled) {
+      console.warn(`${LOG_PREFIX} update_preauth_notifications_failed`, {
+        admin_user_id: req.user?.id || null,
+        reason: "missing_autopay_numbers_preauth_notifications_enabled_column",
+      });
+      return res.status(409).json({ ok: false, error: "migration_required" });
+    }
+
+    const id = String(req.params.id || "").trim();
+    const updated = await query(
+      `UPDATE public.autopay_numbers
+          SET preauth_notifications_enabled = $2
+        WHERE id = $1
+        RETURNING id`,
+      [id, req.body.preauth_notifications_enabled]
+    );
+
+    if (!updated.rowCount) {
+      console.warn(`${LOG_PREFIX} update_preauth_notifications_failed`, {
+        admin_user_id: req.user?.id || null,
+        captive_id: id || null,
+        reason: "not_found",
+      });
+      return res.status(404).json({ ok: false, error: "captive_not_found" });
+    }
+
+    const itemResult = await query(
+      buildCaptivesBaseSql({
+        ...schema,
+        includeWhere: "WHERE an.id = $1",
+      }),
+      [id]
+    );
+
+    console.log(`${LOG_PREFIX} update_preauth_notifications`, {
+      admin_user_id: req.user?.id || null,
+      captive_id: id,
+      autopay_number_id: id,
+      enabled: req.body.preauth_notifications_enabled,
+    });
+
+    const item = mapRow(itemResult.rows[0]);
+    return res.json({
+      ok: true,
+      id: item.autopay_number_id,
+      preauth_notifications_enabled: item.preauth_notifications_enabled,
+      preauth_notifications_label: item.preauth_notifications_label,
+      item,
+    });
+  } catch (error) {
+    console.error(`${LOG_PREFIX} update_preauth_notifications_failed`, {
+      admin_user_id: req.user?.id || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "admin_captives_preauth_notifications_failed" });
   }
 });
 

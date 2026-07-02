@@ -1,7 +1,13 @@
 import { Router } from "express";
 import {
+  authorizeCaptivePreauthByCode,
+  authorizeCaptivePreauthPublic,
   authorizeCaptivePreauthByToken,
+  declineCaptivePreauthByCode,
+  declineCaptivePreauthPublic,
   declineCaptivePreauthByToken,
+  lookupCaptivePreauthByCode,
+  lookupCaptivePreauthPublic,
 } from "../services/autopay/captivePreauthService.js";
 
 const router = Router();
@@ -82,6 +88,81 @@ function messageForResult(action, result) {
   };
 }
 
+function readConfirmationCode(req) {
+  return String(req.body?.confirmation_code || "").trim().toUpperCase();
+}
+
+function readPublicCredentials(req) {
+  return {
+    email: String(req.body?.email || "").trim().toLowerCase(),
+    phone: String(req.body?.phone || "").replace(/\D/g, ""),
+    authorizationId: String(req.body?.authorization_id || "").trim(),
+  };
+}
+
+function jsonForCodeDecision(result) {
+  if (result?.code === "invalid_confirmation_code") {
+    return { status: 400, body: { ok: false, error: "invalid_confirmation_code" } };
+  }
+  if (result?.code === "duplicate_confirmation_code") {
+    return { status: 409, body: { ok: false, error: "duplicate_confirmation_code" } };
+  }
+  if (result?.code === "confirmation_code_expired") {
+    return {
+      status: 410,
+      body: {
+        ok: true,
+        status: "expired",
+        authorization: result.authorization
+          ? {
+              status: "expired",
+              captive_number: Number(result.authorization.captive_number),
+            }
+          : undefined,
+      },
+    };
+  }
+  if (result?.code === "already_decided") {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        already_decided: true,
+        status: result.status,
+        message: "Esta decisão já foi registrada anteriormente.",
+      },
+    };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      status: result?.status,
+    },
+  };
+}
+
+function jsonForPublicDecision(result) {
+  if (result?.code === "authorization_not_found") {
+    return { status: 404, body: { ok: false, error: "authorization_not_found" } };
+  }
+  if (result?.code === "already_decided") {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        already_decided: true,
+        status: result.status,
+        message: "Esta decisão já foi registrada anteriormente.",
+      },
+    };
+  }
+  if (result?.status === "expired") {
+    return { status: 410, body: { ok: true, status: "expired" } };
+  }
+  return { status: 200, body: { ok: true, status: result?.status } };
+}
+
 async function handleAuthorize(req, res) {
   try {
     const result = await authorizeCaptivePreauthByToken(req.query?.token);
@@ -111,6 +192,103 @@ async function handleDecline(req, res) {
     return htmlResponse(res, "Erro", "Não foi possível registrar sua resposta agora.", 500);
   }
 }
+
+router.post("/code/lookup", async (req, res) => {
+  try {
+    const result = await lookupCaptivePreauthByCode(readConfirmationCode(req));
+    if (!result.ok) {
+      return res.status(result.error === "duplicate_confirmation_code" ? 409 : 400).json({
+        ok: false,
+        error: result.error || "invalid_confirmation_code",
+      });
+    }
+    return res.json(result);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "confirmation_code_lookup",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "confirmation_code_lookup_failed" });
+  }
+});
+
+router.post("/code/authorize", async (req, res) => {
+  try {
+    const result = await authorizeCaptivePreauthByCode(readConfirmationCode(req));
+    const response = jsonForCodeDecision(result);
+    return res.status(response.status).json(response.body);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "confirmation_code_authorize",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "confirmation_code_authorize_failed" });
+  }
+});
+
+router.post("/code/decline", async (req, res) => {
+  try {
+    const result = await declineCaptivePreauthByCode(readConfirmationCode(req));
+    const response = jsonForCodeDecision(result);
+    return res.status(response.status).json(response.body);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "confirmation_code_decline",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "confirmation_code_decline_failed" });
+  }
+});
+
+router.post("/public/lookup", async (req, res) => {
+  try {
+    const { email, phone } = readPublicCredentials(req);
+    const result = await lookupCaptivePreauthPublic({ email, phone });
+    return res.json(result);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "public_lookup",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "public_lookup_failed" });
+  }
+});
+
+router.post("/public/authorize", async (req, res) => {
+  try {
+    const { email, phone, authorizationId } = readPublicCredentials(req);
+    const result = await authorizeCaptivePreauthPublic({ email, phone, authorizationId });
+    const response = jsonForPublicDecision(result);
+    return res.status(response.status).json(response.body);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "public_authorize",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "public_authorize_failed" });
+  }
+});
+
+router.post("/public/decline", async (req, res) => {
+  try {
+    const { email, phone, authorizationId } = readPublicCredentials(req);
+    const result = await declineCaptivePreauthPublic({ email, phone, authorizationId });
+    const response = jsonForPublicDecision(result);
+    return res.status(response.status).json(response.body);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "public_decline",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "public_decline_failed" });
+  }
+});
 
 router.get("/authorize", handleAuthorize);
 router.get("/decline", handleDecline);
