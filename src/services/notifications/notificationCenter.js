@@ -28,6 +28,10 @@ import {
   isWhatsAppConsentRequired,
   isUnlinkedWhatsAppPhoneAllowed,
 } from "./communicationConsent.js";
+import {
+  getCaptivePreauthTemplateMode,
+  resolveCaptiveConfirmationPublicUrl,
+} from "../autopay/captivePreauthService.js";
 
 export const DELIVERY_NOTE_ACCEPTED =
   "accepted_by_brevo_not_delivery_confirmed";
@@ -98,6 +102,8 @@ export async function resolveCaptivePreauthTemplateHealth({ pgClient } = {}) {
 
 export async function getNotificationHealth() {
   const captiveTemplate = await resolveCaptivePreauthTemplateHealth();
+  const captiveConfirmationPublicUrl = resolveCaptiveConfirmationPublicUrl();
+  const captivePreauthTemplateMode = getCaptivePreauthTemplateMode();
   return {
     ok: true,
     notificationCenterEnabled: isTruthy(process.env.NOTIFICATION_CENTER_ENABLED),
@@ -121,6 +127,9 @@ export async function getNotificationHealth() {
     captive_preauth_template_id: captiveTemplate.id,
     captive_preauth_template_source: captiveTemplate.source,
     captive_preauth_template_key: captiveTemplate.key,
+    captive_confirmation_public_url: captiveConfirmationPublicUrl,
+    captive_confirmation_public_url_configured: Boolean(captiveConfirmationPublicUrl),
+    captive_preauth_template_mode: captivePreauthTemplateMode,
     adminTestCustomRecipientsEnabled: isAdminTestCustomRecipientsEnabled(),
     adminTestAllowedRecipientsConfigured: Boolean(
       String(process.env.NOTIFICATION_ADMIN_TEST_ALLOWED_RECIPIENTS || "").trim()

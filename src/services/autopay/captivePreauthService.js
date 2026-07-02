@@ -13,6 +13,8 @@ const LOG_PREFIX = "[captive-preauth]";
 const PUBLIC_URL_FALLBACK = "https://sorteiosxnamai.com.br";
 const AUTHORIZATION_STATUSES = new Set(["pending", "authorized", "declined", "expired", "charged", "failed"]);
 const PREAUTH_TEMPLATE_KEY = "CAPTIVE_PREAUTH_REQUEST";
+const CONFIRMATION_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function log(event, extra = {}) {
   console.log(`${LOG_PREFIX} ${event}`, extra);
@@ -36,6 +38,41 @@ function normalizeBaseUrl() {
   return String(raw || PUBLIC_URL_FALLBACK).trim().replace(/\/+$/, "");
 }
 
+function normalizeUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (!/^https?:$/i.test(url.protocol)) return null;
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function appendConfirmPath(baseUrl) {
+  const base = normalizeUrl(baseUrl);
+  if (!base) return null;
+  return `${base.replace(/\/+$/, "")}/cativo/confirmar`;
+}
+
+export function getCaptivePreauthTemplateMode() {
+  const mode = String(process.env.CAPTIVE_PREAUTH_TEMPLATE_MODE || "params").trim().toLowerCase();
+  return mode === "static_link" ? "static_link" : "params";
+}
+
+export function resolveCaptiveConfirmationPublicUrl() {
+  const explicit = normalizeUrl(process.env.CAPTIVE_CONFIRMATION_PUBLIC_URL);
+  if (explicit) return explicit;
+
+  return (
+    appendConfirmPath(process.env.PUBLIC_APP_URL) ||
+    appendConfirmPath(process.env.FRONTEND_URL) ||
+    appendConfirmPath(process.env.SITE_URL) ||
+    null
+  );
+}
+
 function toPositiveInt(value) {
   const n = Number(value);
   return Number.isInteger(n) && n > 0 ? n : null;
@@ -49,6 +86,23 @@ function safeStatus(status) {
 function safeError(value, fallback = "notification_failed") {
   const text = String(value || fallback).trim();
   return text.replace(/[\r\n\t]+/g, " ").slice(0, 180);
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizePhoneDigits(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function phoneLookupVariants(value) {
+  const digits = normalizePhoneDigits(value);
+  if (!digits) return [];
+  const variants = new Set([digits]);
+  if (digits.startsWith("55") && digits.length > 11) variants.add(digits.slice(2));
+  if (!digits.startsWith("55") && (digits.length === 10 || digits.length === 11)) variants.add(`55${digits}`);
+  return [...variants];
 }
 
 function isCaptivePreauthWhatsAppEnabled() {
@@ -94,7 +148,21 @@ function formatAmountBRL(amountCents) {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
 
-function buildCaptivePreauthMessage({ customerName, drawTitle, amount, number, authorizeUrl, declineUrl }) {
+function buildCaptivePreauthMessage({ customerName, confirmationCode }) {
+  return [
+    `Olá, ${customerName}.`,
+    "",
+    "A New Store possui uma confirmação pendente para sua conta.",
+    "",
+    `Código de confirmação: ${confirmationCode}.`,
+    "",
+    "Use o botão abaixo para acessar a página de confirmação.",
+    "",
+    "Caso tenha dúvidas, responda esta mensagem.",
+  ].join("\n");
+}
+
+function buildLegacyCaptivePreauthMessage({ customerName, drawTitle, amount, number, authorizeUrl, declineUrl }) {
   return [
     `Olá, ${customerName}! Um novo sorteio especial da New Store foi lançado: ${drawTitle}.`,
     "",
@@ -175,7 +243,7 @@ async function getDrawPriceCents(draw) {
 }
 
 async function listActiveCaptives() {
-  const columns = await query(
+  const profileColumns = await query(
     `SELECT 1
        FROM information_schema.columns
       WHERE table_schema = 'public'
@@ -183,13 +251,39 @@ async function listActiveCaptives() {
         AND column_name = 'authorization_mode'
       LIMIT 1`
   );
-  const hasAuthorizationMode = Boolean(columns.rows?.length);
+  const hasAuthorizationMode = Boolean(profileColumns.rows?.length);
   if (!hasAuthorizationMode) {
     warn("profile_requires_preauth", {
       selected: 0,
       reason: "authorization_mode_column_missing",
     });
-    return [];
+    return { rows: [], skippedNotificationsDisabled: 0 };
+  }
+
+  const numberColumns = await query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'autopay_numbers'
+        AND column_name = 'preauth_notifications_enabled'`
+  );
+  const hasPreauthNotificationsEnabled = Boolean(numberColumns.rows?.length);
+  const preauthNotificationsFilter = hasPreauthNotificationsEnabled
+    ? "AND COALESCE(an.preauth_notifications_enabled, true) = true"
+    : "";
+  let skippedNotificationsDisabled = 0;
+
+  if (hasPreauthNotificationsEnabled) {
+    const skippedResult = await query(
+      `SELECT COUNT(*)::int AS count
+         FROM public.autopay_numbers an
+         JOIN public.autopay_profiles ap ON ap.id = an.autopay_id
+        WHERE ap.active = true
+          AND an.active = true
+          AND COALESCE(ap.authorization_mode, false) = true
+          AND COALESCE(an.preauth_notifications_enabled, true) = false`
+    );
+    skippedNotificationsDisabled = Number(skippedResult.rows?.[0]?.count || 0);
   }
 
   const result = await query(
@@ -206,18 +300,40 @@ async function listActiveCaptives() {
       WHERE ap.active = true
         AND an.active = true
         AND COALESCE(ap.authorization_mode, false) = true
+        ${preauthNotificationsFilter}
       ORDER BY an.n ASC, ap.user_id ASC`
   );
-  log("profile_requires_preauth", { selected: result.rows?.length || 0 });
-  return result.rows || [];
+  log("profile_requires_preauth", {
+    selected: result.rows?.length || 0,
+    skipped_notifications_disabled: skippedNotificationsDisabled,
+  });
+  return { rows: result.rows || [], skippedNotificationsDisabled };
 }
 
 export function createToken() {
   return crypto.randomBytes(32).toString("base64url");
 }
 
+export function createConfirmationCode() {
+  let code = "";
+  for (let i = 0; i < 6; i += 1) {
+    code += CONFIRMATION_CODE_ALPHABET[crypto.randomInt(CONFIRMATION_CODE_ALPHABET.length)];
+  }
+  return code;
+}
+
+export function normalizeConfirmationCode(code) {
+  return String(code || "").trim().replace(/\s+/g, "").toUpperCase();
+}
+
 export function hashToken(token) {
   const value = String(token || "").trim();
+  if (!value) return null;
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+export function hashConfirmationCode(code) {
+  const value = normalizeConfirmationCode(code);
   if (!value) return null;
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -228,6 +344,10 @@ export function buildAuthorizeUrl(token) {
 
 export function buildDeclineUrl(token) {
   return `${normalizeBaseUrl()}/cativo/recusar?token=${encodeURIComponent(token)}`;
+}
+
+export function buildManageUrl() {
+  return resolveCaptiveConfirmationPublicUrl();
 }
 
 async function resolveCaptivePreauthTemplateConfig() {
@@ -287,7 +407,32 @@ async function updateAuthorizationNotification({ authorizationId, dispatchId = n
   return result.rows?.[0] || null;
 }
 
-async function sendCaptivePreauthWhatsApp({ authorization, captive, draw, authorizeUrl, declineUrl, templateId }) {
+async function getAuthorizationTableSchema() {
+  const result = await query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'autopay_draw_authorizations'
+        AND column_name IN ('confirmation_code_hash', 'confirmation_code_created_at')`
+  );
+  const columns = new Set((result.rows || []).map((row) => row.column_name));
+  return {
+    confirmation_code_hash: columns.has("confirmation_code_hash"),
+    confirmation_code_created_at: columns.has("confirmation_code_created_at"),
+  };
+}
+
+async function sendCaptivePreauthWhatsApp({
+  authorization,
+  captive,
+  draw,
+  authorizeUrl,
+  declineUrl,
+  manageUrl,
+  confirmationCode,
+  templateId,
+  templateMode = "params",
+}) {
   const authorizationId = String(authorization.id);
   const userId = Number(authorization.user_id);
   const captiveNumber = Number(authorization.captive_number);
@@ -295,22 +440,37 @@ async function sendCaptivePreauthWhatsApp({ authorization, captive, draw, author
   const drawTitle = String(getDrawTitle(draw) || `Sorteio #${draw.id}`);
   const amount = formatAmountBRL(authorization.amount_cents);
   const number = String(captiveNumber);
-  const params = {
-    customer_name: customerName,
-    draw_title: drawTitle,
-    amount,
-    number,
-    authorize_url: authorizeUrl,
-    decline_url: declineUrl,
-  };
-  const message = buildCaptivePreauthMessage({
-    customerName,
-    drawTitle,
-    amount,
-    number,
-    authorizeUrl,
-    declineUrl,
-  });
+  const staticLinkMode = templateMode === "static_link";
+  const params = staticLinkMode
+    ? undefined
+    : {
+        customer_name: customerName,
+        confirmation_code: confirmationCode || null,
+        draw_title: drawTitle,
+        amount,
+        number,
+        authorize_url: manageUrl,
+        decline_url: manageUrl,
+        manage_url: manageUrl,
+      };
+  const message = staticLinkMode
+    ? null
+    : buildCaptivePreauthMessage({
+        customerName,
+        confirmationCode,
+      });
+
+  if (staticLinkMode) {
+    log("whatsapp_static_link_mode", {
+      draw_id: Number(draw.id),
+      user_id: userId,
+      captive_number: captiveNumber,
+      template_id: String(templateId || ""),
+      static_link_mode: true,
+      params_sent: false,
+      confirmation_url_configured: Boolean(manageUrl),
+    });
+  }
 
   const consent = await assertWhatsAppConsent({
     userId,
@@ -357,8 +517,8 @@ async function sendCaptivePreauthWhatsApp({ authorization, captive, draw, author
     messageSnapshot: {
       template_key: PREAUTH_TEMPLATE_KEY,
       provider_template_id: templateId,
-      params,
-      message,
+      template_mode: templateMode,
+      ...(staticLinkMode ? {} : { params, message }),
     },
     recipientSnapshot: {
       user_id: userId,
@@ -445,8 +605,13 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
   const adminUserId = options.adminUserId != null ? Number(options.adminUserId) : null;
   const draw = await getDraw(drawId);
   const amountCents = await getDrawPriceCents(draw);
-  const captives = await listActiveCaptives();
+  const activeCaptives = await listActiveCaptives();
+  const captives = activeCaptives.rows || [];
+  const skippedNotificationsDisabled = Number(activeCaptives.skippedNotificationsDisabled || 0);
   const whatsappEnabled = isCaptivePreauthWhatsAppEnabled();
+  const templateMode = getCaptivePreauthTemplateMode();
+  const confirmationPublicUrl = resolveCaptiveConfirmationPublicUrl();
+  const authorizationSchema = await getAuthorizationTableSchema();
   const templateConfig = whatsappEnabled
     ? await resolveCaptivePreauthTemplateConfig()
     : { templateId: null, source: "missing", templateKey: PREAUTH_TEMPLATE_KEY };
@@ -456,10 +621,21 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
     draw_id: Number(draw.id),
     admin_user_id: adminUserId,
     active_captives: captives.length,
+    skipped_notifications_disabled: skippedNotificationsDisabled,
     whatsapp_enabled: whatsappEnabled,
+    captive_preauth_template_mode: templateMode,
+    confirmation_url_configured: Boolean(confirmationPublicUrl),
     captive_preauth_template_id: templateId || null,
     captive_preauth_template_source: templateConfig.source,
   });
+
+  if (templateMode === "static_link" && !confirmationPublicUrl) {
+    warn("config_missing", {
+      draw_id: Number(draw.id),
+      admin_user_id: adminUserId,
+      config: "CAPTIVE_CONFIRMATION_PUBLIC_URL",
+    });
+  }
 
   if (!whatsappEnabled) {
     log("whatsapp_disabled", { draw_id: Number(draw.id), admin_user_id: adminUserId });
@@ -469,7 +645,15 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
 
   if (!captives.length) {
     log("no_captives_found", { draw_id: Number(draw.id), admin_user_id: adminUserId });
-    return { ok: true, draw_id: Number(draw.id), created: 0, already_exists: 0, skipped: 0, items: [] };
+    return {
+      ok: true,
+      draw_id: Number(draw.id),
+      created: 0,
+      already_exists: 0,
+      skipped: 0,
+      skipped_notifications_disabled: skippedNotificationsDisabled,
+      items: [],
+    };
   }
 
   let created = 0;
@@ -489,6 +673,27 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
 
     const token = createToken();
     const tokenHash = hashToken(token);
+    const canStoreConfirmationCode =
+      authorizationSchema.confirmation_code_hash && authorizationSchema.confirmation_code_created_at;
+    const confirmationCode = canStoreConfirmationCode ? createConfirmationCode() : null;
+    const confirmationCodeHash = canStoreConfirmationCode ? hashConfirmationCode(confirmationCode) : null;
+    const confirmationColumns = canStoreConfirmationCode
+      ? ", confirmation_code_hash, confirmation_code_created_at"
+      : "";
+    const confirmationValues = canStoreConfirmationCode ? ", $8, now()" : "";
+    const expiresAtParam = canStoreConfirmationCode ? "$9" : "$8";
+    const createdByParam = canStoreConfirmationCode ? "$10" : "$9";
+    const insertParams = [
+      Number(draw.id),
+      userId,
+      captive.autopay_profile_id,
+      captive.autopay_number_id,
+      captiveNumber,
+      amountCents,
+      tokenHash,
+    ];
+    if (canStoreConfirmationCode) insertParams.push(confirmationCodeHash);
+    insertParams.push(expiresAt, adminUserId);
     const insert = await query(
       `INSERT INTO public.autopay_draw_authorizations (
           draw_id,
@@ -498,25 +703,15 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
           captive_number,
           amount_cents,
           status,
-          token_hash,
+          token_hash${confirmationColumns},
           expires_at,
           created_by
         )
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7${confirmationValues}, ${expiresAtParam}, ${createdByParam})
        ON CONFLICT (draw_id, user_id, captive_number) DO NOTHING
        RETURNING id, user_id, captive_number, amount_cents, status, expires_at,
                  notification_dispatch_id, notification_status, notification_error`,
-      [
-        Number(draw.id),
-        userId,
-        captive.autopay_profile_id,
-        captive.autopay_number_id,
-        captiveNumber,
-        amountCents,
-        tokenHash,
-        expiresAt,
-        adminUserId,
-      ]
+      insertParams
     );
 
     if (insert.rowCount) {
@@ -530,6 +725,15 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
       });
       const authorizeUrl = buildAuthorizeUrl(token);
       const declineUrl = buildDeclineUrl(token);
+      const manageUrl = confirmationPublicUrl;
+      if (confirmationCode) {
+        log("confirmation_code_created", {
+          draw_id: Number(draw.id),
+          user_id: Number(row.user_id),
+          captive_number: Number(row.captive_number),
+          code_present: true,
+        });
+      }
       let notification = {
         notification_dispatch_id: row.notification_dispatch_id || null,
         notification_status: row.notification_status || null,
@@ -565,7 +769,10 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
             draw,
             authorizeUrl,
             declineUrl,
+            manageUrl,
+            confirmationCode,
             templateId,
+            templateMode,
           });
         } catch (err) {
           const failureReason = safeError(err?.message || "whatsapp_send_failed");
@@ -645,7 +852,10 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
     created,
     already_exists: alreadyExists,
     skipped,
+    skipped_notifications_disabled: skippedNotificationsDisabled,
     whatsapp_enabled: whatsappEnabled,
+    captive_preauth_template_mode: templateMode,
+    captive_confirmation_public_url_configured: Boolean(confirmationPublicUrl),
     captive_preauth_template_id: templateId || null,
     captive_preauth_template_source: templateConfig.source,
     captive_preauth_template_key: PREAUTH_TEMPLATE_KEY,
@@ -664,6 +874,21 @@ async function getAuthorizationByToken(token) {
     [tokenHash]
   );
   return result.rows?.[0] || null;
+}
+
+async function getAuthorizationByConfirmationCode(code) {
+  const codeHash = hashConfirmationCode(code);
+  if (!codeHash) return { error: "invalid_confirmation_code", row: null };
+  const result = await query(
+    `SELECT *
+       FROM public.autopay_draw_authorizations
+      WHERE confirmation_code_hash = $1`,
+    [codeHash]
+  );
+  if ((result.rows || []).length > 1) {
+    return { error: "duplicate_confirmation_code", row: null };
+  }
+  return { error: null, row: result.rows?.[0] || null };
 }
 
 async function getAuthorizationById(id) {
@@ -703,11 +928,150 @@ async function expireAuthorization(row) {
   return updated.rows?.[0] || { ...row, status: "expired" };
 }
 
-async function applyTokenDecision(token, decision) {
-  const row = await getAuthorizationByToken(token);
+async function publicAuthorization(row) {
+  if (!row) return null;
+  let drawTitle = `Sorteio #${row.draw_id}`;
+  try {
+    const draw = await getDraw(row.draw_id);
+    drawTitle = String(getDrawTitle(draw) || drawTitle);
+  } catch {}
+  return {
+    status: safeStatus(row.status),
+    draw_title: drawTitle,
+    captive_number: Number(row.captive_number),
+    amount: formatAmountBRL(row.amount_cents),
+  };
+}
+
+async function lookupPublicUser({ email, phone }) {
+  const normalizedEmail = normalizeEmail(email);
+  const phoneVariants = phoneLookupVariants(phone);
+  if (!normalizedEmail || !phoneVariants.length) return null;
+
+  const result = await query(
+    `SELECT id
+       FROM public.users
+      WHERE LOWER(TRIM(email)) = $1
+        AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($2::text[])
+      LIMIT 1`,
+    [normalizedEmail, phoneVariants]
+  );
+  return result.rows?.[0] || null;
+}
+
+function logPublicEvent(event, { email, phone, userId = null, found = false, authorizationId = null, status = null, expired = false } = {}) {
+  log(event, {
+    email_present: Boolean(normalizeEmail(email)),
+    phone_present: Boolean(normalizePhoneDigits(phone)),
+    found: Boolean(found),
+    user_id: userId != null ? Number(userId) : null,
+    authorization_id: authorizationId || null,
+    status: status || null,
+    expired: Boolean(expired),
+  });
+}
+
+export async function lookupCaptivePreauthPublic({ email, phone }) {
+  const user = await lookupPublicUser({ email, phone });
+  if (!user) {
+    logPublicEvent("public_lookup", { email, phone, found: false });
+    return { ok: true, items: [] };
+  }
+
+  const result = await query(
+    `SELECT id, draw_id, user_id, captive_number, amount_cents, status, expires_at
+       FROM public.autopay_draw_authorizations
+      WHERE user_id = $1
+        AND status = 'pending'
+        AND expires_at > now()
+      ORDER BY expires_at ASC, created_at ASC`,
+    [user.id]
+  );
+  const rows = result.rows || [];
+  const items = await Promise.all(
+    rows.map(async (row) => ({
+      id: String(row.id),
+      draw_id: Number(row.draw_id),
+      captive_number: Number(row.captive_number),
+      amount: formatAmountBRL(row.amount_cents),
+      status: safeStatus(row.status),
+      expires_at: row.expires_at,
+      draw_title: (await publicAuthorization(row))?.draw_title || `Sorteio #${row.draw_id}`,
+    }))
+  );
+
+  logPublicEvent("public_lookup", {
+    email,
+    phone,
+    userId: user.id,
+    found: items.length > 0,
+    status: items.length ? "pending" : "empty",
+  });
+  return { ok: true, items };
+}
+
+async function getPublicAuthorizationForDecision({ email, phone, authorizationId }) {
+  const user = await lookupPublicUser({ email, phone });
+  if (!user) return { user: null, row: null };
+  const id = String(authorizationId || "").trim();
+  if (!UUID_RE.test(id)) return { user, row: null };
+  const result = await query(
+    `SELECT *
+       FROM public.autopay_draw_authorizations
+      WHERE id = $1
+        AND user_id = $2
+      LIMIT 1`,
+    [id, user.id]
+  );
+  return { user, row: result.rows?.[0] || null };
+}
+
+export async function authorizeCaptivePreauthPublic({ email, phone, authorizationId }) {
+  const { user, row } = await getPublicAuthorizationForDecision({ email, phone, authorizationId });
+  if (!user || !row) {
+    logPublicEvent("public_authorize", { email, phone, found: false, authorizationId });
+    return { ok: false, code: "authorization_not_found", status: "not_found" };
+  }
+  const result = await applyAuthorizationDecision(row, "authorize", "public");
+  logPublicEvent("public_authorize", {
+    email,
+    phone,
+    userId: user.id,
+    found: true,
+    authorizationId,
+    status: result.status,
+    expired: result.status === "expired",
+  });
+  return result;
+}
+
+export async function declineCaptivePreauthPublic({ email, phone, authorizationId }) {
+  const { user, row } = await getPublicAuthorizationForDecision({ email, phone, authorizationId });
+  if (!user || !row) {
+    logPublicEvent("public_decline", { email, phone, found: false, authorizationId });
+    return { ok: false, code: "authorization_not_found", status: "not_found" };
+  }
+  const result = await applyAuthorizationDecision(row, "decline", "public");
+  logPublicEvent("public_decline", {
+    email,
+    phone,
+    userId: user.id,
+    found: true,
+    authorizationId,
+    status: result.status,
+    expired: result.status === "expired",
+  });
+  return result;
+}
+
+async function applyAuthorizationDecision(row, decision, source = "token") {
   if (!row) {
-    warn("token_invalid", { action: decision });
-    return { ok: false, code: "token_invalid", status: "invalid" };
+    const code = source === "confirmation_code" ? "invalid_confirmation_code" : "token_invalid";
+    warn(source === "confirmation_code" ? "confirmation_code_invalid" : "token_invalid", {
+      action: decision,
+      code_present: source === "confirmation_code" ? false : undefined,
+    });
+    return { ok: false, code, status: "invalid" };
   }
 
   const currentStatus = safeStatus(row.status);
@@ -717,7 +1081,7 @@ async function applyTokenDecision(token, decision) {
 
   if (new Date(row.expires_at).getTime() < Date.now()) {
     const expired = await expireAuthorization(row);
-    warn("token_expired", {
+    warn(source === "confirmation_code" ? "confirmation_code_expired" : "token_expired", {
       authorization_id: row.id,
       draw_id: Number(row.draw_id),
       user_id: Number(row.user_id),
@@ -725,7 +1089,7 @@ async function applyTokenDecision(token, decision) {
     });
     return {
       ok: false,
-      code: "token_expired",
+      code: source === "confirmation_code" ? "confirmation_code_expired" : "token_expired",
       status: "expired",
       authorization: expired,
     };
@@ -759,6 +1123,58 @@ async function applyTokenDecision(token, decision) {
   return { ok: true, code: `${nextStatus}_success`, status: nextStatus, authorization: out };
 }
 
+async function applyTokenDecision(token, decision) {
+  const row = await getAuthorizationByToken(token);
+  return applyAuthorizationDecision(row, decision, "token");
+}
+
+export async function lookupCaptivePreauthByCode(code) {
+  const normalized = normalizeConfirmationCode(code);
+  const lookup = await getAuthorizationByConfirmationCode(normalized);
+  if (lookup.error || !lookup.row) {
+    warn("confirmation_code_lookup", {
+      found: false,
+      status: "invalid",
+      expired: false,
+      code_present: Boolean(normalized),
+    });
+    return { ok: false, error: lookup.error || "invalid_confirmation_code" };
+  }
+
+  let row = lookup.row;
+  let expired = safeStatus(row.status) === "expired";
+  if (safeStatus(row.status) === "pending" && new Date(row.expires_at).getTime() < Date.now()) {
+    row = await expireAuthorization(row);
+    expired = true;
+  }
+
+  warn("confirmation_code_lookup", {
+    found: true,
+    status: safeStatus(row.status),
+    expired,
+    code_present: true,
+  });
+  return { ok: true, authorization: await publicAuthorization(row) };
+}
+
+export async function authorizeCaptivePreauthByCode(code) {
+  const normalized = normalizeConfirmationCode(code);
+  const lookup = await getAuthorizationByConfirmationCode(normalized);
+  if (lookup.error || !lookup.row) {
+    return { ok: false, code: lookup.error || "invalid_confirmation_code", status: "invalid" };
+  }
+  return applyAuthorizationDecision(lookup.row, "authorize", "confirmation_code");
+}
+
+export async function declineCaptivePreauthByCode(code) {
+  const normalized = normalizeConfirmationCode(code);
+  const lookup = await getAuthorizationByConfirmationCode(normalized);
+  if (lookup.error || !lookup.row) {
+    return { ok: false, code: lookup.error || "invalid_confirmation_code", status: "invalid" };
+  }
+  return applyAuthorizationDecision(lookup.row, "decline", "confirmation_code");
+}
+
 export function isCaptivePreauthEnabled() {
   return String(process.env.CAPTIVE_PREAUTH_ENABLED || "false").trim().toLowerCase() === "true";
 }
@@ -776,11 +1192,22 @@ export async function declineCaptivePreauthByToken(token) {
 export default {
   createCaptivePreAuthorizationsForDraw,
   createToken,
+  createConfirmationCode,
   hashToken,
+  hashConfirmationCode,
   buildAuthorizeUrl,
   buildDeclineUrl,
+  buildManageUrl,
+  getCaptivePreauthTemplateMode,
+  resolveCaptiveConfirmationPublicUrl,
+  lookupCaptivePreauthByCode,
   authorizeCaptivePreauthByToken,
   declineCaptivePreauthByToken,
+  authorizeCaptivePreauthByCode,
+  declineCaptivePreauthByCode,
+  lookupCaptivePreauthPublic,
+  authorizeCaptivePreauthPublic,
+  declineCaptivePreauthPublic,
   isCaptivePreauthEnabled,
   isCaptivePreauthWhatsAppEnabled,
 };

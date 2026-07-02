@@ -86,7 +86,7 @@ const PORT = process.env.PORT || 4000;
 // Se não setar CORS_ORIGIN, usamos esta allowlist padrão
 const ORIGIN =
   process.env.CORS_ORIGIN ||
-  "http://localhost:3000,https://newstore-frontend-ten.vercel.app,https://newstorerj.com.br,https://www.newstorerj.com.br";
+  "http://localhost:3000,https://newstore-frontend-ten.vercel.app,https://newstorerj.com.br,https://www.newstorerj.com.br,https://sorteionewstore.com.br,https://www.sorteionewstore.com.br";
 
 // ⚠️ CORS_ORIGIN deve conter SOMENTE origens (sem /api, sem paths)
 const ORIGINS = ORIGIN.split(",").map((s) => s.trim()).filter(Boolean);

@@ -331,8 +331,10 @@ export async function sendBrevoWhatsAppTemplate({
     senderNumber,
     contactNumbers: [recipient],
     templateId: Number(templateId),
-    params: params || {},
   };
+  if (params && typeof params === "object" && Object.keys(params).length) {
+    payload.params = params;
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

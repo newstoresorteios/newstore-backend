@@ -146,6 +146,9 @@ router.get("/health", async (_req, res) => {
       testRecipientConfigured: health?.testRecipientConfigured,
       genericTestTemplateEnvConfigured: health?.genericTestTemplateEnvConfigured,
       captiveTemplateEnvConfigured: health?.captiveTemplateEnvConfigured,
+      captivePreauthTemplateMode: health?.captive_preauth_template_mode || null,
+      captiveConfirmationPublicUrlConfigured:
+        health?.captive_confirmation_public_url_configured === true,
       adminTestCustomRecipientsEnabled: health?.adminTestCustomRecipientsEnabled,
       adminTestAllowedRecipientsConfigured:
         health?.adminTestAllowedRecipientsConfigured,
