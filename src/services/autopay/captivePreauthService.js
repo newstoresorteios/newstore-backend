@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { query } from "../../db.js";
 import { getTicketPriceCents as getGlobalTicketPriceCents } from "../config.js";
+import { chargeAuthorizedCaptivePreauth as chargeAuthorizedCaptivePreauthWithAutopay } from "../autopayRunner.js";
 import {
   getWhatsAppProviderReadiness,
   resolveRecipientForCurrentMode,
@@ -15,6 +16,12 @@ const AUTHORIZATION_STATUSES = new Set(["pending", "authorized", "declined", "ex
 const PREAUTH_TEMPLATE_KEY = "CAPTIVE_PREAUTH_REQUEST";
 const CONFIRMATION_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AUTOPAY_BASE_AMOUNT_COLUMNS = [
+  "authorized_amount_cents",
+  "max_authorized_amount_cents",
+  "default_amount_cents",
+  "amount_cents",
+];
 
 function log(event, extra = {}) {
   console.log(`${LOG_PREFIX} ${event}`, extra);
@@ -78,6 +85,27 @@ function toPositiveInt(value) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+function envBool(name, defaultValue = false) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === "") return Boolean(defaultValue);
+  return String(raw).trim().toLowerCase() === "true";
+}
+
+function getCaptivePreauthExpiresHours() {
+  const fromEnv = toPositiveInt(process.env.CAPTIVE_PREAUTH_EXPIRES_HOURS);
+  return fromEnv || 12;
+}
+
+function getDefaultAuthorizedBaseAmountCents() {
+  return toPositiveInt(process.env.CAPTIVE_AUTOPAY_DEFAULT_AMOUNT_CENTS) || 5500;
+}
+
+export function shouldRequireCaptivePreauth({ currentAmountCents, authorizedBaseAmountCents }) {
+  const current = Number(currentAmountCents);
+  const base = Number(authorizedBaseAmountCents);
+  return Number.isFinite(current) && Number.isFinite(base) && current > base;
+}
+
 function safeStatus(status) {
   const s = String(status || "").trim().toLowerCase();
   return AUTHORIZATION_STATUSES.has(s) ? s : "unknown";
@@ -106,7 +134,7 @@ function phoneLookupVariants(value) {
 }
 
 function isCaptivePreauthWhatsAppEnabled() {
-  return String(process.env.CAPTIVE_PREAUTH_WHATSAPP_ENABLED || "false").trim().toLowerCase() === "true";
+  return envBool("CAPTIVE_PREAUTH_WHATSAPP_ENABLED", false);
 }
 
 function buildWhatsAppSkipDiagnostics({ reason, templateId }) {
@@ -207,14 +235,14 @@ async function getDrawPriceCents(draw) {
   const drawId = Number(draw?.id);
   const columns = await query(
     `SELECT column_name
-       FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = 'draws'
-        AND column_name IN ('ticket_price_cents', 'price_cents', 'amount_cents')`
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'draws'
+        AND column_name IN ('ticket_price_cents', 'price_cents', 'quota_price_cents', 'amount_cents')`
   );
   const drawColumns = new Set((columns.rows || []).map((row) => row.column_name));
 
-  for (const columnName of ["ticket_price_cents", "price_cents", "amount_cents"]) {
+  for (const columnName of ["ticket_price_cents", "price_cents", "quota_price_cents", "amount_cents"]) {
     if (drawColumns.has(columnName)) {
       const value = toPositiveInt(draw?.[columnName]);
       if (value) return value;
@@ -268,6 +296,21 @@ async function listActiveCaptives() {
         AND column_name = 'preauth_notifications_enabled'`
   );
   const hasPreauthNotificationsEnabled = Boolean(numberColumns.rows?.length);
+  const amountColumns = await query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'autopay_profiles'
+        AND column_name = ANY($1::text[])`,
+    [AUTOPAY_BASE_AMOUNT_COLUMNS]
+  );
+  const existingAmountColumns = new Set((amountColumns.rows || []).map((row) => row.column_name));
+  const amountExpressions = AUTOPAY_BASE_AMOUNT_COLUMNS
+    .filter((columnName) => existingAmountColumns.has(columnName))
+    .map((columnName) => `ap.${columnName}`);
+  const authorizedBaseAmountExpr = amountExpressions.length
+    ? `COALESCE(${amountExpressions.join(", ")})`
+    : "NULL";
   const preauthNotificationsFilter = hasPreauthNotificationsEnabled
     ? "AND COALESCE(an.preauth_notifications_enabled, true) = true"
     : "";
@@ -292,6 +335,7 @@ async function listActiveCaptives() {
         an.autopay_id AS autopay_profile_id,
         an.n AS captive_number,
         ap.user_id,
+        ${authorizedBaseAmountExpr} AS authorized_base_amount_cents,
         u.name AS user_name,
         u.phone AS user_phone
        FROM public.autopay_numbers an
@@ -659,17 +703,44 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
   let created = 0;
   let alreadyExists = 0;
   let skipped = 0;
+  let skippedAmountNotIncreased = 0;
   const items = [];
-  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + getCaptivePreauthExpiresHours() * 60 * 60 * 1000);
 
   for (const captive of captives) {
     const captiveNumber = Number(captive.captive_number);
     const userId = Number(captive.user_id);
+    const authorizedBaseAmountCents =
+      toPositiveInt(captive.authorized_base_amount_cents) || getDefaultAuthorizedBaseAmountCents();
 
     if (!Number.isInteger(captiveNumber) || !Number.isInteger(userId)) {
       skipped++;
       continue;
     }
+
+    if (!shouldRequireCaptivePreauth({
+      currentAmountCents: amountCents,
+      authorizedBaseAmountCents,
+    })) {
+      skipped++;
+      skippedAmountNotIncreased++;
+      log("skipped_amount_not_increased", {
+        draw_id: Number(draw.id),
+        user_id: userId,
+        captive_number: captiveNumber,
+        current_amount_cents: amountCents,
+        authorized_base_amount_cents: authorizedBaseAmountCents,
+      });
+      continue;
+    }
+
+    log("required_amount_increased", {
+      draw_id: Number(draw.id),
+      user_id: userId,
+      captive_number: captiveNumber,
+      current_amount_cents: amountCents,
+      authorized_base_amount_cents: authorizedBaseAmountCents,
+    });
 
     const token = createToken();
     const tokenHash = hashToken(token);
@@ -853,6 +924,7 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
     already_exists: alreadyExists,
     skipped,
     skipped_notifications_disabled: skippedNotificationsDisabled,
+    skipped_amount_not_increased: skippedAmountNotIncreased,
     whatsapp_enabled: whatsappEnabled,
     captive_preauth_template_mode: templateMode,
     captive_confirmation_public_url_configured: Boolean(confirmationPublicUrl),
@@ -928,6 +1000,25 @@ async function expireAuthorization(row) {
   return updated.rows?.[0] || { ...row, status: "expired" };
 }
 
+export async function expirePendingCaptivePreauths() {
+  const result = await query(
+    `UPDATE public.autopay_draw_authorizations
+        SET status = 'expired',
+            expired_at = COALESCE(expired_at, now()),
+            updated_at = now()
+      WHERE status = 'pending'
+        AND expires_at IS NOT NULL
+        AND expires_at <= now()
+      RETURNING id, draw_id, user_id, captive_number`
+  );
+  const rows = result.rows || [];
+  log("expired_pending_scan", {
+    expired_count: rows.length,
+    draw_ids: [...new Set(rows.map((row) => Number(row.draw_id)).filter(Number.isFinite))],
+  });
+  return { expired_count: rows.length, rows };
+}
+
 async function publicAuthorization(row) {
   if (!row) return null;
   let drawTitle = `Sorteio #${row.draw_id}`;
@@ -972,6 +1063,7 @@ function logPublicEvent(event, { email, phone, userId = null, found = false, aut
 }
 
 export async function lookupCaptivePreauthPublic({ email, phone }) {
+  await expirePendingCaptivePreauths();
   const user = await lookupPublicUser({ email, phone });
   if (!user) {
     logPublicEvent("public_lookup", { email, phone, found: false });
@@ -1011,6 +1103,7 @@ export async function lookupCaptivePreauthPublic({ email, phone }) {
 }
 
 async function getPublicAuthorizationForDecision({ email, phone, authorizationId }) {
+  await expirePendingCaptivePreauths();
   const user = await lookupPublicUser({ email, phone });
   if (!user) return { user: null, row: null };
   const id = String(authorizationId || "").trim();
@@ -1033,6 +1126,28 @@ export async function authorizeCaptivePreauthPublic({ email, phone, authorizatio
     return { ok: false, code: "authorization_not_found", status: "not_found" };
   }
   const result = await applyAuthorizationDecision(row, "authorize", "public");
+  if (
+    result.ok &&
+    result.code === "authorized_success" &&
+    isCaptivePreauthChargeOnAuthorizeEnabled()
+  ) {
+    const chargeResult = await chargeAuthorizedCaptivePreauth(result.authorization.id);
+    const status = chargeResult.status || "failed";
+    logPublicEvent("public_authorize", {
+      email,
+      phone,
+      userId: user.id,
+      found: true,
+      authorizationId,
+      status,
+      expired: status === "expired",
+    });
+    if (!chargeResult.ok) {
+      return { ok: false, code: chargeResult.code || "payment_failed", status, charged: false };
+    }
+    return { ...result, status: "charged", charged: true, charge: chargeResult };
+  }
+
   logPublicEvent("public_authorize", {
     email,
     phone,
@@ -1042,7 +1157,7 @@ export async function authorizeCaptivePreauthPublic({ email, phone, authorizatio
     status: result.status,
     expired: result.status === "expired",
   });
-  return result;
+  return { ...result, charged: false };
 }
 
 export async function declineCaptivePreauthPublic({ email, phone, authorizationId }) {
@@ -1079,7 +1194,7 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
     return alreadyDecidedResponse(row);
   }
 
-  if (new Date(row.expires_at).getTime() < Date.now()) {
+  if (new Date(row.expires_at).getTime() <= Date.now()) {
     const expired = await expireAuthorization(row);
     warn(source === "confirmation_code" ? "confirmation_code_expired" : "token_expired", {
       authorization_id: row.id,
@@ -1176,7 +1291,23 @@ export async function declineCaptivePreauthByCode(code) {
 }
 
 export function isCaptivePreauthEnabled() {
-  return String(process.env.CAPTIVE_PREAUTH_ENABLED || "false").trim().toLowerCase() === "true";
+  return envBool("CAPTIVE_PREAUTH_ENABLED", false);
+}
+
+export function isCaptivePreauthChargeOnAuthorizeEnabled() {
+  return envBool("CAPTIVE_PREAUTH_CHARGE_ON_AUTHORIZE_ENABLED", false);
+}
+
+export async function chargeAuthorizedCaptivePreauth(authorizationId, options = {}) {
+  return chargeAuthorizedCaptivePreauthWithAutopay(authorizationId, options);
+}
+
+export function isCaptivePreauthExpiryScanEnabled() {
+  return envBool("CAPTIVE_PREAUTH_EXPIRY_SCAN_ENABLED", true);
+}
+
+export function getCaptivePreauthExpiryScanIntervalMs() {
+  return toPositiveInt(process.env.CAPTIVE_PREAUTH_EXPIRY_SCAN_INTERVAL_MS) || 300000;
 }
 
 export { isCaptivePreauthWhatsAppEnabled };
@@ -1198,6 +1329,7 @@ export default {
   buildAuthorizeUrl,
   buildDeclineUrl,
   buildManageUrl,
+  shouldRequireCaptivePreauth,
   getCaptivePreauthTemplateMode,
   resolveCaptiveConfirmationPublicUrl,
   lookupCaptivePreauthByCode,
@@ -1208,6 +1340,11 @@ export default {
   lookupCaptivePreauthPublic,
   authorizeCaptivePreauthPublic,
   declineCaptivePreauthPublic,
+  chargeAuthorizedCaptivePreauth,
+  expirePendingCaptivePreauths,
   isCaptivePreauthEnabled,
+  isCaptivePreauthChargeOnAuthorizeEnabled,
   isCaptivePreauthWhatsAppEnabled,
+  isCaptivePreauthExpiryScanEnabled,
+  getCaptivePreauthExpiryScanIntervalMs,
 };

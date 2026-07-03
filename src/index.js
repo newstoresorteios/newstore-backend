@@ -33,6 +33,11 @@ import adminSecondaryDrawsRouter from "./routes/admin_secondary_draws.js";
 import adminCaptivesRouter from "./routes/admin_captives.js";
 import adminCaptivePreauthRouter from "./routes/admin_captive_preauth.js";
 import captivePreauthRouter from "./routes/captive_preauth.js";
+import {
+  expirePendingCaptivePreauths,
+  getCaptivePreauthExpiryScanIntervalMs,
+  isCaptivePreauthExpiryScanEnabled,
+} from "./services/autopay/captivePreauthService.js";
 
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
@@ -82,6 +87,30 @@ try { validateTrayConfigAtStartup(); } catch {}
 try { configureWebPush(); } catch {}
 
 const PORT = process.env.PORT || 4000;
+
+function startCaptivePreauthExpiryScanner() {
+  if (!isCaptivePreauthExpiryScanEnabled()) {
+    console.log("[captive-preauth] expired_pending_scan disabled");
+    return;
+  }
+
+  const intervalMs = getCaptivePreauthExpiryScanIntervalMs();
+  const runScan = async () => {
+    try {
+      await expirePendingCaptivePreauths();
+    } catch (e) {
+      console.warn("[captive-preauth] expired_pending_scan", {
+        expired_count: 0,
+        draw_ids: [],
+        error: e?.code || e?.message || "scan_failed",
+      });
+    }
+  };
+
+  runScan();
+  setInterval(runScan, intervalMs);
+  console.log("[captive-preauth] expired_pending_scan scheduled", { interval_ms: intervalMs });
+}
 
 // Se não setar CORS_ORIGIN, usamos esta allowlist padrão
 const ORIGIN =
@@ -390,6 +419,7 @@ async function bootstrap() {
     const pool = await getPool();
     await pool.query("SELECT 1");
     console.log("[db] warmup ok");
+    startCaptivePreauthExpiryScanner();
 
     app.listen(PORT, () => {
       console.log(`API listening on :${PORT}`);

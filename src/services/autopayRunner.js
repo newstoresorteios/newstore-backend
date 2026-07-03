@@ -15,6 +15,27 @@ const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ?? "");
 const err  = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ?? "");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const AUTOPAY_BASE_AMOUNT_COLUMNS = [
+  "authorized_amount_cents",
+  "max_authorized_amount_cents",
+  "default_amount_cents",
+  "amount_cents",
+];
+
+function toPositiveInt(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function getDefaultAuthorizedBaseAmountCents() {
+  return toPositiveInt(process.env.CAPTIVE_AUTOPAY_DEFAULT_AMOUNT_CENTS) || 5500;
+}
+
+function shouldRequireCaptivePreauth({ currentAmountCents, authorizedBaseAmountCents }) {
+  const current = Number(currentAmountCents);
+  const base = Number(authorizedBaseAmountCents);
+  return Number.isFinite(current) && Number.isFinite(base) && current > base;
+}
 
 /* ------------------------------------------------------- *
  * Autopay Runs (1 linha por attempt_trace_id) — com CASTS explícitos
@@ -202,6 +223,39 @@ async function getTicketPriceCents(client) {
   return 300; // fallback seguro
 }
 
+async function getDrawTicketPriceCents(client, draw_id) {
+  try {
+    const { rows: cols } = await client.query(
+      `select column_name
+         from information_schema.columns
+        where table_schema='public'
+          and table_name='draws'
+          and column_name in ('ticket_price_cents','price_cents','quota_price_cents','amount_cents')`
+    );
+    const columns = (cols || [])
+      .map((row) => row.column_name)
+      .filter((columnName) => ["ticket_price_cents", "price_cents", "quota_price_cents", "amount_cents"].includes(columnName));
+    if (columns.length) {
+      const r = await client.query(
+        `select ${columns.map((columnName) => `"${columnName}"`).join(", ")}
+           from public.draws
+          where id=$1
+          limit 1`,
+        [draw_id]
+      );
+      const row = r.rows?.[0] || {};
+      for (const columnName of ["ticket_price_cents", "price_cents", "quota_price_cents", "amount_cents"]) {
+        if (columns.includes(columnName)) {
+          const value = toPositiveInt(row[columnName]);
+          if (value) return value;
+        }
+      }
+    }
+  } catch {}
+
+  return getTicketPriceCents(client);
+}
+
 async function hasAutopayNumberActiveColumn(client) {
   const { rows } = await client.query(
     `select 1
@@ -224,6 +278,25 @@ async function hasAutopayProfileAuthorizationModeColumn(client) {
       limit 1`
   );
   return rows.length > 0;
+}
+
+async function getAutopayProfileBaseAmountColumns(client) {
+  const { rows } = await client.query(
+    `select column_name
+       from information_schema.columns
+      where table_schema='public'
+        and table_name='autopay_profiles'
+        and column_name = any($1::text[])`,
+    [AUTOPAY_BASE_AMOUNT_COLUMNS]
+  );
+  return new Set((rows || []).map((row) => row.column_name));
+}
+
+function buildAuthorizedBaseAmountSql(existingColumns) {
+  const expressions = AUTOPAY_BASE_AMOUNT_COLUMNS
+    .filter((columnName) => existingColumns.has(columnName))
+    .map((columnName) => `max(ap.${columnName})`);
+  return expressions.length ? `coalesce(${expressions.join(", ")})` : "null";
 }
 
 /* ------------------------------------------------------- *
@@ -519,6 +592,436 @@ async function finalizePaidReservation(client, { draw_id, reservationId, user_id
   }
 }
 
+function isVindiPaymentApproved({ bill, billInfo, chargeId }) {
+  const norm = (value) => String(value || "").toLowerCase();
+  const billStatus = norm(bill?.billStatus || billInfo?.status);
+  const charge0 = billInfo?.charges?.[0] || null;
+  const chargeStatus = norm(bill?.chargeStatus || charge0?.status);
+  const lastTxStatus = norm(bill?.lastTransactionStatus || charge0?.last_transaction?.status);
+  return Boolean(
+    charge0?.paid_at ||
+    billStatus === "paid" ||
+    chargeStatus === "paid" ||
+    lastTxStatus === "success" ||
+    lastTxStatus === "authorized"
+  );
+}
+
+async function loadAuthorizationForCharge(client, authorizationId, lock = false) {
+  const result = await client.query(
+    `SELECT ada.*,
+            ap.id AS profile_id,
+            ap.active AS profile_active,
+            ap.vindi_customer_id,
+            ap.vindi_payment_profile_id
+       FROM public.autopay_draw_authorizations ada
+       LEFT JOIN public.autopay_profiles ap ON ap.id = ada.autopay_profile_id
+      WHERE ada.id = $1
+      ${lock ? "FOR UPDATE OF ada" : ""}
+      LIMIT 1`,
+    [authorizationId]
+  );
+  return result.rows?.[0] || null;
+}
+
+export async function chargeAuthorizedCaptivePreauth(authorizationId, options = {}) {
+  const pool = await getPool();
+  const client = await pool.connect();
+  const runTraceId = crypto.randomUUID();
+  const attemptTraceId = crypto.randomUUID();
+  const id = String(authorizationId || "").trim();
+  const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 5);
+  let reservationId = null;
+  let bill = null;
+  let billId = null;
+  let chargeId = null;
+  let providerRequest = null;
+  const chargeContext = {
+    draw_id: null,
+    user_id: null,
+    captive_number: null,
+    amount_cents: null,
+  };
+
+  try {
+    await client.query("select pg_advisory_lock(hashtext($1))", [`captive-preauth:${id}`]);
+
+    await client.query("BEGIN");
+    const auth = await loadAuthorizationForCharge(client, id, true);
+    if (!auth) {
+      await client.query("COMMIT");
+      return { ok: false, code: "authorization_not_found", status: "not_found" };
+    }
+
+    const status = String(auth.status || "").toLowerCase();
+    if (status === "charged") {
+      await client.query("COMMIT");
+      return { ok: true, code: "already_charged", status: "charged", charged: true, authorization: auth };
+    }
+    if (status !== "authorized") {
+      await client.query("ROLLBACK");
+      return { ok: false, code: `authorization_${status || "invalid"}`, status };
+    }
+
+    const authorizedAt = auth.authorized_at ? new Date(auth.authorized_at).getTime() : null;
+    const expiresAt = auth.expires_at ? new Date(auth.expires_at).getTime() : null;
+    if (expiresAt && (!authorizedAt || authorizedAt > expiresAt) && expiresAt <= Date.now()) {
+      await client.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'expired',
+                expired_at = COALESCE(expired_at, now()),
+                updated_at = now()
+          WHERE id = $1
+            AND status = 'authorized'
+          RETURNING *`,
+        [id]
+      );
+      await client.query("COMMIT");
+      return { ok: false, code: "authorization_expired", status: "expired" };
+    }
+
+    const draw_id = Number(auth.draw_id);
+    const user_id = Number(auth.user_id);
+    const captiveNumber = Number(auth.captive_number);
+    const amount_cents = Number(auth.amount_cents);
+    const autopay_id = auth.autopay_profile_id || auth.profile_id;
+    chargeContext.draw_id = draw_id;
+    chargeContext.user_id = user_id;
+    chargeContext.captive_number = captiveNumber;
+    chargeContext.amount_cents = amount_cents;
+    if (
+      !Number.isInteger(draw_id) ||
+      !Number.isInteger(user_id) ||
+      !Number.isInteger(captiveNumber) ||
+      !Number.isInteger(amount_cents) ||
+      amount_cents <= 0 ||
+      !autopay_id ||
+      !auth.vindi_customer_id ||
+      !auth.vindi_payment_profile_id
+    ) {
+      await client.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'failed',
+                updated_at = now()
+          WHERE id = $1
+            AND status = 'authorized'`,
+        [id]
+      );
+      await client.query("ROLLBACK");
+      err("charge_authorized_failed", {
+        authorization_id: id,
+        draw_id,
+        user_id,
+        captive_number: captiveNumber,
+        amount_cents,
+        status: "failed",
+        error_code: "authorization_charge_not_configured",
+      });
+      return { ok: false, code: "authorization_charge_not_configured", status: "failed" };
+    }
+
+    log("charge_authorized_started", {
+      authorization_id: id,
+      draw_id,
+      user_id,
+      captive_number: captiveNumber,
+      amount_cents,
+      status,
+    });
+
+    await client.query("COMMIT");
+
+    const alreadyOk = await client.query(
+      `select 1
+         from public.autopay_runs
+        where draw_id = $1
+          and user_id = $2
+          and status = 'charged_ok'
+          and provider_request->>'authorization_id' = $3
+        limit 1`,
+      [draw_id, user_id, id]
+    );
+    if (alreadyOk.rowCount) {
+      const updated = await client.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'charged',
+                charged_at = COALESCE(charged_at, now()),
+                updated_at = now()
+          WHERE id = $1
+            AND status IN ('authorized', 'charged')
+          RETURNING *`,
+        [id]
+      );
+      return {
+        ok: true,
+        code: "already_charged",
+        status: "charged",
+        charged: true,
+        authorization: updated.rows?.[0] || auth,
+      };
+    }
+
+    await insertAutopayRunAttempt(client, {
+      run_trace_id: runTraceId,
+      attempt_trace_id: attemptTraceId,
+      autopay_id,
+      user_id,
+      draw_id,
+      tried_numbers: [captiveNumber],
+      reservation_id: null,
+      provider: "vindi",
+      status: "attempt",
+      amount_cents: null,
+    });
+
+    const reserved = await reserveNumbersForProfile(client, {
+      draw_id,
+      user_id,
+      wants: [captiveNumber],
+      ttlMin,
+    });
+    reservationId = reserved.reservationId;
+    const reservedNumbers = reserved.reservedNumbers || [];
+    if (!reservationId || !reservedNumbers.includes(captiveNumber)) {
+      await updateAutopayRunAttempt(client, {
+        attempt_trace_id: attemptTraceId,
+        status: "skipped_no_available",
+        error_message: "number_not_available",
+      });
+      await client.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'failed',
+                updated_at = now()
+          WHERE id = $1
+            AND status = 'authorized'`,
+        [id]
+      );
+      err("charge_authorized_failed", {
+        authorization_id: id,
+        draw_id,
+        user_id,
+        captive_number: captiveNumber,
+        amount_cents,
+        status: "failed",
+        error_code: "number_not_available",
+      });
+      return { ok: false, code: "number_not_available", status: "failed" };
+    }
+
+    await updateAutopayRunAttempt(client, {
+      attempt_trace_id: attemptTraceId,
+      reservation_id: reservationId,
+      status: "reserved",
+      amount_cents,
+    });
+
+    const idempotencyKey = `captive-preauth:${id}`;
+    const amount_reais = Number((amount_cents / 100).toFixed(2));
+    const description = `Autopay preauth draw ${draw_id} - numero ${String(captiveNumber).padStart(2, "0")}`;
+    providerRequest = {
+      endpoint: "/bills",
+      customer_id: Number(auth.vindi_customer_id),
+      payment_profile_id: Number(auth.vindi_payment_profile_id),
+      code: idempotencyKey,
+      amount_cents,
+      amount_reais,
+      quantity: 1,
+      numbers: [captiveNumber],
+      reservation_id: reservationId,
+      autopay_id,
+      user_id,
+      draw_id,
+      authorization_id: id,
+    };
+
+    bill = await createBill({
+      customerId: auth.vindi_customer_id,
+      amount_cents_total: amount_cents,
+      quantity: 1,
+      description,
+      metadata: {
+        user_id,
+        draw_id,
+        numbers: [captiveNumber],
+        autopay_id,
+        reservation_id: reservationId,
+        authorization_id: id,
+        amount_cents,
+        amount_reais,
+      },
+      paymentProfileId: auth.vindi_payment_profile_id,
+      idempotencyKey,
+      traceId: attemptTraceId,
+    });
+
+    billId = bill.billId;
+    chargeId = bill.chargeId;
+    await updateAutopayRunAttempt(client, {
+      attempt_trace_id: attemptTraceId,
+      status: "billed",
+      provider_status: bill.httpStatus ?? null,
+      provider_bill_id: billId,
+      provider_charge_id: chargeId,
+      provider_request: providerRequest,
+      provider_response: bill.raw || null,
+    });
+
+    const norm = (value) => String(value || "").toLowerCase();
+    if (norm(bill.lastTransactionStatus) === "rejected") {
+      throw new Error(`Vindi rejected: ${bill.gatewayMessage || "rejected"}`);
+    }
+    if (!chargeId) {
+      const chargeResult = await chargeBill(billId, { traceId: attemptTraceId });
+      chargeId = chargeResult.chargeId;
+      await updateAutopayRunAttempt(client, {
+        attempt_trace_id: attemptTraceId,
+        status: "charged",
+        provider_status: chargeResult.httpStatus ?? null,
+        provider_charge_id: chargeId,
+        provider_response: chargeResult.raw || null,
+      });
+    }
+
+    await sleep(1000);
+    const billInfo = await getBill(billId);
+    if (!isVindiPaymentApproved({ bill, billInfo, chargeId })) {
+      throw new Error("payment_not_approved");
+    }
+
+    const fin = await finalizePaidReservation(client, {
+      draw_id,
+      reservationId,
+      user_id,
+      numbers: [captiveNumber],
+      amount_cents,
+      provider: "vindi",
+      billId,
+      chargeId,
+      vindiPayload: {
+        create_bill: bill?.raw ?? null,
+        billId: billId != null ? String(billId) : null,
+        chargeId: chargeId != null ? String(chargeId) : null,
+        billStatus: bill?.billStatus ?? null,
+        chargeStatus: bill?.chargeStatus ?? null,
+        lastTransactionStatus: bill?.lastTransactionStatus ?? null,
+        gatewayMessage: bill?.gatewayMessage ?? null,
+        authorization_id: id,
+      },
+    });
+
+    await updateAutopayRunAttempt(client, {
+      attempt_trace_id: attemptTraceId,
+      status: "charged_ok",
+      provider_bill_id: billId,
+      provider_charge_id: chargeId,
+      error_message: null,
+    });
+
+    await creditCouponOnApprovedPayment(fin.paymentId, {
+      channel: "VINDI",
+      source: "reconcile_sync",
+      runTraceId,
+      meta: { pricing_source: "autopay_draw_authorizations.amount_cents", autopay: true, captive_preauth: true },
+      pgClient: client,
+    });
+
+    const updated = await client.query(
+      `UPDATE public.autopay_draw_authorizations
+          SET status = 'charged',
+              charged_at = COALESCE(charged_at, now()),
+              updated_at = now()
+        WHERE id = $1
+          AND status = 'authorized'
+        RETURNING *`,
+      [id]
+    );
+
+    log("charge_authorized_success", {
+      authorization_id: id,
+      draw_id,
+      user_id,
+      captive_number: captiveNumber,
+      amount_cents,
+      status: "charged",
+    });
+    return {
+      ok: true,
+      code: "charged_success",
+      status: "charged",
+      charged: true,
+      payment_id: fin.paymentId,
+      authorization: updated.rows?.[0] || auth,
+    };
+  } catch (e) {
+    const errorCode = e?.code || e?.status || e?.message || "payment_failed";
+    try {
+      if (client) await client.query("ROLLBACK");
+    } catch {}
+
+    if (billId) {
+      try {
+        const billInfo = await getBill(billId);
+        const charge0 = billInfo?.charges?.[0] || null;
+        const effectiveChargeId = chargeId || charge0?.id || null;
+        const paid =
+          !!charge0?.paid_at ||
+          String(charge0?.status || "").toLowerCase() === "paid" ||
+          String(charge0?.last_transaction?.status || "").toLowerCase() === "success" ||
+          String(billInfo?.status || "").toLowerCase() === "paid";
+        if (paid && effectiveChargeId) {
+          await refundCharge(effectiveChargeId, true);
+        } else {
+          await cancelBill(billId, { traceId: attemptTraceId });
+        }
+      } catch {}
+    }
+
+    if (reservationId) {
+      try {
+        await cancelReservation(client, { draw_id: chargeContext.draw_id, reservationId });
+      } catch {}
+    }
+
+    try {
+      await updateAutopayRunAttempt(client, {
+        attempt_trace_id: attemptTraceId,
+        status: "charged_fail",
+        provider_request: providerRequest,
+        provider_response: e?.response || null,
+        error_message: String(errorCode).slice(0, 180),
+      });
+    } catch {}
+
+    try {
+      await client.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'failed',
+                updated_at = now()
+          WHERE id = $1
+            AND status = 'authorized'
+          RETURNING draw_id, user_id, captive_number, amount_cents`,
+        [id]
+      );
+    } catch {}
+
+    err("charge_authorized_failed", {
+      authorization_id: id,
+      draw_id: chargeContext.draw_id,
+      user_id: chargeContext.user_id,
+      captive_number: chargeContext.captive_number,
+      amount_cents: chargeContext.amount_cents,
+      status: "failed",
+      error_code: String(errorCode).slice(0, 80),
+    });
+    return { ok: false, code: "payment_failed", status: "failed", charged: false };
+  } finally {
+    try {
+      await client.query("select pg_advisory_unlock(hashtext($1))", [`captive-preauth:${id}`]);
+    } catch {}
+    client.release();
+  }
+}
+
 /* ------------------------------------------------------- *
  * Autopay para UM sorteio aberto
  * ------------------------------------------------------- */
@@ -570,6 +1073,9 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
 
     const hasNumberActive = await hasAutopayNumberActiveColumn(client);
     const hasAuthorizationMode = await hasAutopayProfileAuthorizationModeColumn(client);
+    const baseAmountColumns = await getAutopayProfileBaseAmountColumns(client);
+    const authorizedBaseAmountSql = buildAuthorizedBaseAmountSql(baseAmountColumns);
+    const price_cents = await getDrawTicketPriceCents(client, draw_id);
 
     // 4) Scan de candidatos (inclui active=false) + números agregados
     // Regras de elegibilidade (em JS):
@@ -582,6 +1088,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
           ap.user_id as user_id,
           ap.active as active,
           ${hasAuthorizationMode ? "coalesce(ap.authorization_mode, false)" : "false"} as authorization_mode,
+          ${authorizedBaseAmountSql} as authorized_base_amount_cents,
           ap.vindi_customer_id,
           ap.vindi_payment_profile_id,
           coalesce(array_agg(an.n order by an.n) filter (where an.n is not null ${hasNumberActive ? "and an.active = true" : ""}), '{}') as numbers
@@ -616,9 +1123,6 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         continue;
       }
 
-      // candidato = tem Vindi configurado
-      candidates.push(p);
-
       if (!p.active) {
         inactive++;
         console.warn(`${LP} skip profile`, {
@@ -635,16 +1139,25 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
       }
 
       if (p.authorization_mode === true) {
-        inactive++;
-        console.warn("[autopay] skipped_authorization_mode", {
-          runTraceId,
-          autopay_id: p.autopay_id,
-          user_id: p.user_id,
-          active: true,
-          preferred,
-          reason: "requires_preauth",
-        });
-        continue;
+        const authorizedBaseAmountCents =
+          toPositiveInt(p.authorized_base_amount_cents) || getDefaultAuthorizedBaseAmountCents();
+        if (shouldRequireCaptivePreauth({
+          currentAmountCents: price_cents,
+          authorizedBaseAmountCents,
+        })) {
+          inactive++;
+          console.warn("[autopay] skipped_authorization_mode", {
+            runTraceId,
+            autopay_id: p.autopay_id,
+            user_id: p.user_id,
+            active: true,
+            preferred,
+            reason: "requires_preauth_amount_increased",
+            current_amount_cents: price_cents,
+            authorized_base_amount_cents: authorizedBaseAmountCents,
+          });
+          continue;
+        }
       }
 
       if (!preferred.length) {
@@ -662,6 +1175,7 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         continue;
       }
 
+      candidates.push(p);
       eligible++;
     }
 
@@ -685,9 +1199,6 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
         numbers: (p.numbers || []).map(Number).filter((n) => n >= 0 && n <= 99),
       }))
       .filter((p) => p.numbers.length > 0);
-
-    // 5) Preço
-    const price_cents = await getTicketPriceCents(client);
 
     const results = [];
     let totalReserved = 0;

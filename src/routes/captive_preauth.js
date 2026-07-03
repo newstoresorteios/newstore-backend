@@ -146,6 +146,16 @@ function jsonForPublicDecision(result) {
   if (result?.code === "authorization_not_found") {
     return { status: 404, body: { ok: false, error: "authorization_not_found" } };
   }
+  if (result?.code === "payment_failed" || result?.status === "failed") {
+    return {
+      status: 402,
+      body: {
+        ok: false,
+        error: "payment_failed",
+        status: "failed",
+      },
+    };
+  }
   if (result?.code === "already_decided") {
     return {
       status: 200,
@@ -158,9 +168,23 @@ function jsonForPublicDecision(result) {
     };
   }
   if (result?.status === "expired") {
-    return { status: 410, body: { ok: true, status: "expired" } };
+    return {
+      status: 410,
+      body: {
+        ok: false,
+        error: "authorization_expired",
+        status: "expired",
+      },
+    };
   }
-  return { status: 200, body: { ok: true, status: result?.status } };
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      status: result?.status,
+      charged: result?.charged === true,
+    },
+  };
 }
 
 async function handleAuthorize(req, res) {
