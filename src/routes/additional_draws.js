@@ -13,6 +13,31 @@ const AUTH_COOKIE_NAMES = [
   "jwt",
 ];
 
+const ERROR_MESSAGES = {
+  unauthorized: "Faca login para reservar numeros.",
+  invalid_draw_id: "Sorteio adicional invalido.",
+  numbers_must_be_array: "Selecione ao menos um numero do sorteio adicional.",
+  invalid_numbers: "Selecao de numeros invalida.",
+  no_numbers: "Selecione ao menos um numero do sorteio adicional.",
+  draw_not_found: "Sorteio adicional nao encontrado.",
+  draw_not_open: "Esse sorteio adicional nao esta mais disponivel.",
+  numbers_not_found: "Numero nao encontrado neste sorteio adicional.",
+  numbers_reserved: "Esse numero ja esta reservado temporariamente.",
+  numbers_unavailable: "Esse numero nao esta mais disponivel.",
+  additional_config_not_found: "Configuracao do sorteio adicional indisponivel.",
+  invalid_ticket_price: "Valor do sorteio adicional indisponivel.",
+  reserve_failed: "Nao foi possivel reservar numeros do adicional.",
+};
+
+function jsonError(res, status, error, extra = {}) {
+  return res.status(status).json({
+    ok: false,
+    error,
+    message: ERROR_MESSAGES[error] || ERROR_MESSAGES.reserve_failed,
+    ...extra,
+  });
+}
+
 function isAdditionalDrawType(value) {
   return value === "adicional" || value === "secundario";
 }
@@ -219,11 +244,11 @@ router.get("/:id/numbers", async (req, res) => {
 router.post("/:id/reserve", requireAdditionalReserveCredential, requireAuth, async (req, res) => {
   const drawId = Number(req.params.id);
   if (!Number.isInteger(drawId) || drawId <= 0) {
-    return res.status(400).json({ error: "invalid_draw_id" });
+    return jsonError(res, 400, "invalid_draw_id");
   }
 
   const normalized = normalizeNumbers(req.body?.numbers);
-  if (normalized.error) return res.status(400).json({ error: normalized.error });
+  if (normalized.error) return jsonError(res, 400, normalized.error);
 
   const nums = normalized.numbers;
   const pool = await getPool();
@@ -244,11 +269,11 @@ router.post("/:id/reserve", requireAdditionalReserveCredential, requireAuth, asy
     const draw = drawRes.rows[0];
     if (!draw) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "draw_not_found" });
+      return jsonError(res, 404, "draw_not_found");
     }
     if (draw.status !== "open") {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "draw_not_open" });
+      return jsonError(res, 400, "draw_not_open");
     }
 
     const locked = await client.query(
@@ -264,15 +289,22 @@ router.post("/:id/reserve", requireAdditionalReserveCredential, requireAuth, asy
     const notFound = nums.filter((n) => !found.has(n));
     if (notFound.length) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "numbers_not_found", numbers: notFound });
+      return jsonError(res, 400, "numbers_not_found", { numbers: notFound });
     }
 
     const conflicts = locked.rows
       .filter((row) => String(row.status).toLowerCase() !== "available")
-      .map((row) => Number(row.n));
+      .map((row) => ({
+        n: Number(row.n),
+        status: String(row.status || "").toLowerCase(),
+      }));
     if (conflicts.length) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ error: "numbers_unavailable", conflicts });
+      const hasReserved = conflicts.some((item) => item.status === "reserved");
+      const error = hasReserved ? "numbers_reserved" : "numbers_unavailable";
+      return jsonError(res, 409, error, {
+        conflicts: conflicts.map((item) => item.n),
+      });
     }
 
     const reservationId = uuid();
@@ -301,13 +333,13 @@ router.post("/:id/reserve", requireAdditionalReserveCredential, requireAuth, asy
     );
     if (!config.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "additional_config_not_found" });
+      return jsonError(res, 404, "additional_config_not_found");
     }
 
     const priceCents = Number(config.rows[0]?.ticket_price_cents);
     if (!Number.isInteger(priceCents) || priceCents <= 0) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "invalid_ticket_price" });
+      return jsonError(res, 400, "invalid_ticket_price");
     }
 
     await client.query("COMMIT");
@@ -322,7 +354,7 @@ router.post("/:id/reserve", requireAdditionalReserveCredential, requireAuth, asy
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[additional_draws/reserve] error:", e?.code || e?.message || e);
-    return res.status(500).json({ error: "reserve_failed" });
+    return jsonError(res, 500, "reserve_failed");
   } finally {
     client.release();
   }
