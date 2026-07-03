@@ -6,9 +6,44 @@ import { requireAuth } from "../middleware/auth.js";
 const router = Router();
 
 const RESERVATION_TTL_MIN = Math.max(1, Number(process.env.RESERVATION_TTL_MIN || 30));
+const AUTH_COOKIE_NAMES = [
+  process.env.AUTH_COOKIE_NAME || "ns_auth",
+  "ns_auth_token",
+  "token",
+  "jwt",
+];
 
 function isAdditionalDrawType(value) {
   return value === "adicional" || value === "secundario";
+}
+
+function sanitizeToken(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^Bearer\s+/i, "")
+    .replace(/^['"]|['"]$/g, "");
+}
+
+function hasAdditionalReserveCredential(req) {
+  const authorization = sanitizeToken(req.headers?.authorization);
+  if (authorization) return true;
+  const cookies = req.cookies || {};
+  for (const name of AUTH_COOKIE_NAMES) {
+    const token = sanitizeToken(cookies[name]);
+    if (token) return true;
+  }
+  return false;
+}
+
+function requireAdditionalReserveCredential(req, res, next) {
+  if (!hasAdditionalReserveCredential(req)) {
+    return res.status(401).json({
+      ok: false,
+      error: "unauthorized",
+      message: "Faça login para reservar números.",
+    });
+  }
+  return next();
 }
 
 function normalizeNewDrawType(value) {
@@ -181,7 +216,7 @@ router.get("/:id/numbers", async (req, res) => {
   }
 });
 
-router.post("/:id/reserve", requireAuth, async (req, res) => {
+router.post("/:id/reserve", requireAdditionalReserveCredential, requireAuth, async (req, res) => {
   const drawId = Number(req.params.id);
   if (!Number.isInteger(drawId) || drawId <= 0) {
     return res.status(400).json({ error: "invalid_draw_id" });
