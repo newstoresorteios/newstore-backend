@@ -6,6 +6,8 @@ import { expireDrawReservations, isAdditionalDrawType } from "./additional_draws
 
 const router = Router();
 const ACTIVE_RESERVATION_STATUSES = new Set(["active", "reserved", "pending"]);
+const PAID_PAYMENT_STATUSES = new Set(["approved", "paid", "pago"]);
+const FAILED_PAYMENT_STATUSES = new Set(["failed", "rejected", "cancelled", "canceled", "expired"]);
 
 function amountFromCents(cents) {
   return Number((Math.max(0, Number(cents || 0)) / 100).toFixed(2));
@@ -36,6 +38,65 @@ function safeMpErrorMessage(err) {
   ).slice(0, 240);
 }
 
+function normalizePaymentStatus(status) {
+  const normalized = String(status || "pending").toLowerCase();
+  if (PAID_PAYMENT_STATUSES.has(normalized)) return "approved";
+  if (FAILED_PAYMENT_STATUSES.has(normalized)) return normalized === "expired" ? "expired" : "failed";
+  return "pending";
+}
+
+router.get("/:paymentId/status", requireAuth, async (req, res) => {
+  const paymentId = String(req.params.paymentId || "").trim();
+  if (!paymentId) return res.status(400).json({ error: "missing_payment_id" });
+
+  try {
+    const pool = await getPool();
+    const result = await pool.query(
+      `SELECT p.id,
+              p.user_id,
+              p.draw_id,
+              p.status,
+              r.id AS reservation_id,
+              d.draw_type
+         FROM public.payments p
+         JOIN public.draws d ON d.id = p.draw_id
+    LEFT JOIN public.reservations r ON r.payment_id = p.id
+        WHERE p.id = $1
+        LIMIT 1`,
+      [paymentId]
+    );
+
+    const payment = result.rows[0];
+    if (!payment) return res.status(404).json({ error: "payment_not_found" });
+
+    if (Number(payment.user_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: "payment_not_owned" });
+    }
+
+    if (!isAdditionalDrawType(payment.draw_type)) {
+      return res.status(400).json({ error: "draw_not_additional" });
+    }
+
+    const rawStatus = String(payment.status || "").toLowerCase();
+    const status = normalizePaymentStatus(rawStatus);
+    return res.json({
+      ok: true,
+      payment_id: String(payment.id),
+      status,
+      paid: PAID_PAYMENT_STATUSES.has(rawStatus) || status === "approved",
+      draw_id: Number(payment.draw_id),
+      reservation_id: payment.reservation_id || null,
+    });
+  } catch (e) {
+    console.error("[additional_payments/status] error:", {
+      code: e?.code,
+      message: e?.message,
+      table: e?.table,
+      column: e?.column,
+    });
+    return res.status(500).json({ error: "additional_status_failed" });
+  }
+});
 router.post("/pix", requireAuth, async (req, res) => {
   const reservationId = req.body?.reservation_id ?? req.body?.reservationId ?? req.body?.id;
   if (!reservationId) return res.status(400).json({ error: "missing_reservation_id" });
