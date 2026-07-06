@@ -51,11 +51,11 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
 
     // sorteio aberto mais recente
     const d = await query(
-      `SELECT id, opened_at
+      `SELECT id, status, draw_type, opened_at, closed_at, realized_at
          FROM draws
-        WHERE status = 'open'
-          AND COALESCE(draw_type, 'principal') = 'principal'
-        ORDER BY opened_at DESC NULLS LAST,
+        WHERE COALESCE(draw_type, 'principal') = 'principal'
+        ORDER BY CASE WHEN status = 'open' THEN 0 WHEN status = 'closed' THEN 1 ELSE 2 END,
+                 opened_at DESC NULLS LAST,
                  created_at DESC NULLS LAST,
                  id DESC
         LIMIT 1`
@@ -67,6 +67,10 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
     if (!current?.id) {
       return res.json({
         draw_id: null,
+        status: null,
+        draw_type: null,
+        closed_at: null,
+        realized_at: null,
         total: 0,
         sold: 0,
         remaining: 0,
@@ -117,6 +121,10 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
 
     return res.json({
       draw_id: current.id,
+      status: current.status,
+      draw_type: current.draw_type || "principal",
+      closed_at: current.closed_at || null,
+      realized_at: current.realized_at || null,
       total,
       sold,
       remaining,
@@ -185,6 +193,48 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   } catch (e) {
     console.error("[admin/dashboard] /new error:", e);
     return res.status(500).json({ error: "new_draw_failed" });
+  }
+});
+
+/**
+ * POST /api/admin/dashboard/draws/:drawId/close
+ * Fecha manualmente sorteio principal legado sem alterar resultado ou numeros.
+ */
+router.post("/draws/:drawId/close", requireAuth, requireAdmin, async (req, res) => {
+  const drawId = Number(req.params.drawId);
+  if (!Number.isInteger(drawId) || drawId <= 0) {
+    return res.status(400).json({ error: "invalid_draw_id" });
+  }
+
+  try {
+    const current = await query(
+      `SELECT id, status, draw_type, closed_at, realized_at, winner_number, winner_user_id, winner_name
+         FROM public.draws
+        WHERE id = $1
+          AND COALESCE(draw_type, 'principal') = 'principal'`,
+      [drawId]
+    );
+
+    if (!current.rowCount) return res.status(404).json({ error: "draw_not_found" });
+    if (current.rows[0].status !== "open") {
+      return res.status(409).json({ error: "draw_not_open", draw: current.rows[0] });
+    }
+
+    const updated = await query(
+      `UPDATE public.draws
+          SET status = 'closed',
+              closed_at = COALESCE(closed_at, NOW())
+        WHERE id = $1
+          AND status = 'open'
+          AND COALESCE(draw_type, 'principal') = 'principal'
+        RETURNING id, status, draw_type, closed_at, realized_at, winner_number, winner_user_id, winner_name`,
+      [drawId]
+    );
+
+    return res.json({ ok: true, draw: updated.rows[0] });
+  } catch (e) {
+    console.error("[admin/dashboard] /draws/:drawId/close error:", e);
+    return res.status(500).json({ error: "close_draw_failed" });
   }
 });
 

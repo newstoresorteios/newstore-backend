@@ -5,6 +5,7 @@ import express from "express";
 import { query, getPool } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
+import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
 
 const router = express.Router();
 
@@ -532,6 +533,8 @@ router.post("/:id/assign-numbers", async (req, res, next) => {
         throw new Error(`admin_assign_coupon_credit_failed:${creditRes?.action || "unknown"}`);
       }
     }
+
+    await closeDrawIfSoldOut(draw_id, client);
 
     await client.query("COMMIT");
     res.status(201).json({

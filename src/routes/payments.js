@@ -6,6 +6,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { getTicketPriceCents } from '../services/config.js';
 import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
+import { closeDrawIfSoldOut } from '../services/drawLifecycle.js';
 
 const router = Router();
 
@@ -38,83 +39,8 @@ function isDebugMpEnabled() {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/**
- * Fecha o draw se tiver 100 vendidos e cria um novo se não existir outro 'open'.
- * Tudo dentro de TRANSAÇÃO + ADVISORY LOCK para evitar condições de corrida.
- */
 async function finalizeDrawIfComplete(drawId) {
-  // Inicia transação e trava seção crítica
-  await query('BEGIN');
-  try {
-    // trava global simples (escopo transação)
-    await query('SELECT pg_advisory_xact_lock(911001)');
-
-    // Trava a linha do draw e revalida status
-    const cur = await query(
-      `SELECT id, status, closed_at
-         FROM draws
-        WHERE id = $1
-        FOR UPDATE`,
-      [drawId]
-    );
-
-    if (!cur.rows.length) {
-      await query('ROLLBACK');
-      return;
-    }
-
-    // Reconta vendidos sob a mesma transação
-    const cnt = await query(
-      `SELECT COUNT(*)::int AS sold
-         FROM numbers
-        WHERE draw_id = $1 AND status = 'sold'`,
-      [drawId]
-    );
-    const sold = cnt.rows[0]?.sold || 0;
-
-    if (sold === 100) {
-      // Fecha (idempotente)
-      await query(
-        `UPDATE draws
-            SET status = 'closed',
-                closed_at = COALESCE(closed_at, NOW())
-          WHERE id = $1`,
-        [drawId]
-      );
-
-      // Abre novo SOMENTE se não existir outro aberto
-      const ins = await query(
-        `WITH chk AS (
-           SELECT 1
-             FROM draws
-            WHERE status = 'open'
-              AND COALESCE(draw_type, 'principal') = 'principal'
-            LIMIT 1
-         )
-         INSERT INTO draws (status, draw_type)
-         SELECT 'open', 'principal'
-         WHERE NOT EXISTS (SELECT 1 FROM chk)
-         RETURNING id`
-      );
-
-      const newId = ins.rows[0]?.id;
-      if (newId) {
-        // Popula 0..99
-        await query(
-          `INSERT INTO numbers (draw_id, n, status)
-           SELECT $1, gs, 'available'
-             FROM generate_series(0, 99) AS gs`,
-          [newId]
-        );
-      }
-    }
-
-    await query('COMMIT');
-  } catch (e) {
-    try { await query('ROLLBACK'); } catch {}
-    // Loga e segue; idempotência garante consistência em nova tentativa
-    console.error('[finalizeDrawIfComplete] error:', e);
-  }
+  return closeDrawIfSoldOut(drawId);
 }
 
 /**
@@ -140,6 +66,8 @@ async function settleApprovedPayment(id, drawId, numbers) {
         AND draw_id = $2`,
     [id, drawId]
   );
+
+  await closeDrawIfSoldOut(drawId);
 }
 
 /**

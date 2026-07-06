@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { getPool, query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
+import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
 
 const router = Router();
 const VALID_STATUSES = new Set(["draft", "open", "closed", "cancelled"]);
@@ -467,6 +468,8 @@ router.post("/:id/assign-numbers", async (req, res) => {
         RETURNING n, status, reservation_id`,
       [drawId, nums]
     );
+
+    await closeDrawIfSoldOut(drawId, client);
 
     await client.query("COMMIT");
 

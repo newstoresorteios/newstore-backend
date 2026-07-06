@@ -4,6 +4,7 @@ import { getPool } from "../db.js";
 // import { mpChargeCard } from "./mercadopago.js";
 import { createBill, chargeBill, refundCharge, getBill, cancelBill } from "./vindi.js";
 import { creditCouponOnApprovedPayment } from "./couponBalance.js";
+import { closeDrawIfSoldOut } from "./drawLifecycle.js";
 import crypto from "node:crypto";
 
 /* ------------------------------------------------------- *
@@ -581,6 +582,8 @@ async function finalizePaidReservation(client, { draw_id, reservationId, user_id
     if (upd.rowCount !== numbers.length) {
       throw new Error(`numbers_update_mismatch expected=${numbers.length} updated=${upd.rowCount}`);
     }
+
+    await closeDrawIfSoldOut(draw_id, client);
 
     await client.query("COMMIT");
     return { paymentId };
