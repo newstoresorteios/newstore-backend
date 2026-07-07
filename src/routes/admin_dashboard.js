@@ -49,14 +49,12 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
   try {
     console.log("[admin/dashboard] GET /summary");
 
-    // sorteio aberto mais recente
+    // principal aberto; se nao houver, ultimo principal como historico
     const d = await query(
       `SELECT id, status, draw_type, opened_at, closed_at, realized_at
          FROM draws
         WHERE COALESCE(draw_type, 'principal') = 'principal'
-        ORDER BY CASE WHEN status = 'open' THEN 0 WHEN status = 'closed' THEN 1 ELSE 2 END,
-                 opened_at DESC NULLS LAST,
-                 created_at DESC NULLS LAST,
+        ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END,
                  id DESC
         LIMIT 1`
     );
