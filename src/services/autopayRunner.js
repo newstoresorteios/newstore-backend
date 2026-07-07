@@ -627,6 +627,22 @@ async function loadAuthorizationForCharge(client, authorizationId, lock = false)
   return result.rows?.[0] || null;
 }
 
+async function markCaptivePreauthFailedOutsideTransaction(pool, authorizationId) {
+  const id = String(authorizationId || "").trim();
+  if (!id) return null;
+
+  const updated = await pool.query(
+    `UPDATE public.autopay_draw_authorizations
+        SET status = 'failed',
+            updated_at = now()
+      WHERE id = $1
+        AND status = 'authorized'
+      RETURNING *`,
+    [id]
+  );
+  return updated.rows?.[0] || null;
+}
+
 export async function chargeAuthorizedCaptivePreauth(authorizationId, options = {}) {
   const pool = await getPool();
   const client = await pool.connect();
@@ -702,15 +718,8 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
       !auth.vindi_customer_id ||
       !auth.vindi_payment_profile_id
     ) {
-      await client.query(
-        `UPDATE public.autopay_draw_authorizations
-            SET status = 'failed',
-                updated_at = now()
-          WHERE id = $1
-            AND status = 'authorized'`,
-        [id]
-      );
       await client.query("ROLLBACK");
+      await markCaptivePreauthFailedOutsideTransaction(pool, id);
       err("charge_authorized_failed", {
         authorization_id: id,
         draw_id,
@@ -791,14 +800,7 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
         status: "skipped_no_available",
         error_message: "number_not_available",
       });
-      await client.query(
-        `UPDATE public.autopay_draw_authorizations
-            SET status = 'failed',
-                updated_at = now()
-          WHERE id = $1
-            AND status = 'authorized'`,
-        [id]
-      );
+      await markCaptivePreauthFailedOutsideTransaction(pool, id);
       err("charge_authorized_failed", {
         authorization_id: id,
         draw_id,
@@ -996,15 +998,7 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
     } catch {}
 
     try {
-      await client.query(
-        `UPDATE public.autopay_draw_authorizations
-            SET status = 'failed',
-                updated_at = now()
-          WHERE id = $1
-            AND status = 'authorized'
-          RETURNING draw_id, user_id, captive_number, amount_cents`,
-        [id]
-      );
+      await markCaptivePreauthFailedOutsideTransaction(pool, id);
     } catch {}
 
     err("charge_authorized_failed", {
