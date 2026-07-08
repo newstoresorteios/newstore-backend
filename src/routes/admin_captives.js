@@ -17,6 +17,29 @@ const ALLOWED_STATUS = new Set([
 
 const CARD_READY_SQL = "(ap.vindi_customer_id IS NOT NULL AND ap.vindi_payment_profile_id IS NOT NULL)";
 
+function getDefaultAmountCents() {
+  const n = Number(process.env.CAPTIVE_AUTOPAY_DEFAULT_AMOUNT_CENTS);
+  return Number.isInteger(n) && n > 0 ? n : 5500;
+}
+
+function formatAmountLabel(amountCents) {
+  const value = Number(amountCents || 0) / 100;
+  return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+function buildPolicy() {
+  const defaultAmountCents = getDefaultAmountCents();
+  const defaultAmountLabel = formatAmountLabel(defaultAmountCents);
+  return {
+    default_amount_cents: defaultAmountCents,
+    default_amount_label: defaultAmountLabel,
+    variable_pricing_requires_preauth: true,
+    automatic_label: `Automático até ${defaultAmountLabel}`,
+    preauth_label: "Sempre pedir autorização",
+    variable_price_rule_label: `Acima de ${defaultAmountLabel}, a pré-autorização é obrigatória para todos.`,
+  };
+}
+
 function toPositiveInt(value, fallback, max) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
@@ -49,7 +72,7 @@ function mapLastRunStatus(status) {
   return s;
 }
 
-function mapRow(row) {
+function mapRow(row, policy = buildPolicy()) {
   const profileActive = row.profile_active === true;
   const numberActive = row.number_active !== false;
   const preauthNotificationsEnabled = row.preauth_notifications_enabled !== false;
@@ -67,7 +90,8 @@ function mapRow(row) {
     number_active: numberActive,
     authorization_mode: row.authorization_mode === true,
     requires_preauth: row.authorization_mode === true,
-    authorization_mode_label: row.authorization_mode === true ? "Pré-autorização" : "Automático",
+    authorization_mode_label: row.authorization_mode === true ? policy.preauth_label : policy.automatic_label,
+    variable_price_rule_label: policy.variable_price_rule_label,
     preauth_notifications_enabled: preauthNotificationsEnabled,
     preauth_notifications_label: preauthNotificationsEnabled ? "Ativas" : "Pausadas",
     autopay_profile_id: String(row.autopay_profile_id),
@@ -219,6 +243,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       : "todos";
     const schema = await getAdminCaptivesSchema();
     const { numberColumns } = schema;
+    const policy = buildPolicy();
 
     const where = [];
     const params = [];
@@ -272,7 +297,8 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       page,
       pageSize,
       total,
-      items: (listResult.rows || []).map(mapRow),
+      policy,
+      items: (listResult.rows || []).map((row) => mapRow(row, policy)),
     });
   } catch (error) {
     console.error(`${LOG_PREFIX} list_failed`, {
