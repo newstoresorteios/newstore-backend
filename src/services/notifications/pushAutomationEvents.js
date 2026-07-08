@@ -4,6 +4,7 @@ import {
   getAllowedPushRuleEvents,
 } from "./pushRules.js";
 import { sendPushToSubscriptionRow } from "./pushNotifications.js";
+import { handleWhatsAppAutomationEvent } from "./whatsappAutomationEvents.js";
 
 const MAX_METADATA_BYTES = 4096;
 const MAX_RECIPIENT_USER_IDS = 500;
@@ -12,6 +13,7 @@ const SENSITIVE_KEY_RE = /(password|secret|token|authorization|cookie|endpoint|p
 const PUBLIC_EVENT_KEYS = new Set([
   "NEW_DRAW_PUBLISHED",
   "DRAW_REMAINING_NUMBERS_75",
+  "DRAW_REMAINING_NUMBERS_50",
   "DRAW_REMAINING_NUMBERS_20",
   "DRAW_REMAINING_NUMBERS_10",
   "WINNER_DEFINED",
@@ -19,6 +21,7 @@ const PUBLIC_EVENT_KEYS = new Set([
 
 const USER_EVENT_KEYS = new Set([
   "BALANCE_EXPIRING_30_DAYS",
+  "BALANCE_EXPIRING_15_DAYS",
   "BALANCE_EXPIRING_10_DAYS",
   "BALANCE_EXPIRING_7_DAYS",
   "BALANCE_EXPIRED",
@@ -451,6 +454,7 @@ export async function handlePushAutomationEvent({
     : null;
   const engineSource = isEngineSource(safeSource);
   let ledgerClaim = null;
+  let whatsappResult = null;
 
   async function ensureLedgerClaim() {
     if (ledgerClaim) return ledgerClaim;
@@ -479,8 +483,9 @@ export async function handlePushAutomationEvent({
   }
 
   async function finishWithLedger(result, category = "operational") {
-    await finishAutomationEventLedger(ledgerClaim, result, { category, dryRun });
-    return result;
+    const finalResult = whatsappResult ? { ...result, whatsapp: whatsappResult } : result;
+    await finishAutomationEventLedger(ledgerClaim, finalResult, { category, dryRun });
+    return finalResult;
   }
 
   if (engineSource) {
@@ -541,6 +546,31 @@ export async function handlePushAutomationEvent({
 
   const deduped = await getDedupedResultIfNeeded();
   if (deduped) return deduped;
+
+  try {
+    whatsappResult = await handleWhatsAppAutomationEvent({
+      eventKey: key,
+      source: safeSource,
+      referenceType: safeReferenceType,
+      referenceKey: safeReferenceKey,
+      metadata: safeMetadata,
+      recipientUserIds: safeRecipientUserIds,
+      dryRun,
+    });
+  } catch (error) {
+    console.warn("[push-internal] whatsapp automation failed", {
+      event_key: key,
+      reference_key: safeReferenceKey,
+      code: error?.code || null,
+      message: error?.message || null,
+    });
+    whatsappResult = {
+      ok: false,
+      event_key: key,
+      status: "failed",
+      reason: error?.code || error?.message || "whatsapp_automation_failed",
+    };
+  }
 
   const rule = await getActivePushRuleByEventKey(key);
 

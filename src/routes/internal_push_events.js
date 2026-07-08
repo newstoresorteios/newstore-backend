@@ -77,6 +77,7 @@ router.post("/events", async (req, res) => {
       failed: result.failed,
       reference_key: result.reference_key,
       reason: result.reason,
+      whatsapp: result.whatsapp || null,
     });
   } catch (error) {
     const code = error?.code || "push_engine_event_failed";
