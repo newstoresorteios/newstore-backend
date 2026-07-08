@@ -3,6 +3,11 @@ import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { runAutopayForDraw } from "../services/autopayRunner.js";
+import {
+  createCaptivePreAuthorizationsForDraw,
+  isCaptivePreauthEnabled,
+  resolveCaptivePreauthDrawRequirement,
+} from "../services/autopay/captivePreauthService.js";
 import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
 
 const router = Router();
@@ -28,6 +33,48 @@ async function emitAdminNewDrawPublished(drawId) {
       code: error?.code || null,
       message: error?.message || null,
     });
+  }
+}
+
+async function ensureNumbersForDraw(drawId) {
+  await query(
+    `insert into public.numbers(draw_id, n, status, reservation_id)
+     select $1, gs::int2, 'available', null
+       from generate_series(0,99) as gs
+      where not exists (
+        select 1 from public.numbers n where n.draw_id=$1 and n.n = gs::int2
+      )`,
+    [drawId]
+  );
+}
+
+async function createCaptivePreauthIfEnabled(drawId, adminUserId, context) {
+  if (!isCaptivePreauthEnabled()) {
+    return { ok: true, skipped: true, reason: "captive_preauth_disabled" };
+  }
+  try {
+    const requirement = await resolveCaptivePreauthDrawRequirement(drawId);
+    if (!requirement.required) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "amount_not_above_default",
+        ...requirement,
+      };
+    }
+    return await createCaptivePreAuthorizationsForDraw(drawId, { adminUserId });
+  } catch (error) {
+    console.error(`[${context}] captive preauth failed`, {
+      draw_id: drawId,
+      admin_user_id: adminUserId || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return {
+      ok: false,
+      error: error?.message || "captive_preauth_create_failed",
+      code: error?.code || null,
+    };
   }
 }
 
@@ -67,19 +114,25 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
 
     // Garante tabela numbers 00..99 (runner também garante, mas aqui evita corrida inicial)
     try {
-      await query(
-        `insert into public.numbers(draw_id, n, status, reservation_id)
-         select $1, gs::int2, 'available', null
-           from generate_series(0,99) as gs
-          where not exists (
-            select 1 from public.numbers n where n.draw_id=$1 and n.n = gs::int2
-          )`,
-        [draw.id]
-      );
+      await ensureNumbersForDraw(draw.id);
     } catch (e) {
       console.warn("[admin/draws/new] falha ao garantir numbers 00..99 (seguindo mesmo assim)", {
         draw_id: draw.id,
         msg: e?.message || e,
+      });
+    }
+
+    const captivePreauth = await createCaptivePreauthIfEnabled(
+      draw.id,
+      req.user?.id ?? null,
+      "admin/draws/new"
+    );
+    if (!captivePreauth?.ok) {
+      return res.status(500).json({
+        error: "captive_preauth_create_failed",
+        draw_id: draw.id,
+        draw,
+        captive_preauth: captivePreauth,
       });
     }
 
@@ -89,11 +142,12 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
         error: "autopay_run_failed",
         draw_id: draw.id,
         draw,
+        captive_preauth: captivePreauth,
         autopay: result || null,
       });
     }
     await emitAdminNewDrawPublished(draw.id);
-    return res.json({ ok: true, draw_id: draw.id, draw, autopay: result });
+    return res.json({ ok: true, draw_id: draw.id, draw, captive_preauth: captivePreauth, autopay: result });
   } catch (e) {
     console.error("[admin/draws/new] error", e);
     return res.status(500).json({ error: "create_failed" });
@@ -217,15 +271,36 @@ router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
       [drawId]
     );
     if (!up.rowCount) return res.status(404).json({ error: "draw_not_found" });
+    try {
+      await ensureNumbersForDraw(drawId);
+    } catch (e) {
+      console.warn("[admin/draws/:id/open] falha ao garantir numbers 00..99 (seguindo mesmo assim)", {
+        draw_id: drawId,
+        msg: e?.message || e,
+      });
+    }
   } catch (e) {
     console.error("[admin/draws/:id/open] error", e);
     return res.status(500).json({ error: "open_failed" });
   }
 
+  const captivePreauth = await createCaptivePreauthIfEnabled(
+    drawId,
+    req.user?.id ?? null,
+    "admin/draws/:id/open"
+  );
+  if (!captivePreauth?.ok) {
+    return res.status(500).json({
+      error: "captive_preauth_create_failed",
+      draw_id: drawId,
+      captive_preauth: captivePreauth,
+    });
+  }
+
   const result = await runAutopayForDraw(drawId);
-  if (!result?.ok) return res.status(500).json(result);
+  if (!result?.ok) return res.status(500).json({ ...result, captive_preauth: captivePreauth });
   await emitAdminNewDrawPublished(drawId);
-  return res.json(result);
+  return res.json({ ...result, captive_preauth: captivePreauth });
 });
 
 /* ------------------------------------------------------------------ *

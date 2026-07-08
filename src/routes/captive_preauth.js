@@ -2,12 +2,11 @@ import { Router } from "express";
 import {
   authorizeCaptivePreauthByCode,
   authorizeCaptivePreauthPublic,
-  authorizeCaptivePreauthByToken,
   declineCaptivePreauthByCode,
   declineCaptivePreauthPublic,
-  declineCaptivePreauthByToken,
   lookupCaptivePreauthByCode,
   lookupCaptivePreauthPublic,
+  lookupCaptivePreauthByToken,
 } from "../services/autopay/captivePreauthService.js";
 
 const router = Router();
@@ -74,6 +73,24 @@ function messageForResult(action, result) {
       message: messages[status] || "Esta decisão já foi registrada anteriormente.",
     };
   }
+  if (result?.code === "payment_failed" || result?.status === "failed") {
+    return {
+      status: 402,
+      title: "Pagamento nao aprovado",
+      message: "A autorizacao foi registrada, mas nao foi possivel confirmar a cobranca desta participacao.",
+    };
+  }
+  if (
+    result?.code === "number_not_available" ||
+    result?.code === "preauth_reservation_not_available" ||
+    result?.code === "preauth_reservation_expired"
+  ) {
+    return {
+      status: 409,
+      title: "Numero indisponivel",
+      message: "Nao foi possivel confirmar esta participacao porque o numero nao esta mais reservado.",
+    };
+  }
   if (action === "authorize") {
     return {
       status: 200,
@@ -107,7 +124,7 @@ function jsonForCodeDecision(result) {
   if (result?.code === "duplicate_confirmation_code") {
     return { status: 409, body: { ok: false, error: "duplicate_confirmation_code" } };
   }
-  if (result?.code === "confirmation_code_expired") {
+  if (result?.code === "confirmation_code_expired" || result?.status === "expired") {
     return {
       status: 410,
       body: {
@@ -130,6 +147,30 @@ function jsonForCodeDecision(result) {
         already_decided: true,
         status: result.status,
         message: "Esta decisão já foi registrada anteriormente.",
+      },
+    };
+  }
+  if (result?.code === "payment_failed" || result?.status === "failed") {
+    return {
+      status: 402,
+      body: {
+        ok: false,
+        error: "payment_failed",
+        status: "failed",
+      },
+    };
+  }
+  if (
+    result?.code === "number_not_available" ||
+    result?.code === "preauth_reservation_not_available" ||
+    result?.code === "preauth_reservation_expired"
+  ) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: "number_not_available",
+        status: result?.status || "failed",
       },
     };
   }
@@ -177,6 +218,16 @@ function jsonForPublicDecision(result) {
       },
     };
   }
+  if (result?.code === "number_not_available" || result?.code === "preauth_reservation_not_available") {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: "number_not_available",
+        status: result?.status || "failed",
+      },
+    };
+  }
   return {
     status: 200,
     body: {
@@ -189,9 +240,21 @@ function jsonForPublicDecision(result) {
 
 async function handleAuthorize(req, res) {
   try {
-    const result = await authorizeCaptivePreauthByToken(req.query?.token);
-    const message = messageForResult("authorize", result);
-    return htmlResponse(res, message.title, message.message, message.status);
+    const result = await lookupCaptivePreauthByToken(req.query?.token);
+    if (!result.ok) {
+      const message = messageForResult("authorize", result);
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    if (result.status !== "pending") {
+      const message = messageForResult("authorize", { code: "already_decided", status: result.status });
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    return htmlResponse(
+      res,
+      "Confirmacao necessaria",
+      "Para sua seguranca, confirme sua participacao pela pagina de confirmacao. Este link nao realiza cobranca automaticamente.",
+      200
+    );
   } catch (error) {
     console.error("[captive-preauth] failed", {
       action: "authorize",
@@ -204,9 +267,21 @@ async function handleAuthorize(req, res) {
 
 async function handleDecline(req, res) {
   try {
-    const result = await declineCaptivePreauthByToken(req.query?.token);
-    const message = messageForResult("decline", result);
-    return htmlResponse(res, message.title, message.message, message.status);
+    const result = await lookupCaptivePreauthByToken(req.query?.token);
+    if (!result.ok) {
+      const message = messageForResult("decline", result);
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    if (result.status !== "pending") {
+      const message = messageForResult("decline", { code: "already_decided", status: result.status });
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    return htmlResponse(
+      res,
+      "Confirmacao necessaria",
+      "Para sua seguranca, recuse sua participacao pela pagina de confirmacao. Este link nao altera sua autorizacao automaticamente.",
+      200
+    );
   } catch (error) {
     console.error("[captive-preauth] failed", {
       action: "decline",

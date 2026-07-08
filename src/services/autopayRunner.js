@@ -474,6 +474,137 @@ async function cancelReservation(client, { draw_id, reservationId }) {
   }
 }
 
+async function ensureCaptivePreauthReservationForCharge(client, { draw_id, user_id, captiveNumber, expiresAt }) {
+  const expiry = expiresAt ? new Date(expiresAt) : null;
+  if (!(expiry instanceof Date) || Number.isNaN(expiry.getTime())) {
+    return { ok: false, code: "authorization_missing_expiry", status: "failed" };
+  }
+  if (expiry.getTime() <= Date.now()) {
+    return { ok: false, code: "preauth_reservation_expired", status: "expired" };
+  }
+
+  await client.query("BEGIN");
+  try {
+    const numberResult = await client.query(
+      `select n, status, reservation_id
+         from public.numbers
+        where draw_id=$1
+          and n=$2
+        for update`,
+      [draw_id, captiveNumber]
+    );
+    const numberRow = numberResult.rows?.[0] || null;
+    if (!numberRow) {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "number_not_found", status: "failed" };
+    }
+    const numberStatus = String(numberRow.status || "").toLowerCase();
+    if (numberStatus === "sold") {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "number_not_available", status: "failed" };
+    }
+
+    if (numberStatus === "reserved" && numberRow.reservation_id) {
+      const reservationResult = await client.query(
+        `select id, user_id, numbers, status, expires_at
+           from public.reservations
+          where id=$1
+          for update`,
+        [numberRow.reservation_id]
+      );
+      const reservation = reservationResult.rows?.[0] || null;
+      if (!reservation) {
+        await client.query("ROLLBACK");
+        return { ok: false, code: "preauth_reservation_not_available", status: "failed" };
+      }
+
+      const reservationStatus = String(reservation.status || "").toLowerCase();
+      const isBlocking = ["pending", "active", "reserved", ""].includes(reservationStatus);
+      const reservationExpiresAt = reservation.expires_at ? new Date(reservation.expires_at).getTime() : null;
+      const reservationExpired = reservationExpiresAt && reservationExpiresAt <= Date.now();
+      const belongsToAuthorization =
+        Number(reservation.user_id) === Number(user_id) &&
+        (reservation.numbers || []).map(Number).includes(Number(captiveNumber));
+
+      if (isBlocking && !reservationExpired && belongsToAuthorization) {
+        await client.query("COMMIT");
+        return {
+          ok: true,
+          reservationId: reservation.id,
+          reservedNumbers: [Number(captiveNumber)],
+        };
+      }
+
+      if (isBlocking && reservationExpired) {
+        await client.query(`update public.reservations set status='expired', expires_at=now() where id=$1`, [reservation.id]);
+        await client.query(
+          `update public.numbers
+              set status='available',
+                  reservation_id=null
+            where draw_id=$1
+              and n=$2
+              and reservation_id=$3
+              and status='reserved'`,
+          [draw_id, captiveNumber, reservation.id]
+        );
+      } else {
+        await client.query("ROLLBACK");
+        return { ok: false, code: "number_not_available", status: "failed" };
+      }
+    } else if (numberStatus !== "available") {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "number_not_available", status: "failed" };
+    }
+
+    const after = await client.query(
+      `select n, status
+         from public.numbers
+        where draw_id=$1
+          and n=$2
+        for update`,
+      [draw_id, captiveNumber]
+    );
+    const afterRow = after.rows?.[0] || null;
+    if (!afterRow || String(afterRow.status || "").toLowerCase() !== "available") {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "number_not_available", status: "failed" };
+    }
+
+    const reservationId = crypto.randomUUID();
+    await client.query(
+      `insert into public.reservations (id, user_id, draw_id, numbers, status, created_at, expires_at)
+       values ($1, $2, $3, $4::int2[], 'pending', now(), $5)`,
+      [reservationId, user_id, draw_id, [captiveNumber], expiry]
+    );
+    const updated = await client.query(
+      `update public.numbers
+          set status='reserved',
+              reservation_id=$3
+        where draw_id=$1
+          and n=$2
+          and status='available'`,
+      [draw_id, captiveNumber, reservationId]
+    );
+    if (updated.rowCount !== 1) {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "number_not_available", status: "failed" };
+    }
+
+    await client.query("COMMIT");
+    return {
+      ok: true,
+      reservationId,
+      reservedNumbers: [Number(captiveNumber)],
+      legacy_reservation_created: true,
+    };
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw e;
+  }
+}
+
 function buildAutopayPaymentId({ provider, billId, chargeId, draw_id, user_id }) {
   const p = String(provider || "").toLowerCase();
   if (p === "vindi") {
@@ -649,7 +780,6 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
   const runTraceId = crypto.randomUUID();
   const attemptTraceId = crypto.randomUUID();
   const id = String(authorizationId || "").trim();
-  const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 5);
   let reservationId = null;
   let bill = null;
   let billId = null;
@@ -786,31 +916,47 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
       amount_cents: null,
     });
 
-    const reserved = await reserveNumbersForProfile(client, {
+    const reserved = await ensureCaptivePreauthReservationForCharge(client, {
       draw_id,
       user_id,
-      wants: [captiveNumber],
-      ttlMin,
+      captiveNumber,
+      expiresAt: auth.expires_at,
     });
     reservationId = reserved.reservationId;
     const reservedNumbers = reserved.reservedNumbers || [];
-    if (!reservationId || !reservedNumbers.includes(captiveNumber)) {
+    if (!reserved.ok || !reservationId || !reservedNumbers.includes(captiveNumber)) {
       await updateAutopayRunAttempt(client, {
         attempt_trace_id: attemptTraceId,
         status: "skipped_no_available",
-        error_message: "number_not_available",
+        error_message: reserved.code || "preauth_reservation_not_available",
       });
-      await markCaptivePreauthFailedOutsideTransaction(pool, id);
+      if (reserved.status === "expired") {
+        await pool.query(
+          `UPDATE public.autopay_draw_authorizations
+              SET status = 'expired',
+                  expired_at = COALESCE(expired_at, now()),
+                  updated_at = now()
+            WHERE id = $1
+              AND status = 'authorized'`,
+          [id]
+        );
+      } else {
+        await markCaptivePreauthFailedOutsideTransaction(pool, id);
+      }
       err("charge_authorized_failed", {
         authorization_id: id,
         draw_id,
         user_id,
         captive_number: captiveNumber,
         amount_cents,
-        status: "failed",
-        error_code: "number_not_available",
+        status: reserved.status || "failed",
+        error_code: reserved.code || "preauth_reservation_not_available",
       });
-      return { ok: false, code: "number_not_available", status: "failed" };
+      return {
+        ok: false,
+        code: reserved.code || "preauth_reservation_not_available",
+        status: reserved.status || "failed",
+      };
     }
 
     await updateAutopayRunAttempt(client, {

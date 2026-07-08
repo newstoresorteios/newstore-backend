@@ -4,12 +4,47 @@ import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents, setTicketPriceCents } from "../services/config.js";
 import { runAutopayForDraw } from "../services/autopayRunner.js";
+import {
+  createCaptivePreAuthorizationsForDraw,
+  isCaptivePreauthEnabled,
+  resolveCaptivePreauthDrawRequirement,
+} from "../services/autopay/captivePreauthService.js";
 import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
 
 const router = Router();
 
 function log(...a) {
   console.log("[admin/dashboard]", ...a);
+}
+
+async function createCaptivePreauthIfEnabled(drawId, adminUserId, context) {
+  if (!isCaptivePreauthEnabled()) {
+    return { ok: true, skipped: true, reason: "captive_preauth_disabled" };
+  }
+  try {
+    const requirement = await resolveCaptivePreauthDrawRequirement(drawId);
+    if (!requirement.required) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "amount_not_above_default",
+        ...requirement,
+      };
+    }
+    return await createCaptivePreAuthorizationsForDraw(drawId, { adminUserId });
+  } catch (error) {
+    console.error(`[${context}] captive preauth failed`, {
+      draw_id: drawId,
+      admin_user_id: adminUserId || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return {
+      ok: false,
+      error: error?.message || "captive_preauth_create_failed",
+      code: error?.code || null,
+    };
+  }
 }
 
 async function emitAdminNewDrawPublished(drawId) {
@@ -178,16 +213,32 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     );
 
     // dispara o AUTOPAY oficial — gera logs [autopayRunner]
+    const captivePreauth = await createCaptivePreauthIfEnabled(
+      newId,
+      req.user?.id ?? null,
+      "admin/dashboard/new"
+    );
+    if (!captivePreauth?.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: "captive_preauth_create_failed",
+        draw_id: newId,
+        sold: 0,
+        remaining: numberCount,
+        captive_preauth: captivePreauth,
+      });
+    }
+
     const autopay = await runAutopayForDraw(newId);
 
     // resposta inclui o resultado do autopay para depuração
     if (!autopay?.ok) {
       console.warn("[admin/dashboard] autopay falhou", autopay);
-      return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: numberCount, autopay });
+      return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: numberCount, captive_preauth: captivePreauth, autopay });
     }
 
     await emitAdminNewDrawPublished(newId);
-    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: numberCount, autopay });
+    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: numberCount, captive_preauth: captivePreauth, autopay });
   } catch (e) {
     console.error("[admin/dashboard] /new error:", e);
     return res.status(500).json({ error: "new_draw_failed" });
