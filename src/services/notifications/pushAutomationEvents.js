@@ -11,6 +11,7 @@ const SENSITIVE_KEY_RE = /(password|secret|token|authorization|cookie|endpoint|p
 
 const PUBLIC_EVENT_KEYS = new Set([
   "NEW_DRAW_PUBLISHED",
+  "DRAW_REMAINING_NUMBERS_75",
   "DRAW_REMAINING_NUMBERS_20",
   "DRAW_REMAINING_NUMBERS_10",
   "WINNER_DEFINED",

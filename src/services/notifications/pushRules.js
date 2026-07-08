@@ -2,6 +2,7 @@ import { query } from "../../db.js";
 
 export const PUSH_RULE_EVENTS = Object.freeze([
   "NEW_DRAW_PUBLISHED",
+  "DRAW_REMAINING_NUMBERS_75",
   "DRAW_REMAINING_NUMBERS_20",
   "DRAW_REMAINING_NUMBERS_10",
   "BALANCE_EXPIRING_30_DAYS",
@@ -22,6 +23,16 @@ export const DEFAULT_PUSH_RULES = Object.freeze([
     body_template: "Já está disponível um novo sorteio da New Store. Confira agora.",
     url_template: "/",
     category: "operational",
+  },
+  {
+    event_key: "DRAW_REMAINING_NUMBERS_75",
+    name: "Faltam 75 números",
+    description: "Dispara quando o sorteio ativo atingir 75 números disponíveis restantes.",
+    title_template: "Sorteio avançando!",
+    body_template: "Restam 75 números disponíveis neste sorteio.",
+    url_template: "/",
+    category: "operational",
+    threshold_value: 75,
   },
   {
     event_key: "DRAW_REMAINING_NUMBERS_20",
