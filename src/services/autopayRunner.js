@@ -1219,6 +1219,36 @@ export async function runAutopayForDraw(draw_id, { force = false } = {}) {
     const baseAmountColumns = await getAutopayProfileBaseAmountColumns(client);
     const authorizedBaseAmountSql = buildAuthorizedBaseAmountSql(baseAmountColumns);
     const price_cents = await getDrawTicketPriceCents(client, draw_id);
+    const defaultAmountCents = getDefaultAuthorizedBaseAmountCents();
+    const requiresCaptivePreauthByAmount = shouldRequireCaptivePreauth({
+      currentAmountCents: price_cents,
+      authorizedBaseAmountCents: defaultAmountCents,
+    });
+
+    if (requiresCaptivePreauthByAmount) {
+      warn("direct_autopay_skipped_requires_captive_preauth", {
+        runTraceId,
+        draw_id,
+        price_cents,
+        default_amount_cents: defaultAmountCents,
+        reason: "draw_amount_above_default",
+      });
+      await client.query("BEGIN");
+      await client.query(
+        `update public.draws set autopay_ran_at = now() where id=$1`,
+        [draw_id]
+      );
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        draw_id,
+        skipped: true,
+        reason: "requires_captive_preauth_amount_increased",
+        results: [],
+        price_cents,
+        default_amount_cents: defaultAmountCents,
+      };
+    }
 
     // 4) Scan de candidatos (inclui active=false) + números agregados
     // Regras de elegibilidade (em JS):

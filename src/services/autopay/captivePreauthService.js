@@ -284,14 +284,6 @@ async function listActiveCaptives() {
       LIMIT 1`
   );
   const hasAuthorizationMode = Boolean(profileColumns.rows?.length);
-  if (!hasAuthorizationMode) {
-    warn("profile_requires_preauth", {
-      selected: 0,
-      reason: "authorization_mode_column_missing",
-    });
-    return { rows: [], skippedNotificationsDisabled: 0 };
-  }
-
   const numberColumns = await query(
     `SELECT column_name
        FROM information_schema.columns
@@ -315,9 +307,10 @@ async function listActiveCaptives() {
   const authorizedBaseAmountExpr = amountExpressions.length
     ? `COALESCE(${amountExpressions.join(", ")})`
     : "NULL";
-  const preauthNotificationsFilter = hasPreauthNotificationsEnabled
-    ? "AND COALESCE(an.preauth_notifications_enabled, true) = true"
-    : "";
+  const authorizationModeExpr = hasAuthorizationMode ? "COALESCE(ap.authorization_mode, false)" : "false";
+  const preauthNotificationsExpr = hasPreauthNotificationsEnabled
+    ? "COALESCE(an.preauth_notifications_enabled, true)"
+    : "true";
   let skippedNotificationsDisabled = 0;
 
   if (hasPreauthNotificationsEnabled) {
@@ -327,7 +320,6 @@ async function listActiveCaptives() {
          JOIN public.autopay_profiles ap ON ap.id = an.autopay_id
         WHERE ap.active = true
           AND an.active = true
-          AND COALESCE(ap.authorization_mode, false) = true
           AND COALESCE(an.preauth_notifications_enabled, true) = false`
     );
     skippedNotificationsDisabled = Number(skippedResult.rows?.[0]?.count || 0);
@@ -340,6 +332,8 @@ async function listActiveCaptives() {
         an.n AS captive_number,
         ap.user_id,
         ${authorizedBaseAmountExpr} AS authorized_base_amount_cents,
+        ${authorizationModeExpr} AS authorization_mode,
+        ${preauthNotificationsExpr} AS preauth_notifications_enabled,
         u.name AS user_name,
         u.phone AS user_phone
        FROM public.autopay_numbers an
@@ -347,13 +341,13 @@ async function listActiveCaptives() {
        JOIN public.users u ON u.id = ap.user_id
       WHERE ap.active = true
         AND an.active = true
-        AND COALESCE(ap.authorization_mode, false) = true
-        ${preauthNotificationsFilter}
       ORDER BY an.n ASC, ap.user_id ASC`
   );
-  log("profile_requires_preauth", {
+  log("active_captives_for_preauth", {
     selected: result.rows?.length || 0,
     skipped_notifications_disabled: skippedNotificationsDisabled,
+    authorization_mode_column_present: hasAuthorizationMode,
+    preauth_notifications_column_present: hasPreauthNotificationsEnabled,
   });
   return { rows: result.rows || [], skippedNotificationsDisabled };
 }
@@ -898,6 +892,32 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
   const adminUserId = options.adminUserId != null ? Number(options.adminUserId) : null;
   const draw = await getDraw(drawId);
   const amountCents = await getDrawPriceCents(draw);
+  const defaultAmountCents = getDefaultAuthorizedBaseAmountCents();
+  const preauthRequiredByDrawAmount = shouldRequireCaptivePreauth({
+    currentAmountCents: amountCents,
+    authorizedBaseAmountCents: defaultAmountCents,
+  });
+
+  if (!preauthRequiredByDrawAmount) {
+    log("skipped_amount_not_above_default", {
+      draw_id: Number(draw.id),
+      current_amount_cents: amountCents,
+      default_amount_cents: defaultAmountCents,
+    });
+    return {
+      ok: true,
+      draw_id: Number(draw.id),
+      skipped: true,
+      reason: "amount_not_above_default",
+      draw_ticket_price_cents: amountCents,
+      default_amount_cents: defaultAmountCents,
+      required: false,
+      created: 0,
+      already_exists: 0,
+      items: [],
+    };
+  }
+
   const activeCaptives = await listActiveCaptives();
   const captives = activeCaptives.rows || [];
   const skippedNotificationsDisabled = Number(activeCaptives.skippedNotificationsDisabled || 0);
@@ -952,7 +972,6 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
   let created = 0;
   let alreadyExists = 0;
   let skipped = 0;
-  let skippedAmountNotIncreased = 0;
   let reservationCreated = 0;
   let reservationAlreadyExists = 0;
   let reservationFailed = 0;
@@ -970,28 +989,14 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
       continue;
     }
 
-    if (!shouldRequireCaptivePreauth({
-      currentAmountCents: amountCents,
-      authorizedBaseAmountCents,
-    })) {
-      skipped++;
-      skippedAmountNotIncreased++;
-      log("skipped_amount_not_increased", {
-        draw_id: Number(draw.id),
-        user_id: userId,
-        captive_number: captiveNumber,
-        current_amount_cents: amountCents,
-        authorized_base_amount_cents: authorizedBaseAmountCents,
-      });
-      continue;
-    }
-
     log("required_amount_increased", {
       draw_id: Number(draw.id),
       user_id: userId,
       captive_number: captiveNumber,
       current_amount_cents: amountCents,
       authorized_base_amount_cents: authorizedBaseAmountCents,
+      default_amount_cents: defaultAmountCents,
+      authorization_mode: captive.authorization_mode === true,
     });
 
     const token = createToken();
@@ -1102,6 +1107,20 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
           errorMessage: null,
         });
         notification = { ...notification, notification_status: "not_sent", notification_error: null };
+      } else if (captive.preauth_notifications_enabled === false) {
+        await updateAuthorizationNotification({
+          authorizationId: row.id,
+          status: "skipped",
+          errorMessage: "preauth_notifications_disabled",
+        });
+        logWhatsAppSkipped({
+          drawId: draw.id,
+          userId: Number(row.user_id),
+          captiveNumber: Number(row.captive_number),
+          reason: "preauth_notifications_disabled",
+          templateId,
+        });
+        notification = { ...notification, notification_status: "skipped", notification_error: "preauth_notifications_disabled" };
       } else if (!templateId) {
         await updateAuthorizationNotification({
           authorizationId: row.id,
@@ -1247,7 +1266,7 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
     already_exists: alreadyExists,
     skipped,
     skipped_notifications_disabled: skippedNotificationsDisabled,
-    skipped_amount_not_increased: skippedAmountNotIncreased,
+    skipped_amount_not_increased: 0,
     reservation_created: reservationCreated,
     reservation_already_exists: reservationAlreadyExists,
     reservation_failed: reservationFailed,
