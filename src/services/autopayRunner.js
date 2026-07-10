@@ -790,6 +790,7 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
     user_id: null,
     captive_number: null,
     amount_cents: null,
+    expires_at: null,
   };
 
   try {
@@ -838,6 +839,7 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
     chargeContext.user_id = user_id;
     chargeContext.captive_number = captiveNumber;
     chargeContext.amount_cents = amount_cents;
+    chargeContext.expires_at = auth.expires_at || null;
     if (
       !Number.isInteger(draw_id) ||
       !Number.isInteger(user_id) ||
@@ -1127,7 +1129,9 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
       } catch {}
     }
 
-    if (reservationId) {
+    const authExpiresAt = chargeContext.expires_at ? new Date(chargeContext.expires_at).getTime() : null;
+    const keepReservationForRetry = Boolean(reservationId && authExpiresAt && authExpiresAt > Date.now());
+    if (reservationId && !keepReservationForRetry) {
       try {
         await cancelReservation(client, { draw_id: chargeContext.draw_id, reservationId });
       } catch {}
@@ -1155,6 +1159,8 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
       amount_cents: chargeContext.amount_cents,
       status: "failed",
       error_code: String(errorCode).slice(0, 80),
+      reservation_id: reservationId || null,
+      reservation_kept_for_retry: keepReservationForRetry,
     });
     return { ok: false, code: "payment_failed", status: "failed", charged: false };
   } finally {

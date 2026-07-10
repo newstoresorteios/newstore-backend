@@ -51,6 +51,7 @@ router.post("/draws/:drawId/reissue-and-resend", requireAuth, requireAdmin, asyn
       draw_id: Number(req.params.drawId),
       pending_found: result.pending_found,
       amount_corrected: result.amount_corrected,
+      failed_recovered: result.failed_recovered,
       sent: result.sent,
       skipped:
         Number(result.skipped_consent || 0) +

@@ -1346,6 +1346,97 @@ async function hasCompletedCaptivePreauthCharge(authorizationId) {
   return result.rowCount > 0;
 }
 
+async function hasApprovedPaymentForAuthorization(authorization) {
+  const drawId = Number(authorization?.draw_id);
+  const userId = Number(authorization?.user_id);
+  const captiveNumber = Number(authorization?.captive_number);
+  if (!Number.isInteger(drawId) || !Number.isInteger(userId) || !Number.isInteger(captiveNumber)) {
+    return false;
+  }
+  const result = await query(
+    `SELECT 1
+       FROM public.payments
+      WHERE draw_id = $1
+        AND user_id = $2
+        AND lower(status) IN ('approved', 'paid', 'pago')
+        AND $3 = ANY(numbers)
+      LIMIT 1`,
+    [drawId, userId, captiveNumber]
+  );
+  return result.rowCount > 0;
+}
+
+async function getRecoverableFailedAuthorizationInfo(authorization, options = {}) {
+  const status = safeStatus(authorization?.status);
+  const base = {
+    recoverable: false,
+    retryable: false,
+    reason: null,
+    reservation_id: null,
+  };
+  if (status !== "failed") return { ...base, reason: "status_not_failed" };
+
+  const expiresAt = authorization?.expires_at ? new Date(authorization.expires_at).getTime() : null;
+  if (!expiresAt || expiresAt <= Date.now()) return { ...base, reason: "authorization_expired" };
+
+  const reservation = options.reservation || await validateExistingCaptivePreauthReservation(authorization);
+  if (!reservation.ok) {
+    warn("failed_authorization_not_recoverable", {
+      authorization_id: authorization?.id || null,
+      draw_id: Number(authorization?.draw_id),
+      user_id: Number(authorization?.user_id),
+      captive_number: Number(authorization?.captive_number),
+      reservation_id: reservation.reservation_id || null,
+      reason: reservation.reason || "reservation_invalid",
+    });
+    return { ...base, reason: reservation.reason || "reservation_invalid" };
+  }
+
+  if (await hasCompletedCaptivePreauthCharge(authorization.id)) {
+    warn("failed_authorization_not_recoverable", {
+      authorization_id: authorization.id,
+      draw_id: Number(authorization.draw_id),
+      user_id: Number(authorization.user_id),
+      captive_number: Number(authorization.captive_number),
+      reservation_id: reservation.reservation_id || null,
+      reason: "charged_ok_exists",
+    });
+    return { ...base, reason: "charged_ok_exists", reservation_id: reservation.reservation_id || null };
+  }
+
+  if (await hasApprovedPaymentForAuthorization(authorization)) {
+    warn("failed_authorization_not_recoverable", {
+      authorization_id: authorization.id,
+      draw_id: Number(authorization.draw_id),
+      user_id: Number(authorization.user_id),
+      captive_number: Number(authorization.captive_number),
+      reservation_id: reservation.reservation_id || null,
+      reason: "approved_payment_exists",
+    });
+    return { ...base, reason: "approved_payment_exists", reservation_id: reservation.reservation_id || null };
+  }
+
+  log("failed_authorization_recoverable", {
+    authorization_id: authorization.id,
+    draw_id: Number(authorization.draw_id),
+    user_id: Number(authorization.user_id),
+    captive_number: Number(authorization.captive_number),
+    reservation_id: reservation.reservation_id || null,
+    reason: "reservation_valid",
+  });
+  return {
+    recoverable: true,
+    retryable: true,
+    reason: "reservation_valid",
+    reservation_id: reservation.reservation_id || null,
+  };
+}
+
+async function isRecoverableFailedAuthorization(authorization) {
+  const info = await getRecoverableFailedAuthorizationInfo(authorization);
+  return info.recoverable === true;
+}
+
 async function listPendingCaptivePreauthsForReissue(drawId) {
   const numberColumns = await query(
     `SELECT column_name
@@ -1374,7 +1465,7 @@ async function listPendingCaptivePreauthsForReissue(drawId) {
         AND an.active = true
        JOIN public.users u ON u.id = ada.user_id
       WHERE ada.draw_id = $1
-        AND ada.status = 'pending'
+        AND ada.status IN ('pending', 'failed')
         AND ada.expires_at > now()
       ORDER BY ada.expires_at ASC, ada.created_at ASC`,
     [Number(drawId)]
@@ -1390,6 +1481,9 @@ async function reissuePendingCaptivePreauthCredentials({ authorizationId, amount
   const setParts = [
     "amount_cents = $2",
     "token_hash = $3",
+    "status = 'pending'",
+    "authorized_at = NULL",
+    "charged_at = NULL",
     "updated_at = now()",
   ];
 
@@ -1404,7 +1498,7 @@ async function reissuePendingCaptivePreauthCredentials({ authorizationId, amount
     `UPDATE public.autopay_draw_authorizations
         SET ${setParts.join(", ")}
       WHERE id = $1
-        AND status = 'pending'
+        AND status IN ('pending', 'failed')
         AND expires_at > now()
       RETURNING *`,
     params
@@ -1470,6 +1564,7 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
     official_amount_cents: officialAmountCents,
     pending_found: rows.length,
     amount_corrected: 0,
+    failed_recovered: 0,
     credentials_reissued: 0,
     sent: 0,
     skipped_consent: 0,
@@ -1495,6 +1590,17 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
       continue;
     }
 
+    if (safeStatus(row.status) === "failed") {
+      const recoverable = await getRecoverableFailedAuthorizationInfo(row, { reservation });
+      if (!recoverable.recoverable) {
+        summary.skipped_other++;
+        continue;
+      }
+    } else if (safeStatus(row.status) !== "pending") {
+      summary.untouched_non_pending++;
+      continue;
+    }
+
     if (await hasCompletedCaptivePreauthCharge(authorizationId)) {
       summary.skipped_already_charged++;
       continue;
@@ -1510,6 +1616,7 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
       });
       if (reissued.authorization) {
         if (Number(row.amount_cents) !== officialAmountCents) summary.amount_corrected++;
+        if (safeStatus(row.status) === "failed") summary.failed_recovered++;
         summary.credentials_reissued++;
       }
       summary.skipped_near_expiration++;
@@ -1526,6 +1633,17 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
       continue;
     }
     if (Number(row.amount_cents) !== officialAmountCents) summary.amount_corrected++;
+    if (safeStatus(row.status) === "failed") {
+      summary.failed_recovered++;
+      log("failed_authorization_recovered", {
+        authorization_id: authorizationId,
+        draw_id: id,
+        user_id: Number(row.user_id),
+        captive_number: Number(row.captive_number),
+        reservation_id: reservation.reservation_id || null,
+        reason: "admin_reissue",
+      });
+    }
     summary.credentials_reissued++;
 
     if (!whatsappEnabled) {
@@ -1650,6 +1768,16 @@ async function getAuthorizationById(id) {
 
 function alreadyDecidedResponse(row) {
   const status = safeStatus(row?.status);
+  if (status === "failed") {
+    return {
+      ok: false,
+      code: "payment_failed",
+      status: "failed",
+      retryable: true,
+      message: "A tentativa de cobrança não foi concluída. A participação ainda pode ser confirmada novamente enquanto a reserva estiver válida.",
+      authorization: row,
+    };
+  }
   return {
     ok: true,
     code: "already_decided",
@@ -1774,19 +1902,26 @@ export async function lookupCaptivePreauthPublic({ email, phone }) {
     `SELECT id, draw_id, user_id, captive_number, amount_cents, status, expires_at
        FROM public.autopay_draw_authorizations
       WHERE user_id = $1
-        AND status = 'pending'
+        AND status IN ('pending', 'failed')
         AND expires_at > now()
       ORDER BY expires_at ASC, created_at ASC`,
     [user.id]
   );
   const rows = result.rows || [];
+  const filteredRows = [];
+  for (const row of rows) {
+    if (safeStatus(row.status) === "failed" && !(await isRecoverableFailedAuthorization(row))) continue;
+    filteredRows.push(row);
+  }
   const items = await Promise.all(
-    rows.map(async (row) => ({
+    filteredRows.map(async (row) => ({
       id: String(row.id),
       draw_id: Number(row.draw_id),
       captive_number: Number(row.captive_number),
+      amount_cents: Number(row.amount_cents),
       amount: formatAmountBRL(row.amount_cents),
       status: safeStatus(row.status),
+      retryable: safeStatus(row.status) === "failed",
       expires_at: row.expires_at,
       draw_title: (await publicAuthorization(row))?.draw_title || `Sorteio #${row.draw_id}`,
     }))
@@ -1838,14 +1973,19 @@ export async function lookupCaptivePreauthForUser(userId) {
     `SELECT id, draw_id, user_id, captive_number, amount_cents, status, expires_at
        FROM public.autopay_draw_authorizations
       WHERE user_id = $1
-        AND status = 'pending'
+        AND status IN ('pending', 'failed')
         AND expires_at > now()
       ORDER BY expires_at ASC, created_at ASC`,
     [id]
   );
   const rows = result.rows || [];
+  const filteredRows = [];
+  for (const row of rows) {
+    if (safeStatus(row.status) === "failed" && !(await isRecoverableFailedAuthorization(row))) continue;
+    filteredRows.push(row);
+  }
   const items = await Promise.all(
-    rows.map(async (row) => ({
+    filteredRows.map(async (row) => ({
       id: String(row.id),
       draw_id: Number(row.draw_id),
       draw_title: (await publicAuthorization(row))?.draw_title || `Sorteio #${row.draw_id}`,
@@ -1853,6 +1993,7 @@ export async function lookupCaptivePreauthForUser(userId) {
       amount_cents: Number(row.amount_cents),
       amount: formatAmountBRL(row.amount_cents),
       status: safeStatus(row.status),
+      retryable: safeStatus(row.status) === "failed",
       expires_at: row.expires_at instanceof Date ? row.expires_at.toISOString() : row.expires_at,
     }))
   );
@@ -2004,6 +2145,51 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
   }
 
   const currentStatus = safeStatus(row.status);
+  if (currentStatus === "failed") {
+    const recoverable = await getRecoverableFailedAuthorizationInfo(row);
+    if (!recoverable.recoverable) {
+      return {
+        ok: false,
+        code: "payment_failed",
+        status: "failed",
+        retryable: false,
+        message: "A tentativa de cobrança não foi concluída, mas a reserva não está mais disponível para nova tentativa.",
+        authorization: row,
+      };
+    }
+    if (decision === "authorize") {
+      return recoverFailedAuthorizationForRetry(row, source);
+    }
+    if (decision === "decline") {
+      const updated = await query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'declined',
+                declined_at = now(),
+                updated_at = now()
+          WHERE id = $1
+            AND status = 'failed'
+          RETURNING *`,
+        [row.id]
+      );
+      const out = updated.rows?.[0] || null;
+      if (!out) {
+        const current = await getAuthorizationById(row.id);
+        return alreadyDecidedResponse(current || row);
+      }
+      try {
+        await releasePendingCaptiveReservationForAuthorization(out);
+      } catch (err) {
+        warn("reservation_release_failed", {
+          authorization_id: row.id,
+          draw_id: Number(row.draw_id),
+          user_id: Number(row.user_id),
+          captive_number: Number(row.captive_number),
+          reason: safeError(err?.message || "release_failed"),
+        });
+      }
+      return { ok: true, code: "declined_success", status: "declined", authorization: out };
+    }
+  }
   if (currentStatus !== "pending") {
     return alreadyDecidedResponse(row);
   }
@@ -2121,6 +2307,156 @@ export async function lookupCaptivePreauthByToken(token) {
     status,
     authorization: await publicAuthorization(row),
   };
+}
+
+async function recoverFailedAuthorizationForRetry(row, source = "account") {
+  const pool = await getPool();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(
+      `SELECT *
+         FROM public.autopay_draw_authorizations
+        WHERE id = $1
+        FOR UPDATE`,
+      [row.id]
+    );
+    const current = locked.rows?.[0] || null;
+    if (!current || safeStatus(current.status) !== "failed") {
+      await client.query("ROLLBACK");
+      return alreadyDecidedResponse(current || row);
+    }
+
+    const numberResult = await client.query(
+      `SELECT status AS number_status,
+              reservation_id
+         FROM public.numbers
+        WHERE draw_id = $1
+          AND n = $2
+        FOR UPDATE`,
+      [Number(current.draw_id), Number(current.captive_number)]
+    );
+    const numberRow = numberResult.rows?.[0] || null;
+    let reservationRow = null;
+    if (numberRow?.reservation_id) {
+      const reservationResult = await client.query(
+        `SELECT user_id, numbers, status AS reservation_status, expires_at
+           FROM public.reservations
+          WHERE id = $1
+          FOR UPDATE`,
+        [numberRow.reservation_id]
+      );
+      reservationRow = reservationResult.rows?.[0] || null;
+    }
+    const reservationStatus = String(reservationRow?.reservation_status || "").toLowerCase();
+    const reservationExpiresAt = reservationRow?.expires_at ? new Date(reservationRow.expires_at).getTime() : null;
+    const reservationValid =
+      numberRow &&
+      reservationRow &&
+      String(numberRow.number_status || "").toLowerCase() === "reserved" &&
+      numberRow.reservation_id &&
+      ["pending", "active", "reserved", ""].includes(reservationStatus) &&
+      (!reservationExpiresAt || reservationExpiresAt > Date.now()) &&
+      Number(reservationRow.user_id) === Number(current.user_id) &&
+      (reservationRow.numbers || []).map(Number).includes(Number(current.captive_number));
+
+    if (!reservationValid) {
+      await client.query("ROLLBACK");
+      warn("failed_authorization_not_recoverable", {
+        authorization_id: current.id,
+        draw_id: Number(current.draw_id),
+        user_id: Number(current.user_id),
+        captive_number: Number(current.captive_number),
+        reservation_id: numberRow?.reservation_id || null,
+        reason: "reservation_invalid",
+      });
+      return {
+        ok: false,
+        code: "payment_failed",
+        status: "failed",
+        retryable: false,
+        authorization: current,
+      };
+    }
+
+    const charged = await client.query(
+      `SELECT 1
+         FROM public.autopay_runs
+        WHERE status = 'charged_ok'
+          AND provider_request->>'authorization_id' = $1
+        LIMIT 1`,
+      [String(current.id)]
+    );
+    const approvedPayment = await client.query(
+      `SELECT 1
+         FROM public.payments
+        WHERE draw_id = $1
+          AND user_id = $2
+          AND lower(status) IN ('approved', 'paid', 'pago')
+          AND $3 = ANY(numbers)
+        LIMIT 1`,
+      [Number(current.draw_id), Number(current.user_id), Number(current.captive_number)]
+    );
+    if (charged.rowCount || approvedPayment.rowCount) {
+      await client.query("ROLLBACK");
+      warn("failed_authorization_not_recoverable", {
+        authorization_id: current.id,
+        draw_id: Number(current.draw_id),
+        user_id: Number(current.user_id),
+        captive_number: Number(current.captive_number),
+        reservation_id: numberRow.reservation_id || null,
+        reason: charged.rowCount ? "charged_ok_exists" : "approved_payment_exists",
+      });
+      return {
+        ok: false,
+        code: "payment_failed",
+        status: "failed",
+        retryable: false,
+        authorization: current,
+      };
+    }
+
+    const expiresAt = current.expires_at ? new Date(current.expires_at).getTime() : null;
+    if (!expiresAt || expiresAt <= Date.now()) {
+      await client.query("ROLLBACK");
+      return {
+        ok: false,
+        code: "token_expired",
+        status: "expired",
+        authorization: current,
+      };
+    }
+
+    const updated = await client.query(
+      `UPDATE public.autopay_draw_authorizations
+          SET status = 'authorized',
+              authorized_at = now(),
+              charged_at = NULL,
+              updated_at = now()
+        WHERE id = $1
+          AND status = 'failed'
+        RETURNING *`,
+      [current.id]
+    );
+    await client.query("COMMIT");
+    const out = updated.rows?.[0] || current;
+    log("failed_authorization_retry_started", {
+      authorization_id: out.id,
+      draw_id: Number(out.draw_id),
+      user_id: Number(out.user_id),
+      captive_number: Number(out.captive_number),
+      reservation_id: numberRow.reservation_id || null,
+      reason: source,
+    });
+    return { ok: true, code: "authorized_success", status: "authorized", authorization: out, retryable: true };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function authorizeCaptivePreauthByCode(code) {

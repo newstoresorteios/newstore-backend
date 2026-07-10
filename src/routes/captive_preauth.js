@@ -161,6 +161,8 @@ function jsonForCodeDecision(result) {
         ok: false,
         error: "payment_failed",
         status: "failed",
+        retryable: result?.retryable === true,
+        message: result?.message,
       },
     };
   }
@@ -198,6 +200,8 @@ function jsonForPublicDecision(result) {
         ok: false,
         error: "payment_failed",
         status: "failed",
+        retryable: result?.retryable === true,
+        message: result?.message,
       },
     };
   }
@@ -253,6 +257,8 @@ function jsonForAccountDecision(result) {
         ok: false,
         error: "payment_failed",
         status: "failed",
+        retryable: result?.retryable === true,
+        message: result?.message,
       },
     };
   }
@@ -307,7 +313,7 @@ async function handleAuthorize(req, res) {
       const message = messageForResult("authorize", result);
       return htmlResponse(res, message.title, message.message, message.status);
     }
-    if (result.status !== "pending") {
+    if (result.status !== "pending" && result.status !== "failed") {
       const message = messageForResult("authorize", { code: "already_decided", status: result.status });
       return htmlResponse(res, message.title, message.message, message.status);
     }
@@ -334,7 +340,7 @@ async function handleDecline(req, res) {
       const message = messageForResult("decline", result);
       return htmlResponse(res, message.title, message.message, message.status);
     }
-    if (result.status !== "pending") {
+    if (result.status !== "pending" && result.status !== "failed") {
       const message = messageForResult("decline", { code: "already_decided", status: result.status });
       return htmlResponse(res, message.title, message.message, message.status);
     }
