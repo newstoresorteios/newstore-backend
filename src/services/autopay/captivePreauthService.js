@@ -900,6 +900,48 @@ async function releasePendingCaptiveReservationForAuthorization(authorization) {
   }
 }
 
+async function validateExistingCaptivePreauthReservation(authorization) {
+  const drawId = Number(authorization?.draw_id);
+  const userId = Number(authorization?.user_id);
+  const captiveNumber = Number(authorization?.captive_number);
+  if (!Number.isInteger(drawId) || !Number.isInteger(userId) || !Number.isInteger(captiveNumber)) {
+    return { ok: false, reason: "invalid_authorization" };
+  }
+
+  const result = await query(
+    `SELECT n.status AS number_status,
+            n.reservation_id,
+            r.user_id,
+            r.numbers,
+            r.status AS reservation_status,
+            r.expires_at
+       FROM public.numbers n
+       LEFT JOIN public.reservations r ON r.id = n.reservation_id
+      WHERE n.draw_id = $1
+        AND n.n = $2
+      LIMIT 1`,
+    [drawId, captiveNumber]
+  );
+  const row = result.rows?.[0] || null;
+  if (!row) return { ok: false, reason: "number_not_found" };
+  if (String(row.number_status || "").toLowerCase() !== "reserved" || !row.reservation_id) {
+    return { ok: false, reason: "preauth_reservation_not_available" };
+  }
+
+  const reservationStatus = String(row.reservation_status || "").toLowerCase();
+  const reservationExpiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
+  const isBlocking = ["active", "pending", "reserved", ""].includes(reservationStatus);
+  const isExpired = reservationExpiresAt && reservationExpiresAt <= Date.now();
+  const belongsToAuthorization =
+    Number(row.user_id) === userId &&
+    (row.numbers || []).map(Number).includes(captiveNumber);
+
+  if (!isBlocking || isExpired || !belongsToAuthorization) {
+    return { ok: false, reason: isExpired ? "preauth_reservation_expired" : "preauth_reservation_not_available" };
+  }
+  return { ok: true, reservation_id: String(row.reservation_id) };
+}
+
 export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}) {
   const adminUserId = options.adminUserId != null ? Number(options.adminUserId) : null;
   const draw = await getDraw(drawId);
@@ -1290,6 +1332,281 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
     captive_preauth_template_key: PREAUTH_TEMPLATE_KEY,
     items,
   };
+}
+
+async function hasCompletedCaptivePreauthCharge(authorizationId) {
+  const result = await query(
+    `SELECT 1
+       FROM public.autopay_runs
+      WHERE status = 'charged_ok'
+        AND provider_request->>'authorization_id' = $1
+      LIMIT 1`,
+    [String(authorizationId)]
+  );
+  return result.rowCount > 0;
+}
+
+async function listPendingCaptivePreauthsForReissue(drawId) {
+  const numberColumns = await query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'autopay_numbers'
+        AND column_name = 'preauth_notifications_enabled'`
+  );
+  const hasPreauthNotificationsEnabled = Boolean(numberColumns.rows?.length);
+  const preauthNotificationsExpr = hasPreauthNotificationsEnabled
+    ? "COALESCE(an.preauth_notifications_enabled, true)"
+    : "true";
+
+  const result = await query(
+    `SELECT ada.*,
+            ${preauthNotificationsExpr} AS preauth_notifications_enabled,
+            u.name AS user_name,
+            u.phone AS user_phone
+       FROM public.autopay_draw_authorizations ada
+       JOIN public.autopay_profiles ap ON ap.id = ada.autopay_profile_id
+        AND ap.user_id = ada.user_id
+        AND ap.active = true
+       JOIN public.autopay_numbers an ON an.id = ada.autopay_number_id
+        AND an.autopay_id = ap.id
+        AND an.n = ada.captive_number
+        AND an.active = true
+       JOIN public.users u ON u.id = ada.user_id
+      WHERE ada.draw_id = $1
+        AND ada.status = 'pending'
+        AND ada.expires_at > now()
+      ORDER BY ada.expires_at ASC, ada.created_at ASC`,
+    [Number(drawId)]
+  );
+  return result.rows || [];
+}
+
+async function reissuePendingCaptivePreauthCredentials({ authorizationId, amountCents, schema }) {
+  const token = createToken();
+  const tokenHash = hashToken(token);
+  let confirmationCode = null;
+  const params = [authorizationId, amountCents, tokenHash];
+  const setParts = [
+    "amount_cents = $2",
+    "token_hash = $3",
+    "updated_at = now()",
+  ];
+
+  if (schema.confirmation_code_hash && schema.confirmation_code_created_at) {
+    confirmationCode = createConfirmationCode();
+    params.push(hashConfirmationCode(confirmationCode));
+    setParts.push(`confirmation_code_hash = $${params.length}`);
+    setParts.push("confirmation_code_created_at = now()");
+  }
+
+  const result = await query(
+    `UPDATE public.autopay_draw_authorizations
+        SET ${setParts.join(", ")}
+      WHERE id = $1
+        AND status = 'pending'
+        AND expires_at > now()
+      RETURNING *`,
+    params
+  );
+
+  return {
+    token,
+    confirmationCode,
+    authorization: result.rows?.[0] || null,
+  };
+}
+
+function classifyReissueNotification(result) {
+  const status = String(result?.notification_status || "").toLowerCase();
+  const reason = String(result?.notification_error || "").toLowerCase();
+  if (status === "skipped" && reason.includes("consent")) return "skipped_consent";
+  if (status === "skipped") return "skipped_other";
+  if (status && status !== "failed") return "sent";
+  return "failed";
+}
+
+export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUserId }) {
+  const id = Number(drawId);
+  if (!Number.isInteger(id) || id <= 0) {
+    const err = new Error("invalid_draw_id");
+    err.status = 400;
+    throw err;
+  }
+
+  const draw = await getDraw(id);
+  if (String(draw?.draw_type || "principal").toLowerCase() !== "principal") {
+    const err = new Error("draw_not_principal");
+    err.status = 400;
+    throw err;
+  }
+
+  const officialAmountCents = await resolveDrawAmountCents(draw);
+  const defaultAmountCents = getDefaultAuthorizedBaseAmountCents();
+  if (!shouldRequireCaptivePreauth({
+    currentAmountCents: officialAmountCents,
+    authorizedBaseAmountCents: defaultAmountCents,
+  })) {
+    const err = new Error("captive_preauth_not_required");
+    err.status = 409;
+    throw err;
+  }
+
+  await expirePendingCaptivePreauths();
+
+  const rows = await listPendingCaptivePreauthsForReissue(id);
+  const schema = await getAuthorizationTableSchema();
+  const whatsappEnabled = isCaptivePreauthWhatsAppEnabled();
+  const templateMode = getCaptivePreauthTemplateMode();
+  const confirmationPublicUrl = resolveCaptiveConfirmationPublicUrl();
+  const templateConfig = whatsappEnabled
+    ? await resolveCaptivePreauthTemplateConfig()
+    : { templateId: null, source: "missing", templateKey: PREAUTH_TEMPLATE_KEY };
+  const templateId = templateConfig.templateId;
+  const seen = new Set();
+  const summary = {
+    ok: true,
+    draw_id: id,
+    official_amount_cents: officialAmountCents,
+    pending_found: rows.length,
+    amount_corrected: 0,
+    credentials_reissued: 0,
+    sent: 0,
+    skipped_consent: 0,
+    skipped_notifications_disabled: 0,
+    skipped_near_expiration: 0,
+    skipped_reservation_unavailable: 0,
+    skipped_already_charged: 0,
+    skipped_whatsapp_disabled: 0,
+    skipped_template_missing: 0,
+    skipped_other: 0,
+    failed: 0,
+    untouched_non_pending: 0,
+  };
+
+  for (const row of rows) {
+    const authorizationId = String(row.id);
+    if (seen.has(authorizationId)) continue;
+    seen.add(authorizationId);
+
+    const reservation = await validateExistingCaptivePreauthReservation(row);
+    if (!reservation.ok) {
+      summary.skipped_reservation_unavailable++;
+      continue;
+    }
+
+    if (await hasCompletedCaptivePreauthCharge(authorizationId)) {
+      summary.skipped_already_charged++;
+      continue;
+    }
+
+    const expiresAtMs = row.expires_at ? new Date(row.expires_at).getTime() : 0;
+    const nearExpiration = expiresAtMs && expiresAtMs - Date.now() < 10 * 60 * 1000;
+    if (nearExpiration) {
+      const reissued = await reissuePendingCaptivePreauthCredentials({
+        authorizationId,
+        amountCents: officialAmountCents,
+        schema,
+      });
+      if (reissued.authorization) {
+        if (Number(row.amount_cents) !== officialAmountCents) summary.amount_corrected++;
+        summary.credentials_reissued++;
+      }
+      summary.skipped_near_expiration++;
+      continue;
+    }
+
+    const reissued = await reissuePendingCaptivePreauthCredentials({
+      authorizationId,
+      amountCents: officialAmountCents,
+      schema,
+    });
+    if (!reissued.authorization) {
+      summary.untouched_non_pending++;
+      continue;
+    }
+    if (Number(row.amount_cents) !== officialAmountCents) summary.amount_corrected++;
+    summary.credentials_reissued++;
+
+    if (!whatsappEnabled) {
+      await updateAuthorizationNotification({
+        authorizationId,
+        status: "not_sent",
+        errorMessage: null,
+      });
+      summary.skipped_whatsapp_disabled++;
+      continue;
+    }
+
+    if (row.preauth_notifications_enabled === false) {
+      await updateAuthorizationNotification({
+        authorizationId,
+        status: "skipped",
+        errorMessage: "preauth_notifications_disabled",
+      });
+      summary.skipped_notifications_disabled++;
+      continue;
+    }
+
+    if (!templateId) {
+      await updateAuthorizationNotification({
+        authorizationId,
+        status: "skipped",
+        errorMessage: "whatsapp_template_missing",
+      });
+      summary.skipped_template_missing++;
+      continue;
+    }
+
+    try {
+      const notification = await sendCaptivePreauthWhatsApp({
+        authorization: reissued.authorization,
+        captive: row,
+        draw,
+        authorizeUrl: buildAuthorizeUrl(reissued.token),
+        declineUrl: buildDeclineUrl(reissued.token),
+        manageUrl: confirmationPublicUrl,
+        confirmationCode: reissued.confirmationCode,
+        templateId,
+        templateMode,
+      });
+      summary[classifyReissueNotification(notification)]++;
+    } catch (err) {
+      const failureReason = safeError(err?.message || "whatsapp_send_failed");
+      await updateAuthorizationNotification({
+        authorizationId,
+        status: "failed",
+        errorMessage: failureReason,
+      });
+      error("admin_reissue_whatsapp_failed", {
+        authorization_id: authorizationId,
+        draw_id: id,
+        admin_user_id: adminUserId || null,
+        reason: failureReason,
+      });
+      summary.failed++;
+    }
+  }
+
+  log("admin_reissue_resend_completed", {
+    admin_user_id: adminUserId || null,
+    draw_id: id,
+    pending_found: summary.pending_found,
+    amount_corrected: summary.amount_corrected,
+    sent: summary.sent,
+    skipped:
+      summary.skipped_consent +
+      summary.skipped_notifications_disabled +
+      summary.skipped_near_expiration +
+      summary.skipped_reservation_unavailable +
+      summary.skipped_already_charged +
+      summary.skipped_whatsapp_disabled +
+      summary.skipped_template_missing +
+      summary.skipped_other,
+    failed: summary.failed,
+  });
+
+  return summary;
 }
 
 async function getAuthorizationByToken(token) {
@@ -1892,6 +2209,7 @@ export default {
   lookupCaptivePreauthForUser,
   authorizeCaptivePreauthForUser,
   declineCaptivePreauthForUser,
+  reissueAndResendPendingCaptivePreauths,
   chargeAuthorizedCaptivePreauth,
   expirePendingCaptivePreauths,
   isCaptivePreauthEnabled,
