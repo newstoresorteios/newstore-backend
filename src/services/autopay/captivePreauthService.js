@@ -274,6 +274,18 @@ async function getDrawPriceCents(draw) {
   throw err;
 }
 
+async function resolveDrawAmountCents(draw, options = {}) {
+  const hasExplicitAmount = options.amountCents !== undefined && options.amountCents !== null;
+  const amountCents = hasExplicitAmount ? toPositiveInt(options.amountCents) : await getDrawPriceCents(draw);
+  if (!amountCents) {
+    const err = new Error("invalid_ticket_price");
+    err.status = 400;
+    err.draw_id = Number(draw?.id);
+    throw err;
+  }
+  return amountCents;
+}
+
 async function listActiveCaptives() {
   const profileColumns = await query(
     `SELECT 1
@@ -891,7 +903,7 @@ async function releasePendingCaptiveReservationForAuthorization(authorization) {
 export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}) {
   const adminUserId = options.adminUserId != null ? Number(options.adminUserId) : null;
   const draw = await getDraw(drawId);
-  const amountCents = await getDrawPriceCents(draw);
+  const amountCents = await resolveDrawAmountCents(draw, options);
   const defaultAmountCents = getDefaultAuthorizedBaseAmountCents();
   const preauthRequiredByDrawAmount = shouldRequireCaptivePreauth({
     currentAmountCents: amountCents,
@@ -1473,6 +1485,124 @@ export async function lookupCaptivePreauthPublic({ email, phone }) {
   return { ok: true, items };
 }
 
+function normalizeUserId(value) {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+async function userHasCaptiveNumber(userId) {
+  const id = normalizeUserId(userId);
+  if (!id) return false;
+  const result = await query(
+    `SELECT 1
+      FROM public.autopay_profiles ap
+       JOIN public.autopay_numbers an ON an.autopay_id = ap.id
+      WHERE ap.user_id = $1
+        AND ap.active = true
+        AND an.active = true
+      LIMIT 1`,
+    [id]
+  );
+  return result.rowCount > 0;
+}
+
+export async function lookupCaptivePreauthForUser(userId) {
+  const id = normalizeUserId(userId);
+  if (!id) return { ok: true, has_captive: false, items: [] };
+
+  await expirePendingCaptivePreauths();
+
+  const hasCaptive = await userHasCaptiveNumber(id);
+  if (!hasCaptive) {
+    return { ok: true, has_captive: false, items: [] };
+  }
+
+  const result = await query(
+    `SELECT id, draw_id, user_id, captive_number, amount_cents, status, expires_at
+       FROM public.autopay_draw_authorizations
+      WHERE user_id = $1
+        AND status = 'pending'
+        AND expires_at > now()
+      ORDER BY expires_at ASC, created_at ASC`,
+    [id]
+  );
+  const rows = result.rows || [];
+  const items = await Promise.all(
+    rows.map(async (row) => ({
+      id: String(row.id),
+      draw_id: Number(row.draw_id),
+      draw_title: (await publicAuthorization(row))?.draw_title || `Sorteio #${row.draw_id}`,
+      captive_number: Number(row.captive_number),
+      amount_cents: Number(row.amount_cents),
+      amount: formatAmountBRL(row.amount_cents),
+      status: safeStatus(row.status),
+      expires_at: row.expires_at instanceof Date ? row.expires_at.toISOString() : row.expires_at,
+    }))
+  );
+
+  log("account_lookup", {
+    user_id: id,
+    has_captive: true,
+    pending_count: items.length,
+  });
+  return { ok: true, has_captive: true, items };
+}
+
+async function getAuthorizationForUserDecision({ userId, authorizationId }) {
+  await expirePendingCaptivePreauths();
+  const id = normalizeUserId(userId);
+  const authId = String(authorizationId || "").trim();
+  if (!id || !UUID_RE.test(authId)) return { row: null };
+  const result = await query(
+    `SELECT *
+       FROM public.autopay_draw_authorizations
+      WHERE id = $1
+        AND user_id = $2
+      LIMIT 1`,
+    [authId, id]
+  );
+  return { row: result.rows?.[0] || null };
+}
+
+export async function authorizeCaptivePreauthForUser({ userId, authorizationId }) {
+  const { row } = await getAuthorizationForUserDecision({ userId, authorizationId });
+  if (!row) {
+    log("account_authorize_not_found", {
+      user_id: normalizeUserId(userId),
+      authorization_id: authorizationId || null,
+    });
+    return { ok: false, code: "authorization_not_found", status: "not_found" };
+  }
+  const result = await applyAuthorizationDecision(row, "authorize", "account");
+  const finalResult = await chargeAfterAuthorizationIfEnabled(result, "account");
+  log("account_authorize", {
+    user_id: Number(row.user_id),
+    authorization_id: row.id,
+    status: finalResult.status,
+    already_decided: finalResult.already_decided === true,
+  });
+  return finalResult;
+}
+
+export async function declineCaptivePreauthForUser({ userId, authorizationId }) {
+  const { row } = await getAuthorizationForUserDecision({ userId, authorizationId });
+  if (!row) {
+    log("account_decline_not_found", {
+      user_id: normalizeUserId(userId),
+      authorization_id: authorizationId || null,
+    });
+    return { ok: false, code: "authorization_not_found", status: "not_found" };
+  }
+  const result = await applyAuthorizationDecision(row, "decline", "account");
+  log("account_decline", {
+    user_id: Number(row.user_id),
+    authorization_id: row.id,
+    status: result.status,
+    already_decided: result.already_decided === true,
+  });
+  return result;
+}
+
 async function getPublicAuthorizationForDecision({ email, phone, authorizationId }) {
   await expirePendingCaptivePreauths();
   const user = await lookupPublicUser({ email, phone });
@@ -1699,9 +1829,9 @@ export function isCaptivePreauthEnabled() {
   return envBool("CAPTIVE_PREAUTH_ENABLED", false);
 }
 
-export async function resolveCaptivePreauthDrawRequirement(drawId) {
+export async function resolveCaptivePreauthDrawRequirement(drawId, options = {}) {
   const draw = await getDraw(drawId);
-  const drawTicketPriceCents = await getDrawPriceCents(draw);
+  const drawTicketPriceCents = await resolveDrawAmountCents(draw, options);
   const defaultAmountCents = getDefaultAuthorizedBaseAmountCents();
   return {
     draw_id: Number(draw.id),
@@ -1759,6 +1889,9 @@ export default {
   lookupCaptivePreauthPublic,
   authorizeCaptivePreauthPublic,
   declineCaptivePreauthPublic,
+  lookupCaptivePreauthForUser,
+  authorizeCaptivePreauthForUser,
+  declineCaptivePreauthForUser,
   chargeAuthorizedCaptivePreauth,
   expirePendingCaptivePreauths,
   isCaptivePreauthEnabled,

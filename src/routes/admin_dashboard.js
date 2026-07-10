@@ -17,12 +17,12 @@ function log(...a) {
   console.log("[admin/dashboard]", ...a);
 }
 
-async function createCaptivePreauthIfEnabled(drawId, adminUserId, context) {
+async function createCaptivePreauthIfEnabled(drawId, adminUserId, context, amountCents) {
   if (!isCaptivePreauthEnabled()) {
     return { ok: true, skipped: true, reason: "captive_preauth_disabled" };
   }
   try {
-    const requirement = await resolveCaptivePreauthDrawRequirement(drawId);
+    const requirement = await resolveCaptivePreauthDrawRequirement(drawId, { amountCents });
     if (!requirement.required) {
       return {
         ok: true,
@@ -31,7 +31,7 @@ async function createCaptivePreauthIfEnabled(drawId, adminUserId, context) {
         ...requirement,
       };
     }
-    return await createCaptivePreAuthorizationsForDraw(drawId, { adminUserId });
+    return await createCaptivePreAuthorizationsForDraw(drawId, { adminUserId, amountCents });
   } catch (error) {
     console.error(`[${context}] captive preauth failed`, {
       draw_id: drawId,
@@ -186,6 +186,11 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     if (!Number.isInteger(numberCount) || numberCount <= 0 || numberCount > 10000) {
       return res.status(400).json({ error: "invalid_number_count" });
     }
+    const ticketPriceCents = Number(req.body?.ticket_price_cents);
+    if (!Number.isInteger(ticketPriceCents) || ticketPriceCents <= 0) {
+      return res.status(400).json({ error: "invalid_ticket_price" });
+    }
+    const principalTicketPriceCents = await setTicketPriceCents(ticketPriceCents);
 
     // fecha os abertos anteriores
     await query(
@@ -216,13 +221,15 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     const captivePreauth = await createCaptivePreauthIfEnabled(
       newId,
       req.user?.id ?? null,
-      "admin/dashboard/new"
+      "admin/dashboard/new",
+      principalTicketPriceCents
     );
     if (!captivePreauth?.ok) {
       return res.status(500).json({
         ok: false,
         error: "captive_preauth_create_failed",
         draw_id: newId,
+        ticket_price_cents: principalTicketPriceCents,
         sold: 0,
         remaining: numberCount,
         captive_preauth: captivePreauth,
@@ -234,11 +241,27 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     // resposta inclui o resultado do autopay para depuração
     if (!autopay?.ok) {
       console.warn("[admin/dashboard] autopay falhou", autopay);
-      return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: numberCount, captive_preauth: captivePreauth, autopay });
+      return res.status(500).json({
+        ok: false,
+        draw_id: newId,
+        ticket_price_cents: principalTicketPriceCents,
+        sold: 0,
+        remaining: numberCount,
+        captive_preauth: captivePreauth,
+        autopay,
+      });
     }
 
     await emitAdminNewDrawPublished(newId);
-    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: numberCount, captive_preauth: captivePreauth, autopay });
+    return res.json({
+      ok: true,
+      draw_id: newId,
+      ticket_price_cents: principalTicketPriceCents,
+      sold: 0,
+      remaining: numberCount,
+      captive_preauth: captivePreauth,
+      autopay,
+    });
   } catch (e) {
     console.error("[admin/dashboard] /new error:", e);
     return res.status(500).json({ error: "new_draw_failed" });
