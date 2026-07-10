@@ -2444,6 +2444,264 @@ export async function setCurrentDrawCaptiveParticipation({
   };
 }
 
+async function hasCaptivePreauthChargeInProgress(authorization, pgClient) {
+  const result = await pgClient.query(
+    `SELECT 1
+       FROM public.autopay_runs
+      WHERE draw_id = $1
+        AND user_id = $2
+        AND lower(coalesce(status, '')) IN ('attempt', 'reserved', 'billed', 'charged')
+        AND (
+          provider_request->>'authorization_id' = $3
+          OR $4::smallint = ANY(coalesce(tried_numbers, '{}'::smallint[]))
+        )
+      LIMIT 1`,
+    [
+      Number(authorization.draw_id),
+      Number(authorization.user_id),
+      String(authorization.id),
+      Number(authorization.captive_number),
+    ]
+  );
+  return result.rowCount > 0;
+}
+
+export async function authorizeCurrentDrawCaptivePreauthForAdmin({
+  authorizationId,
+  drawId,
+  adminUserId,
+}) {
+  const authId = String(authorizationId || "").trim();
+  const requestedDrawId = toPositiveInt(drawId);
+  const adminId = toPositiveInt(adminUserId);
+  if (!UUID_RE.test(authId)) throw captiveAdminError("participation_not_found", 404);
+  if (!requestedDrawId) throw captiveAdminError("invalid_draw_id", 400);
+  if (!adminId) throw captiveAdminError("invalid_admin_user", 400);
+
+  const context = await getCurrentCaptiveDrawContext();
+  if (!context.draw) throw captiveAdminError("current_principal_draw_not_found", 404);
+  if (context.draw_id !== requestedDrawId) throw captiveAdminError("draw_not_current_principal", 409);
+  if (!context.preauth_required) throw captiveAdminError("captive_preauth_not_required", 409);
+
+  const pool = await getPool();
+  const client = await pool.connect();
+  let authorization = null;
+  let auditEvent = null;
+  let autopayNumberId = null;
+  let decision = null;
+
+  try {
+    await client.query("BEGIN");
+    const lockedDraw = await client.query(
+      `SELECT id, status, draw_type
+         FROM public.draws
+        WHERE id = $1
+        FOR UPDATE`,
+      [context.draw_id]
+    );
+    const draw = lockedDraw.rows?.[0] || null;
+    if (
+      !draw ||
+      String(draw.status || "").toLowerCase() !== "open" ||
+      String(draw.draw_type || "principal").toLowerCase() !== "principal"
+    ) {
+      throw captiveAdminError("current_principal_draw_changed", 409);
+    }
+
+    const authorizationResult = await client.query(
+      `SELECT *
+         FROM public.autopay_draw_authorizations
+        WHERE id = $1
+          AND draw_id = $2
+        FOR UPDATE`,
+      [authId, context.draw_id]
+    );
+    authorization = authorizationResult.rows?.[0] || null;
+    if (!authorization) throw captiveAdminError("participation_not_found", 404);
+
+    const captiveResult = await client.query(
+      `SELECT an.id AS autopay_number_id,
+              an.n AS captive_number,
+              an.active AS number_active,
+              ap.user_id,
+              ap.active AS profile_active
+         FROM public.autopay_profiles ap
+         JOIN public.autopay_numbers an
+           ON an.autopay_id = ap.id
+          AND an.n = $3
+          AND ($4::uuid IS NULL OR an.id = $4::uuid)
+        WHERE ap.id = $1
+          AND ap.user_id = $2
+        LIMIT 1
+        FOR UPDATE OF ap, an`,
+      [
+        authorization.autopay_profile_id,
+        Number(authorization.user_id),
+        Number(authorization.captive_number),
+        authorization.autopay_number_id || null,
+      ]
+    );
+    const captive = captiveResult.rows?.[0] || null;
+    if (
+      !captive ||
+      captive.profile_active !== true ||
+      captive.number_active !== true ||
+      Number(captive.user_id) !== Number(authorization.user_id) ||
+      Number(captive.captive_number) !== Number(authorization.captive_number)
+    ) {
+      throw captiveAdminError("captive_number_not_available_for_user", 409);
+    }
+    autopayNumberId = String(captive.autopay_number_id);
+
+    const overrideResult = await client.query(
+      `SELECT enabled
+         FROM public.autopay_draw_captive_overrides
+        WHERE draw_id = $1
+          AND autopay_number_id = $2
+        FOR UPDATE`,
+      [context.draw_id, autopayNumberId]
+    );
+    if (overrideResult.rows?.[0]?.enabled === false) {
+      throw captiveAdminError("participation_disabled_current_draw", 409);
+    }
+
+    const existingAudit = await client.query(
+      `SELECT authorization_source, admin_user_id, created_at
+         FROM public.captive_preauth_authorization_events
+        WHERE authorization_id = $1
+          AND authorization_source = 'admin'
+          AND new_status = 'authorized'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [authorization.id]
+    );
+    const previousAdminEvent = existingAudit.rows?.[0] || null;
+    const status = safeStatus(authorization.status);
+    const paymentApproved =
+      await hasCompletedCaptivePreauthCharge(authorization.id, { pgClient: client }) ||
+      await hasApprovedPaymentForAuthorization(authorization, { pgClient: client });
+
+    if (status === "charged" || paymentApproved) {
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        code: "already_charged",
+        already_decided: true,
+        status,
+        charged: true,
+        payment_status: "paid",
+        participation_status: "confirmed",
+        authorization,
+        autopay_number_id: autopayNumberId,
+        authorization_source: previousAdminEvent ? "admin" : "client",
+        authorized_by_admin_id: previousAdminEvent?.admin_user_id || null,
+        authorized_at: previousAdminEvent?.created_at || authorization.authorized_at || null,
+      };
+    }
+    if (status === "authorized") {
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        code: "already_authorized",
+        already_decided: true,
+        status,
+        charged: false,
+        payment_status: "pending",
+        participation_status: "confirmed",
+        authorization,
+        autopay_number_id: autopayNumberId,
+        authorization_source: previousAdminEvent ? "admin" : "client",
+        authorized_by_admin_id: previousAdminEvent?.admin_user_id || null,
+        authorized_at: previousAdminEvent?.created_at || authorization.authorized_at || null,
+      };
+    }
+    if (status === "declined") throw captiveAdminError("participation_declined_by_customer", 409);
+    if (status === "expired") throw captiveAdminError("authorization_expired", 410);
+    if (status === "failed") throw captiveAdminError("payment_failed_retry_required", 409);
+    if (status !== "pending") throw captiveAdminError("participation_not_pending", 409);
+
+    const expiresAt = authorization.expires_at ? new Date(authorization.expires_at).getTime() : null;
+    if (!expiresAt || expiresAt <= Date.now()) throw captiveAdminError("authorization_expired", 410);
+    if (Number(authorization.amount_cents) !== Number(context.official_amount_cents)) {
+      throw captiveAdminError("authorization_amount_outdated", 409);
+    }
+    if (await hasCaptivePreauthChargeInProgress(authorization, client)) {
+      throw captiveAdminError("payment_in_progress", 409);
+    }
+
+    const reservation = await lockCaptivePreauthReservation(client, authorization);
+    if (!reservation.ok) {
+      throw captiveAdminError("captive_number_not_available_for_user", 409);
+    }
+
+    decision = await applyAuthorizationDecision(authorization, "authorize", "admin", { pgClient: client });
+    if (!decision.ok || decision.code !== "authorized_success") {
+      throw captiveAdminError(decision.code || "admin_authorization_failed", 409);
+    }
+
+    const insertedAudit = await client.query(
+      `INSERT INTO public.captive_preauth_authorization_events (
+          authorization_id,
+          draw_id,
+          user_id,
+          autopay_number_id,
+          captive_number,
+          amount_cents,
+          previous_status,
+          new_status,
+          authorization_source,
+          admin_user_id,
+          origin
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'authorized', 'admin', $8, 'admin_panel')
+        RETURNING id, authorization_source, admin_user_id, created_at`,
+      [
+        authorization.id,
+        Number(authorization.draw_id),
+        Number(authorization.user_id),
+        autopayNumberId,
+        Number(authorization.captive_number),
+        Number(authorization.amount_cents),
+        status,
+        adminId,
+      ]
+    );
+    auditEvent = insertedAudit.rows?.[0] || null;
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const chargedResult = await chargeAfterAuthorizationIfEnabled(decision, "admin");
+  const paymentStatus = chargedResult.charged === true
+    ? "paid"
+    : chargedResult.status === "failed" ? "failed" : "pending";
+  log("admin_authorization_completed", {
+    authorization_id: authorization.id,
+    draw_id: Number(authorization.draw_id),
+    user_id: Number(authorization.user_id),
+    captive_number: Number(authorization.captive_number),
+    admin_user_id: adminId,
+    authorization_source: "admin",
+    status: chargedResult.status,
+    charged: chargedResult.charged === true,
+  });
+  return {
+    ...chargedResult,
+    autopay_number_id: autopayNumberId,
+    authorization_source: "admin",
+    authorized_by_admin_id: adminId,
+    authorized_at: auditEvent?.created_at || decision.authorization?.authorized_at || null,
+    participation_status: ["authorized", "charged"].includes(chargedResult.status) ? "confirmed" : "payment_failed",
+    payment_status: paymentStatus,
+    audit_event_id: auditEvent?.id ? String(auditEvent.id) : null,
+  };
+}
+
 async function getAuthorizationByToken(token) {
   const tokenHash = hashToken(token);
   if (!tokenHash) return null;
@@ -2505,8 +2763,9 @@ function alreadyDecidedResponse(row) {
   };
 }
 
-async function expireAuthorization(row) {
-  const updated = await query(
+async function expireAuthorization(row, options = {}) {
+  const runQuery = options.pgClient ? options.pgClient.query.bind(options.pgClient) : query;
+  const updated = await runQuery(
     `UPDATE public.autopay_draw_authorizations
         SET status = 'expired',
             expired_at = COALESCE(expired_at, now()),
@@ -2851,7 +3110,7 @@ export async function declineCaptivePreauthPublic({ email, phone, authorizationI
   return result;
 }
 
-async function applyAuthorizationDecision(row, decision, source = "token") {
+async function applyAuthorizationDecision(row, decision, source = "token", options = {}) {
   if (!row) {
     const code = source === "confirmation_code" ? "invalid_confirmation_code" : "token_invalid";
     warn(source === "confirmation_code" ? "confirmation_code_invalid" : "token_invalid", {
@@ -2878,7 +3137,8 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
       return recoverFailedAuthorizationForRetry(row, source);
     }
     if (decision === "decline") {
-      const updated = await query(
+      const runQuery = options.pgClient ? options.pgClient.query.bind(options.pgClient) : query;
+      const updated = await runQuery(
         `UPDATE public.autopay_draw_authorizations
             SET status = 'declined',
                 declined_at = now(),
@@ -2890,11 +3150,15 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
       );
       const out = updated.rows?.[0] || null;
       if (!out) {
-        const current = await getAuthorizationById(row.id);
+        const currentResult = await runQuery(
+          `SELECT * FROM public.autopay_draw_authorizations WHERE id = $1 LIMIT 1`,
+          [row.id]
+        );
+        const current = currentResult.rows?.[0] || null;
         return alreadyDecidedResponse(current || row);
       }
       try {
-        await releasePendingCaptiveReservationForAuthorization(out);
+        await releasePendingCaptiveReservationForAuthorization(out, { pgClient: options.pgClient });
       } catch (err) {
         warn("reservation_release_failed", {
           authorization_id: row.id,
@@ -2912,7 +3176,7 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
   }
 
   if (new Date(row.expires_at).getTime() <= Date.now()) {
-    const expired = await expireAuthorization(row);
+    const expired = await expireAuthorization(row, { pgClient: options.pgClient });
     warn(source === "confirmation_code" ? "confirmation_code_expired" : "token_expired", {
       authorization_id: row.id,
       draw_id: Number(row.draw_id),
@@ -2930,7 +3194,8 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
   const isAuthorize = decision === "authorize";
   const nextStatus = isAuthorize ? "authorized" : "declined";
   const atColumn = isAuthorize ? "authorized_at" : "declined_at";
-  const updated = await query(
+  const runQuery = options.pgClient ? options.pgClient.query.bind(options.pgClient) : query;
+  const updated = await runQuery(
     `UPDATE public.autopay_draw_authorizations
         SET status = $2,
             ${atColumn} = now(),
@@ -2942,7 +3207,11 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
   );
   const out = updated.rows?.[0] || null;
   if (!out) {
-    const current = await getAuthorizationById(row.id);
+    const currentResult = await runQuery(
+      `SELECT * FROM public.autopay_draw_authorizations WHERE id = $1 LIMIT 1`,
+      [row.id]
+    );
+    const current = currentResult.rows?.[0] || null;
     return alreadyDecidedResponse(current || row);
   }
 
@@ -2954,7 +3223,7 @@ async function applyAuthorizationDecision(row, decision, source = "token") {
   });
   if (!isAuthorize) {
     try {
-      await releasePendingCaptiveReservationForAuthorization(out);
+      await releasePendingCaptiveReservationForAuthorization(out, { pgClient: options.pgClient });
     } catch (err) {
       warn("reservation_release_failed", {
         authorization_id: row.id,
@@ -3265,6 +3534,7 @@ export default {
   lookupCaptivePreauthForUser,
   authorizeCaptivePreauthForUser,
   declineCaptivePreauthForUser,
+  authorizeCurrentDrawCaptivePreauthForAdmin,
   getCurrentCaptiveDrawContext,
   setCurrentDrawCaptiveParticipation,
   reissueAndResendPendingCaptivePreauths,

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import {
+  authorizeCurrentDrawCaptivePreauthForAdmin,
   getCurrentCaptiveDrawContext,
   setCurrentDrawCaptiveParticipation,
 } from "../services/autopay/captivePreauthService.js";
@@ -23,6 +24,24 @@ const CARD_READY_SQL = "(ap.vindi_customer_id IS NOT NULL AND ap.vindi_payment_p
 const HISTORY_STATUSES = new Set(["accepted", "sent", "delivered", "skipped", "failed"]);
 const HISTORY_ATTEMPT_TYPES = new Set(["initial", "reissue", "manual_activation"]);
 const PARTICIPATION_FILTERS = new Set(["all", "enabled", "disabled", "pending", "confirmed", "failed"]);
+const ADMIN_AUTHORIZATION_ERROR_CODES = new Set([
+  "participation_not_found",
+  "invalid_draw_id",
+  "invalid_admin_user",
+  "current_principal_draw_not_found",
+  "draw_not_current_principal",
+  "current_principal_draw_changed",
+  "captive_preauth_not_required",
+  "captive_number_not_available_for_user",
+  "participation_disabled_current_draw",
+  "participation_declined_by_customer",
+  "authorization_expired",
+  "payment_failed_retry_required",
+  "participation_not_pending",
+  "authorization_amount_outdated",
+  "payment_in_progress",
+  "admin_authorization_failed",
+]);
 
 function getDefaultAmountCents() {
   const n = Number(process.env.CAPTIVE_AUTOPAY_DEFAULT_AMOUNT_CENTS);
@@ -69,6 +88,30 @@ function maskHistoryPhone(phone) {
     return `+${digits.slice(0, 2)} ${digits.slice(2, 4)} *****-${last4}`;
   }
   return `*****-${last4}`;
+}
+
+function adminAuthorizationMessage(code) {
+  return {
+    participation_not_found: "Participação não encontrada.",
+    current_principal_draw_not_found: "Nenhum sorteio principal está aberto.",
+    draw_not_current_principal: "A participação não pertence ao sorteio principal atual.",
+    captive_preauth_not_required: "O sorteio atual utiliza o fluxo automático padrão.",
+    captive_number_not_available_for_user: "O número cativo não está disponível para este usuário.",
+    participation_disabled_current_draw: "O número cativo está desativado neste sorteio.",
+    participation_declined_by_customer: "O cliente recusou esta participação. É necessário reabrir a autorização antes de confirmar administrativamente.",
+    authorization_expired: "O prazo desta autorização expirou.",
+    payment_failed_retry_required: "A cobrança anterior falhou. É necessária uma nova confirmação antes de tentar novamente.",
+    participation_not_pending: "Esta participação não está pendente de confirmação.",
+    authorization_amount_outdated: "O valor da autorização está desatualizado. Reemita a confirmação antes de autorizar.",
+    payment_in_progress: "Já existe uma cobrança em processamento para esta participação.",
+    payment_failed: "A autorização foi registrada, mas a cobrança não foi aprovada.",
+    authorization_charge_not_configured: "A autorização foi registrada, mas o cartão não está disponível para cobrança.",
+  }[code] || "Não foi possível autorizar a cobrança.";
+}
+
+function normalizeAdminAuthorizationErrorCode(value) {
+  const code = String(value || "").trim();
+  return ADMIN_AUTHORIZATION_ERROR_CODES.has(code) ? code : "admin_authorization_failed";
 }
 
 function normalizeConsentStatus(status) {
@@ -426,7 +469,9 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
   if (normalizedStatus === "enabled") where.push("COALESCE(draw_override.enabled, true) = true");
   if (normalizedStatus === "disabled") where.push("COALESCE(draw_override.enabled, true) = false");
   if (normalizedStatus === "pending") where.push("LOWER(COALESCE(auth.status, '')) = 'pending'");
-  if (normalizedStatus === "confirmed") where.push(APPROVED_PARTICIPATION_SQL);
+  if (normalizedStatus === "confirmed") {
+    where.push(`(${APPROVED_PARTICIPATION_SQL} OR LOWER(COALESCE(auth.status, '')) = 'authorized')`);
+  }
   if (normalizedStatus === "failed") where.push("LOWER(COALESCE(auth.status, '')) = 'failed'");
   const whereSql = `WHERE ${where.join(" AND ")}`;
   const fromSql = `
@@ -441,6 +486,14 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
      AND auth.user_id = ap.user_id
      AND auth.captive_number = an.n
      AND (auth.autopay_number_id = an.id OR auth.autopay_number_id IS NULL)
+    LEFT JOIN LATERAL (
+      SELECT authorization_source, admin_user_id, created_at
+        FROM public.captive_preauth_authorization_events authorization_event
+       WHERE authorization_event.authorization_id = auth.id
+         AND authorization_event.new_status = 'authorized'
+       ORDER BY authorization_event.created_at DESC
+       LIMIT 1
+    ) latest_authorization_event ON true
     LEFT JOIN public.numbers draw_number
       ON draw_number.draw_id = $1
      AND draw_number.n = an.n
@@ -466,10 +519,32 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
             auth.expires_at AS authorization_expires_at,
             auth.notification_status,
             auth.notification_error,
+            latest_authorization_event.authorization_source,
+            latest_authorization_event.admin_user_id AS authorized_by_admin_id,
+            latest_authorization_event.created_at AS admin_authorized_at,
             draw_number.status AS draw_number_status,
             draw_number.reservation_id,
             reservation.status AS reservation_status,
             ${APPROVED_PARTICIPATION_SQL} AS payment_approved,
+            EXISTS (
+              SELECT 1
+                FROM public.autopay_runs run_in_progress
+               WHERE run_in_progress.draw_id = auth.draw_id
+                 AND run_in_progress.user_id = auth.user_id
+                 AND LOWER(COALESCE(run_in_progress.status, '')) IN ('attempt', 'reserved', 'billed', 'charged')
+                 AND (
+                   run_in_progress.provider_request->>'authorization_id' = auth.id::text
+                   OR an.n = ANY(COALESCE(run_in_progress.tried_numbers, '{}'::smallint[]))
+                 )
+            ) AS payment_in_progress,
+            (
+              LOWER(COALESCE(draw_number.status, '')) = 'reserved'
+              AND draw_number.reservation_id IS NOT NULL
+              AND LOWER(COALESCE(reservation.status, '')) IN ('pending', 'active', 'reserved', '')
+              AND (reservation.expires_at IS NULL OR reservation.expires_at > now())
+              AND reservation.user_id = auth.user_id
+              AND an.n::integer = ANY(reservation.numbers)
+            ) AS reservation_valid,
             (
               LOWER(COALESCE(auth.status, '')) = 'failed'
               AND auth.expires_at > now()
@@ -525,13 +600,23 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
     items: (rows.rows || []).map((row) => {
       const enabledCurrentDraw = row.enabled_current_draw === true;
       const authorizationStatus = String(row.authorization_status || "").toLowerCase() || null;
+      const authorizationSource = row.authorization_source || (
+        ["authorized", "charged"].includes(authorizationStatus) || row.payment_approved === true
+          ? "client"
+          : null
+      );
       let participationState = "no_authorization";
       if (!enabledCurrentDraw) participationState = "disabled";
-      else if (row.payment_approved === true) participationState = "confirmed";
+      else if (row.payment_approved === true || authorizationStatus === "charged") {
+        participationState = authorizationSource === "admin" ? "confirmed_admin" : "confirmed_client";
+      }
+      else if (row.payment_in_progress === true) participationState = "payment_processing";
+      else if (authorizationStatus === "authorized") {
+        participationState = authorizationSource === "admin" ? "confirmed_admin" : "confirmed_client";
+      }
       else if (authorizationStatus === "pending") participationState = "pending";
       else if (authorizationStatus === "failed" && row.failed_retryable === true) participationState = "failed_retryable";
       else if (authorizationStatus === "failed") participationState = "failed";
-      else if (authorizationStatus === "authorized") participationState = "authorized";
       else if (authorizationStatus === "declined") participationState = "declined";
       else if (authorizationStatus === "expired") participationState = "expired";
       return {
@@ -546,6 +631,9 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
         participation_state: participationState,
         authorization_id: row.authorization_id ? String(row.authorization_id) : null,
         authorization_status: authorizationStatus,
+        authorization_source: authorizationSource,
+        authorized_by_admin_id: row.authorized_by_admin_id == null ? null : Number(row.authorized_by_admin_id),
+        authorized_at: row.admin_authorized_at || null,
         reservation_id: row.reservation_id ? String(row.reservation_id) : null,
         reservation_status: row.reservation_status || null,
         draw_number_status: row.draw_number_status || null,
@@ -554,7 +642,23 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
         authorization_amount_cents: row.authorization_amount_cents == null ? null : Number(row.authorization_amount_cents),
         authorization_expires_at: row.authorization_expires_at || null,
         payment_approved: row.payment_approved === true,
+        payment_in_progress: row.payment_in_progress === true,
+        payment_status: row.payment_approved === true || authorizationStatus === "charged"
+          ? "paid"
+          : row.payment_in_progress === true || authorizationStatus === "authorized"
+            ? "processing"
+            : authorizationStatus === "failed" ? "failed" : "pending",
         retryable: row.failed_retryable === true,
+        can_admin_authorize:
+          context.preauth_required === true &&
+          enabledCurrentDraw &&
+          authorizationStatus === "pending" &&
+          row.payment_approved !== true &&
+          row.payment_in_progress !== true &&
+          row.reservation_valid === true &&
+          Number(row.authorization_amount_cents) === Number(context.official_amount_cents) &&
+          Boolean(row.authorization_expires_at) &&
+          new Date(row.authorization_expires_at).getTime() > Date.now(),
       };
     }),
   };
@@ -576,6 +680,60 @@ router.get("/current-draw-participation", requireAuth, requireAdmin, async (req,
       code: error?.code || null,
     });
     return res.status(500).json({ ok: false, error: "current_draw_participation_failed" });
+  }
+});
+
+router.post("/current-draw-participation/:authorizationId/authorize", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await authorizeCurrentDrawCaptivePreauthForAdmin({
+      authorizationId: req.params.authorizationId,
+      drawId: req.body?.draw_id,
+      adminUserId: req.user?.id,
+    });
+    const refreshed = result.autopay_number_id
+      ? await loadCurrentDrawParticipation({
+          autopayNumberId: result.autopay_number_id,
+          page: 1,
+          limit: 1,
+        })
+      : null;
+    if (!result.ok) {
+      return res.status(402).json({
+        ...result,
+        error: result.code || "payment_failed",
+        message: adminAuthorizationMessage(result.code || "payment_failed"),
+        item: refreshed?.items?.[0] || null,
+      });
+    }
+    console.log(`${LOG_PREFIX} current_draw_participation_authorized`, {
+      admin_user_id: req.user?.id || null,
+      authorization_id: req.params.authorizationId,
+      draw_id: Number(req.body?.draw_id),
+      authorization_source: result.authorization_source,
+      status: result.status,
+      charged: result.charged === true,
+      already_decided: result.already_decided === true,
+    });
+    return res.json({
+      success: true,
+      ...result,
+      item: refreshed?.items?.[0] || null,
+    });
+  } catch (error) {
+    const rawCode = error?.message || "admin_authorization_failed";
+    const code = normalizeAdminAuthorizationErrorCode(rawCode);
+    console.error(`${LOG_PREFIX} current_draw_participation_authorize_failed`, {
+      admin_user_id: req.user?.id || null,
+      authorization_id: req.params?.authorizationId || null,
+      draw_id: req.body?.draw_id || null,
+      message: rawCode,
+      code: error?.code || null,
+    });
+    return res.status(error?.status || 500).json({
+      ok: false,
+      error: code,
+      message: adminAuthorizationMessage(code),
+    });
   }
 });
 
