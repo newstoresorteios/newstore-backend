@@ -765,6 +765,32 @@ router.get("/current-draw-participation", requireAuth, requireAdmin, async (req,
       message: error?.message || null,
       code: error?.code || null,
     });
+    const migrationErrorHints = [
+      "autopay_draw_captive_overrides",
+      "captive_preauth_authorization_events",
+      "draw_override",
+      "authorization_event",
+      "latest_authorization_event",
+    ];
+    const errorContext = [
+      error?.message,
+      error?.table,
+      error?.column,
+      error?.relation,
+    ].filter(Boolean).join(" ").toLowerCase();
+    const isRequiredMigrationError =
+      ["42P01", "42703"].includes(error?.code) &&
+      migrationErrorHints.some((hint) => errorContext.includes(hint));
+    if (isRequiredMigrationError) {
+      return res.status(503).json({
+        ok: false,
+        error: "database_migration_required",
+        required_migrations: [
+          "023_captive_admin_controls.sql",
+          "024_captive_preauth_authorization_audit.sql",
+        ],
+      });
+    }
     return res.status(500).json({ ok: false, error: "current_draw_participation_failed" });
   }
 });
