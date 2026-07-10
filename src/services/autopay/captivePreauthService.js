@@ -22,6 +22,8 @@ const AUTOPAY_BASE_AMOUNT_COLUMNS = [
   "default_amount_cents",
   "amount_cents",
 ];
+const NOTIFICATION_ATTEMPT_TYPES = new Set(["initial", "reissue", "manual_activation"]);
+const NOTIFICATION_ATTEMPT_STATUSES = new Set(["accepted", "sent", "delivered", "skipped", "failed"]);
 
 function log(event, extra = {}) {
   console.log(`${LOG_PREFIX} ${event}`, extra);
@@ -235,6 +237,18 @@ async function getDraw(drawId) {
   return result.rows[0];
 }
 
+async function getCurrentPrincipalDraw() {
+  const result = await query(
+    `SELECT *
+       FROM public.draws
+      WHERE status = 'open'
+        AND COALESCE(draw_type, 'principal') = 'principal'
+      ORDER BY opened_at DESC NULLS LAST, id DESC
+      LIMIT 1`
+  );
+  return result.rows?.[0] || null;
+}
+
 async function getDrawPriceCents(draw) {
   const drawId = Number(draw?.id);
   const columns = await query(
@@ -286,7 +300,98 @@ async function resolveDrawAmountCents(draw, options = {}) {
   return amountCents;
 }
 
-async function listActiveCaptives() {
+export async function getCurrentCaptiveDrawContext() {
+  const draw = await getCurrentPrincipalDraw();
+  if (!draw) {
+    return {
+      ok: true,
+      draw: null,
+      draw_id: null,
+      official_amount_cents: null,
+      default_amount_cents: getDefaultAuthorizedBaseAmountCents(),
+      preauth_required: false,
+    };
+  }
+  const officialAmountCents = await resolveDrawAmountCents(draw);
+  const defaultAmountCents = getDefaultAuthorizedBaseAmountCents();
+  return {
+    ok: true,
+    draw,
+    draw_id: Number(draw.id),
+    official_amount_cents: officialAmountCents,
+    default_amount_cents: defaultAmountCents,
+    preauth_required: shouldRequireCaptivePreauth({
+      currentAmountCents: officialAmountCents,
+      authorizedBaseAmountCents: defaultAmountCents,
+    }),
+  };
+}
+
+function normalizeNotificationAttemptStatus(value) {
+  const status = String(value || "").trim().toLowerCase();
+  if (NOTIFICATION_ATTEMPT_STATUSES.has(status)) return status;
+  if (["not_sent", "ignored"].includes(status)) return "skipped";
+  if (["read"].includes(status)) return "delivered";
+  return status ? "accepted" : "skipped";
+}
+
+function normalizeNotificationAttemptError(value, status = null) {
+  const raw = safeError(value || "", "").toLowerCase();
+  if (!raw) return normalizeNotificationAttemptStatus(status) === "failed" ? "provider_failed" : null;
+  if (raw.includes("consent")) return "whatsapp_consent_missing";
+  if (raw.includes("preauth_notifications_disabled")) return "preauth_notifications_disabled";
+  if (raw.includes("phone") || raw.includes("recipient") || raw.includes("telefone")) return "invalid_phone";
+  if (raw.includes("near_expiration")) return "skipped_near_expiration";
+  if (raw.includes("reservation")) return "reservation_unavailable";
+  if (raw.includes("payment") || raw.includes("charged")) return "payment_already_approved";
+  if (raw.includes("template")) return "whatsapp_template_missing";
+  if (raw.includes("whatsapp_disabled")) return "whatsapp_disabled";
+  if (normalizeNotificationAttemptStatus(status) === "failed") return "provider_failed";
+  return raw.slice(0, 180);
+}
+
+async function recordCaptivePreauthNotificationAttempt({
+  authorization,
+  attemptType,
+  templateId = null,
+  status,
+  errorCode = null,
+  providerDispatchId = null,
+}) {
+  if (!authorization?.id || !NOTIFICATION_ATTEMPT_TYPES.has(attemptType)) return null;
+  const attemptStatus = normalizeNotificationAttemptStatus(status);
+  const result = await query(
+    `INSERT INTO public.captive_preauth_notification_attempts (
+        authorization_id,
+        draw_id,
+        user_id,
+        captive_number,
+        amount_cents,
+        template_id,
+        attempt_type,
+        status,
+        error_code,
+        provider_dispatch_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::uuid)
+      RETURNING id`,
+    [
+      authorization.id,
+      Number(authorization.draw_id),
+      Number(authorization.user_id),
+      Number(authorization.captive_number),
+      Number(authorization.amount_cents),
+      templateId ? String(templateId) : null,
+      attemptType,
+      attemptStatus,
+      normalizeNotificationAttemptError(errorCode, attemptStatus),
+      providerDispatchId || null,
+    ]
+  );
+  return result.rows?.[0] || null;
+}
+
+async function listActiveCaptives(drawId = null) {
+  const currentDrawId = toPositiveInt(drawId);
   const profileColumns = await query(
     `SELECT 1
        FROM information_schema.columns
@@ -330,9 +435,14 @@ async function listActiveCaptives() {
       `SELECT COUNT(*)::int AS count
          FROM public.autopay_numbers an
          JOIN public.autopay_profiles ap ON ap.id = an.autopay_id
+         LEFT JOIN public.autopay_draw_captive_overrides draw_override
+           ON draw_override.draw_id = $1
+          AND draw_override.autopay_number_id = an.id
         WHERE ap.active = true
           AND an.active = true
-          AND COALESCE(an.preauth_notifications_enabled, true) = false`
+          AND COALESCE(draw_override.enabled, true) = true
+          AND COALESCE(an.preauth_notifications_enabled, true) = false`,
+      [currentDrawId]
     );
     skippedNotificationsDisabled = Number(skippedResult.rows?.[0]?.count || 0);
   }
@@ -351,9 +461,14 @@ async function listActiveCaptives() {
        FROM public.autopay_numbers an
        JOIN public.autopay_profiles ap ON ap.id = an.autopay_id
        JOIN public.users u ON u.id = ap.user_id
+       LEFT JOIN public.autopay_draw_captive_overrides draw_override
+         ON draw_override.draw_id = $1
+        AND draw_override.autopay_number_id = an.id
       WHERE ap.active = true
         AND an.active = true
-      ORDER BY an.n ASC, ap.user_id ASC`
+        AND COALESCE(draw_override.enabled, true) = true
+      ORDER BY an.n ASC, ap.user_id ASC`,
+    [currentDrawId]
   );
   log("active_captives_for_preauth", {
     selected: result.rows?.length || 0,
@@ -553,6 +668,22 @@ async function sendCaptivePreauthWhatsApp({
   const preResolvedRecipient = resolveRecipientForCurrentMode(captive.user_phone, {
     context: "captive_preauth",
   });
+  if (!preResolvedRecipient.ok) {
+    const reason = preResolvedRecipient.reason || "invalid_recipient";
+    await updateAuthorizationNotification({
+      authorizationId,
+      status: "skipped",
+      errorMessage: reason,
+    });
+    logWhatsAppSkipped({
+      drawId: draw.id,
+      userId,
+      captiveNumber,
+      reason,
+      templateId,
+    });
+    return { notification_status: "skipped", notification_error: reason, notification_dispatch_id: null };
+  }
   const dispatch = await createDispatch({
     eventKey: "captive_preauth_request",
     channel: "whatsapp",
@@ -671,7 +802,7 @@ async function markAuthorizationReservationFailed(authorizationId, reason) {
   return result.rows?.[0] || null;
 }
 
-async function createPendingCaptiveReservationForAuthorization(authorization) {
+async function createPendingCaptiveReservationForAuthorization(authorization, options = {}) {
   const drawId = Number(authorization?.draw_id);
   const userId = Number(authorization?.user_id);
   const captiveNumber = Number(authorization?.captive_number);
@@ -687,10 +818,17 @@ async function createPendingCaptiveReservationForAuthorization(authorization) {
     return { ok: false, reason: "invalid_authorization" };
   }
 
-  const pool = await getPool();
-  const client = await pool.connect();
+  const ownsTransaction = !options.pgClient;
+  const pool = ownsTransaction ? await getPool() : null;
+  const client = options.pgClient || await pool.connect();
+  const rollback = async () => {
+    if (ownsTransaction) await client.query("ROLLBACK");
+  };
+  const commit = async () => {
+    if (ownsTransaction) await client.query("COMMIT");
+  };
   try {
-    await client.query("BEGIN");
+    if (ownsTransaction) await client.query("BEGIN");
 
     const locked = await client.query(
       `SELECT n, status, reservation_id
@@ -701,13 +839,13 @@ async function createPendingCaptiveReservationForAuthorization(authorization) {
       [drawId, captiveNumber]
     );
     if (!locked.rowCount) {
-      await client.query("ROLLBACK");
+      await rollback();
       return { ok: false, reason: "number_not_found" };
     }
 
     let numberRow = locked.rows[0];
     if (String(numberRow.status || "").toLowerCase() === "sold") {
-      await client.query("ROLLBACK");
+      await rollback();
       return { ok: false, reason: "number_sold" };
     }
 
@@ -742,7 +880,7 @@ async function createPendingCaptiveReservationForAuthorization(authorization) {
           (reservation.numbers || []).map(Number).includes(captiveNumber);
 
         if (isBlocking && !isExpired && belongsToAuthorization) {
-          await client.query("COMMIT");
+          await commit();
           return {
             ok: true,
             reservation_id: String(reservation.id),
@@ -769,7 +907,7 @@ async function createPendingCaptiveReservationForAuthorization(authorization) {
             [drawId, captiveNumber, reservation.id]
           );
         } else if (isBlocking) {
-          await client.query("ROLLBACK");
+          await rollback();
           return { ok: false, reason: "number_not_available" };
         } else {
           await client.query(
@@ -796,7 +934,7 @@ async function createPendingCaptiveReservationForAuthorization(authorization) {
     );
     numberRow = after.rows?.[0] || null;
     if (!numberRow || String(numberRow.status || "").toLowerCase() !== "available") {
-      await client.query("ROLLBACK");
+      await rollback();
       return { ok: false, reason: "number_not_available" };
     }
 
@@ -816,23 +954,23 @@ async function createPendingCaptiveReservationForAuthorization(authorization) {
       [drawId, captiveNumber, reservationId]
     );
     if (updated.rowCount !== 1) {
-      await client.query("ROLLBACK");
+      await rollback();
       return { ok: false, reason: "number_not_available" };
     }
 
-    await client.query("COMMIT");
+    await commit();
     return { ok: true, reservation_id: reservationId, already_reserved: false };
   } catch (err) {
     try {
-      await client.query("ROLLBACK");
+      await rollback();
     } catch {}
     throw err;
   } finally {
-    client.release();
+    if (ownsTransaction) client.release();
   }
 }
 
-async function releasePendingCaptiveReservationForAuthorization(authorization) {
+async function releasePendingCaptiveReservationForAuthorization(authorization, options = {}) {
   const drawId = Number(authorization?.draw_id);
   const userId = Number(authorization?.user_id);
   const captiveNumber = Number(authorization?.captive_number);
@@ -840,10 +978,17 @@ async function releasePendingCaptiveReservationForAuthorization(authorization) {
     return { ok: false, released: false, reason: "invalid_authorization" };
   }
 
-  const pool = await getPool();
-  const client = await pool.connect();
+  const ownsTransaction = !options.pgClient;
+  const pool = ownsTransaction ? await getPool() : null;
+  const client = options.pgClient || await pool.connect();
+  const rollback = async () => {
+    if (ownsTransaction) await client.query("ROLLBACK");
+  };
+  const commit = async () => {
+    if (ownsTransaction) await client.query("COMMIT");
+  };
   try {
-    await client.query("BEGIN");
+    if (ownsTransaction) await client.query("BEGIN");
     const reservationResult = await client.query(
       `SELECT id, numbers, status, expires_at
          FROM public.reservations
@@ -861,7 +1006,7 @@ async function releasePendingCaptiveReservationForAuthorization(authorization) {
     );
     const reservation = reservationResult.rows?.[0] || null;
     if (!reservation) {
-      await client.query("COMMIT");
+      await commit();
       return { ok: true, released: false, reason: "reservation_not_found" };
     }
 
@@ -884,7 +1029,7 @@ async function releasePendingCaptiveReservationForAuthorization(authorization) {
       [drawId, captiveNumber, reservation.id]
     );
 
-    await client.query("COMMIT");
+    await commit();
     return {
       ok: true,
       released: numberUpdate.rowCount > 0,
@@ -892,11 +1037,11 @@ async function releasePendingCaptiveReservationForAuthorization(authorization) {
     };
   } catch (err) {
     try {
-      await client.query("ROLLBACK");
+      await rollback();
     } catch {}
     throw err;
   } finally {
-    client.release();
+    if (ownsTransaction) client.release();
   }
 }
 
@@ -942,6 +1087,43 @@ async function validateExistingCaptivePreauthReservation(authorization) {
   return { ok: true, reservation_id: String(row.reservation_id) };
 }
 
+async function lockCaptivePreauthReservation(client, authorization) {
+  const drawId = Number(authorization?.draw_id);
+  const userId = Number(authorization?.user_id);
+  const captiveNumber = Number(authorization?.captive_number);
+  const numberResult = await client.query(
+    `SELECT status, reservation_id
+       FROM public.numbers
+      WHERE draw_id = $1
+        AND n = $2
+      FOR UPDATE`,
+    [drawId, captiveNumber]
+  );
+  const numberRow = numberResult.rows?.[0] || null;
+  if (!numberRow || String(numberRow.status || "").toLowerCase() !== "reserved" || !numberRow.reservation_id) {
+    return { ok: false, reason: "preauth_reservation_not_available", reservation_id: null };
+  }
+  const reservationResult = await client.query(
+    `SELECT id, user_id, numbers, status, expires_at
+       FROM public.reservations
+      WHERE id = $1
+      FOR UPDATE`,
+    [numberRow.reservation_id]
+  );
+  const reservation = reservationResult.rows?.[0] || null;
+  const status = String(reservation?.status || "").toLowerCase();
+  const expiresAt = reservation?.expires_at ? new Date(reservation.expires_at).getTime() : null;
+  const valid =
+    reservation &&
+    ["pending", "active", "reserved", ""].includes(status) &&
+    (!expiresAt || expiresAt > Date.now()) &&
+    Number(reservation.user_id) === userId &&
+    (reservation.numbers || []).map(Number).includes(captiveNumber);
+  return valid
+    ? { ok: true, reservation_id: String(reservation.id) }
+    : { ok: false, reason: "preauth_reservation_not_available", reservation_id: String(numberRow.reservation_id) };
+}
+
 export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}) {
   const adminUserId = options.adminUserId != null ? Number(options.adminUserId) : null;
   const draw = await getDraw(drawId);
@@ -972,7 +1154,7 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
     };
   }
 
-  const activeCaptives = await listActiveCaptives();
+  const activeCaptives = await listActiveCaptives(draw.id);
   const captives = activeCaptives.rows || [];
   const skippedNotificationsDisabled = Number(activeCaptives.skippedNotificationsDisabled || 0);
   const whatsappEnabled = isCaptivePreauthWhatsAppEnabled();
@@ -1124,6 +1306,13 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
           captive_number: Number(row.captive_number),
           reason,
         });
+        await recordCaptivePreauthNotificationAttempt({
+          authorization: failedAuthorization || { ...row, draw_id: Number(draw.id) },
+          attemptType: "initial",
+          templateId,
+          status: "skipped",
+          errorCode: reason,
+        });
         items.push({
           authorization_id: String(row.id),
           user_id: Number(row.user_id),
@@ -1224,6 +1413,17 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
         }
       }
 
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: { ...row, draw_id: Number(draw.id) },
+        attemptType: "initial",
+        templateId,
+        status: notification.notification_status,
+        errorCode: notification.notification_error || (
+          notification.notification_status === "not_sent" ? "whatsapp_disabled" : null
+        ),
+        providerDispatchId: notification.notification_dispatch_id,
+      });
+
       items.push({
         authorization_id: String(row.id),
         user_id: Number(row.user_id),
@@ -1276,6 +1476,13 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
             user_id: userId,
             captive_number: captiveNumber,
             reason,
+          });
+          await recordCaptivePreauthNotificationAttempt({
+            authorization: failedAuthorization || { ...row, draw_id: Number(draw.id) },
+            attemptType: "initial",
+            templateId,
+            status: "skipped",
+            errorCode: reason,
           });
           items.push({
             authorization_id: String(row.id),
@@ -1334,8 +1541,9 @@ export async function createCaptivePreAuthorizationsForDraw(drawId, options = {}
   };
 }
 
-async function hasCompletedCaptivePreauthCharge(authorizationId) {
-  const result = await query(
+async function hasCompletedCaptivePreauthCharge(authorizationId, options = {}) {
+  const runQuery = options.pgClient ? options.pgClient.query.bind(options.pgClient) : query;
+  const result = await runQuery(
     `SELECT 1
        FROM public.autopay_runs
       WHERE status = 'charged_ok'
@@ -1346,19 +1554,23 @@ async function hasCompletedCaptivePreauthCharge(authorizationId) {
   return result.rowCount > 0;
 }
 
-async function hasApprovedPaymentForAuthorization(authorization) {
+async function hasApprovedPaymentForAuthorization(authorization, options = {}) {
   const drawId = Number(authorization?.draw_id);
   const userId = Number(authorization?.user_id);
   const captiveNumber = Number(authorization?.captive_number);
   if (!Number.isInteger(drawId) || !Number.isInteger(userId) || !Number.isInteger(captiveNumber)) {
     return false;
   }
-  const result = await query(
+  const runQuery = options.pgClient ? options.pgClient.query.bind(options.pgClient) : query;
+  const result = await runQuery(
     `SELECT 1
        FROM public.payments
       WHERE draw_id = $1
         AND user_id = $2
-        AND lower(status) IN ('approved', 'paid', 'pago')
+        AND (
+          lower(status) IN ('approved', 'paid', 'pago')
+          OR lower(coalesce(vindi_status, '')) IN ('approved', 'paid', 'pago', 'success', 'successful')
+        )
         AND $3 = ANY(numbers)
       LIMIT 1`,
     [drawId, userId, captiveNumber]
@@ -1463,10 +1675,14 @@ async function listPendingCaptivePreauthsForReissue(drawId) {
         AND an.autopay_id = ap.id
         AND an.n = ada.captive_number
         AND an.active = true
+       LEFT JOIN public.autopay_draw_captive_overrides draw_override
+         ON draw_override.draw_id = ada.draw_id
+        AND draw_override.autopay_number_id = ada.autopay_number_id
        JOIN public.users u ON u.id = ada.user_id
       WHERE ada.draw_id = $1
         AND ada.status IN ('pending', 'failed')
         AND ada.expires_at > now()
+        AND COALESCE(draw_override.enabled, true) = true
       ORDER BY ada.expires_at ASC, ada.created_at ASC`,
     [Number(drawId)]
   );
@@ -1515,9 +1731,24 @@ function classifyReissueNotification(result) {
   const status = String(result?.notification_status || "").toLowerCase();
   const reason = String(result?.notification_error || "").toLowerCase();
   if (status === "skipped" && reason.includes("consent")) return "skipped_consent";
+  if (status === "skipped" && (reason.includes("recipient") || reason.includes("phone"))) return "skipped_invalid_phone";
   if (status === "skipped") return "skipped_other";
   if (status && status !== "failed") return "sent";
   return "failed";
+}
+
+async function correctOpenCaptivePreauthAmount({ authorizationId, amountCents }) {
+  const result = await query(
+    `UPDATE public.autopay_draw_authorizations
+        SET amount_cents = $2,
+            updated_at = now()
+      WHERE id = $1
+        AND status IN ('pending', 'failed')
+        AND expires_at > now()
+      RETURNING *`,
+    [authorizationId, amountCents]
+  );
+  return result.rows?.[0] || null;
 }
 
 export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUserId }) {
@@ -1528,19 +1759,21 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
     throw err;
   }
 
-  const draw = await getDraw(id);
-  if (String(draw?.draw_type || "principal").toLowerCase() !== "principal") {
-    const err = new Error("draw_not_principal");
-    err.status = 400;
+  const currentDraw = await getCurrentCaptiveDrawContext();
+  if (!currentDraw.draw) {
+    const err = new Error("current_principal_draw_not_found");
+    err.status = 404;
+    throw err;
+  }
+  if (currentDraw.draw_id !== id) {
+    const err = new Error("draw_not_current_principal");
+    err.status = 409;
     throw err;
   }
 
-  const officialAmountCents = await resolveDrawAmountCents(draw);
-  const defaultAmountCents = getDefaultAuthorizedBaseAmountCents();
-  if (!shouldRequireCaptivePreauth({
-    currentAmountCents: officialAmountCents,
-    authorizedBaseAmountCents: defaultAmountCents,
-  })) {
+  const draw = currentDraw.draw;
+  const officialAmountCents = currentDraw.official_amount_cents;
+  if (!currentDraw.preauth_required) {
     const err = new Error("captive_preauth_not_required");
     err.status = 409;
     throw err;
@@ -1562,13 +1795,15 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
     ok: true,
     draw_id: id,
     official_amount_cents: officialAmountCents,
-    pending_found: rows.length,
+    pending_found: rows.filter((row) => safeStatus(row.status) === "pending").length,
+    failed_recoverable_found: 0,
     amount_corrected: 0,
     failed_recovered: 0,
     credentials_reissued: 0,
     sent: 0,
     skipped_consent: 0,
     skipped_notifications_disabled: 0,
+    skipped_invalid_phone: 0,
     skipped_near_expiration: 0,
     skipped_reservation_unavailable: 0,
     skipped_already_charged: 0,
@@ -1586,6 +1821,13 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
 
     const reservation = await validateExistingCaptivePreauthReservation(row);
     if (!reservation.ok) {
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: row,
+        attemptType: "reissue",
+        templateId,
+        status: "skipped",
+        errorCode: reservation.reason || "reservation_unavailable",
+      });
       summary.skipped_reservation_unavailable++;
       continue;
     }
@@ -1593,15 +1835,33 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
     if (safeStatus(row.status) === "failed") {
       const recoverable = await getRecoverableFailedAuthorizationInfo(row, { reservation });
       if (!recoverable.recoverable) {
+        await recordCaptivePreauthNotificationAttempt({
+          authorization: row,
+          attemptType: "reissue",
+          templateId,
+          status: "skipped",
+          errorCode: recoverable.reason || "failed_not_recoverable",
+        });
         summary.skipped_other++;
         continue;
       }
+      summary.failed_recoverable_found++;
     } else if (safeStatus(row.status) !== "pending") {
       summary.untouched_non_pending++;
       continue;
     }
 
-    if (await hasCompletedCaptivePreauthCharge(authorizationId)) {
+    if (
+      await hasCompletedCaptivePreauthCharge(authorizationId) ||
+      await hasApprovedPaymentForAuthorization(row)
+    ) {
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: row,
+        attemptType: "reissue",
+        templateId,
+        status: "skipped",
+        errorCode: "payment_already_approved",
+      });
       summary.skipped_already_charged++;
       continue;
     }
@@ -1609,16 +1869,17 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
     const expiresAtMs = row.expires_at ? new Date(row.expires_at).getTime() : 0;
     const nearExpiration = expiresAtMs && expiresAtMs - Date.now() < 10 * 60 * 1000;
     if (nearExpiration) {
-      const reissued = await reissuePendingCaptivePreauthCredentials({
-        authorizationId,
-        amountCents: officialAmountCents,
-        schema,
-      });
-      if (reissued.authorization) {
+      const corrected = await correctOpenCaptivePreauthAmount({ authorizationId, amountCents: officialAmountCents });
+      if (corrected) {
         if (Number(row.amount_cents) !== officialAmountCents) summary.amount_corrected++;
-        if (safeStatus(row.status) === "failed") summary.failed_recovered++;
-        summary.credentials_reissued++;
       }
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: corrected || row,
+        attemptType: "reissue",
+        templateId,
+        status: "skipped",
+        errorCode: "skipped_near_expiration",
+      });
       summary.skipped_near_expiration++;
       continue;
     }
@@ -1629,6 +1890,13 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
       schema,
     });
     if (!reissued.authorization) {
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: row,
+        attemptType: "reissue",
+        templateId,
+        status: "skipped",
+        errorCode: "authorization_changed",
+      });
       summary.untouched_non_pending++;
       continue;
     }
@@ -1652,6 +1920,13 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
         status: "not_sent",
         errorMessage: null,
       });
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: reissued.authorization,
+        attemptType: "reissue",
+        templateId,
+        status: "skipped",
+        errorCode: "whatsapp_disabled",
+      });
       summary.skipped_whatsapp_disabled++;
       continue;
     }
@@ -1662,6 +1937,13 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
         status: "skipped",
         errorMessage: "preauth_notifications_disabled",
       });
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: reissued.authorization,
+        attemptType: "reissue",
+        templateId,
+        status: "skipped",
+        errorCode: "preauth_notifications_disabled",
+      });
       summary.skipped_notifications_disabled++;
       continue;
     }
@@ -1671,6 +1953,13 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
         authorizationId,
         status: "skipped",
         errorMessage: "whatsapp_template_missing",
+      });
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: reissued.authorization,
+        attemptType: "reissue",
+        templateId,
+        status: "skipped",
+        errorCode: "whatsapp_template_missing",
       });
       summary.skipped_template_missing++;
       continue;
@@ -1688,6 +1977,14 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
         templateId,
         templateMode,
       });
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: reissued.authorization,
+        attemptType: "reissue",
+        templateId,
+        status: notification.notification_status,
+        errorCode: notification.notification_error,
+        providerDispatchId: notification.notification_dispatch_id,
+      });
       summary[classifyReissueNotification(notification)]++;
     } catch (err) {
       const failureReason = safeError(err?.message || "whatsapp_send_failed");
@@ -1695,6 +1992,13 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
         authorizationId,
         status: "failed",
         errorMessage: failureReason,
+      });
+      await recordCaptivePreauthNotificationAttempt({
+        authorization: reissued.authorization,
+        attemptType: "reissue",
+        templateId,
+        status: "failed",
+        errorCode: failureReason,
       });
       error("admin_reissue_whatsapp_failed", {
         authorization_id: authorizationId,
@@ -1710,11 +2014,13 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
     admin_user_id: adminUserId || null,
     draw_id: id,
     pending_found: summary.pending_found,
+    failed_recoverable_found: summary.failed_recoverable_found,
     amount_corrected: summary.amount_corrected,
     sent: summary.sent,
     skipped:
       summary.skipped_consent +
       summary.skipped_notifications_disabled +
+      summary.skipped_invalid_phone +
       summary.skipped_near_expiration +
       summary.skipped_reservation_unavailable +
       summary.skipped_already_charged +
@@ -1725,6 +2031,417 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
   });
 
   return summary;
+}
+
+function captiveAdminError(code, status) {
+  const err = new Error(code);
+  err.status = status;
+  return err;
+}
+
+async function sendManualActivationNotification({ authorization, captive, draw, token, confirmationCode }) {
+  const whatsappEnabled = isCaptivePreauthWhatsAppEnabled();
+  const templateMode = getCaptivePreauthTemplateMode();
+  const confirmationPublicUrl = resolveCaptiveConfirmationPublicUrl();
+  const templateConfig = whatsappEnabled
+    ? await resolveCaptivePreauthTemplateConfig()
+    : { templateId: null, source: "missing", templateKey: PREAUTH_TEMPLATE_KEY };
+  const templateId = templateConfig.templateId;
+  let notification;
+
+  if (!whatsappEnabled) {
+    await updateAuthorizationNotification({
+      authorizationId: authorization.id,
+      status: "not_sent",
+      errorMessage: null,
+    });
+    notification = {
+      notification_status: "skipped",
+      notification_error: "whatsapp_disabled",
+      notification_dispatch_id: null,
+    };
+  } else if (captive.preauth_notifications_enabled === false) {
+    await updateAuthorizationNotification({
+      authorizationId: authorization.id,
+      status: "skipped",
+      errorMessage: "preauth_notifications_disabled",
+    });
+    notification = {
+      notification_status: "skipped",
+      notification_error: "preauth_notifications_disabled",
+      notification_dispatch_id: null,
+    };
+  } else if (!templateId) {
+    await updateAuthorizationNotification({
+      authorizationId: authorization.id,
+      status: "skipped",
+      errorMessage: "whatsapp_template_missing",
+    });
+    notification = {
+      notification_status: "skipped",
+      notification_error: "whatsapp_template_missing",
+      notification_dispatch_id: null,
+    };
+  } else {
+    try {
+      notification = await sendCaptivePreauthWhatsApp({
+        authorization,
+        captive,
+        draw,
+        authorizeUrl: buildAuthorizeUrl(token),
+        declineUrl: buildDeclineUrl(token),
+        manageUrl: confirmationPublicUrl,
+        confirmationCode,
+        templateId,
+        templateMode,
+      });
+    } catch (err) {
+      const failureReason = safeError(err?.message || "whatsapp_send_failed");
+      await updateAuthorizationNotification({
+        authorizationId: authorization.id,
+        status: "failed",
+        errorMessage: failureReason,
+      });
+      notification = {
+        notification_status: "failed",
+        notification_error: failureReason,
+        notification_dispatch_id: null,
+      };
+    }
+  }
+
+  await recordCaptivePreauthNotificationAttempt({
+    authorization,
+    attemptType: "manual_activation",
+    templateId,
+    status: notification.notification_status,
+    errorCode: notification.notification_error,
+    providerDispatchId: notification.notification_dispatch_id,
+  });
+  return notification;
+}
+
+export async function setCurrentDrawCaptiveParticipation({
+  autopayNumberId,
+  enabled,
+  reason,
+  adminUserId,
+}) {
+  const captiveId = String(autopayNumberId || "").trim();
+  const adminId = toPositiveInt(adminUserId);
+  const normalizedReason = String(reason || "").trim().replace(/[\r\n\t]+/g, " ").slice(0, 500);
+  if (!UUID_RE.test(captiveId)) throw captiveAdminError("invalid_autopay_number_id", 400);
+  if (typeof enabled !== "boolean") throw captiveAdminError("invalid_enabled", 400);
+  if (!normalizedReason) throw captiveAdminError("reason_required", 400);
+  if (!adminId) throw captiveAdminError("invalid_admin_user", 400);
+
+  const context = await getCurrentCaptiveDrawContext();
+  if (!context.draw) throw captiveAdminError("current_principal_draw_not_found", 404);
+  if (!context.preauth_required) throw captiveAdminError("captive_preauth_not_required", 409);
+
+  const authorizationSchema = await getAuthorizationTableSchema();
+  const pool = await getPool();
+  const client = await pool.connect();
+  let authorization = null;
+  let captive = null;
+  let token = null;
+  let confirmationCode = null;
+  let reservationResult = null;
+  let authorizationClosed = false;
+
+  try {
+    await client.query("BEGIN");
+    const lockedDraw = await client.query(
+      `SELECT id, status, draw_type
+         FROM public.draws
+        WHERE id = $1
+        FOR UPDATE`,
+      [context.draw_id]
+    );
+    const drawRow = lockedDraw.rows?.[0] || null;
+    if (
+      !drawRow ||
+      String(drawRow.status || "").toLowerCase() !== "open" ||
+      String(drawRow.draw_type || "principal").toLowerCase() !== "principal"
+    ) {
+      throw captiveAdminError("current_principal_draw_changed", 409);
+    }
+
+    const lockedCaptive = await client.query(
+      `SELECT an.id AS autopay_number_id,
+              an.autopay_id AS autopay_profile_id,
+              an.n AS captive_number,
+              an.active AS number_active,
+              COALESCE(an.preauth_notifications_enabled, true) AS preauth_notifications_enabled,
+              ap.user_id,
+              ap.active AS profile_active,
+              u.name AS user_name,
+              u.phone AS user_phone
+         FROM public.autopay_numbers an
+         JOIN public.autopay_profiles ap ON ap.id = an.autopay_id
+         JOIN public.users u ON u.id = ap.user_id
+        WHERE an.id = $1
+        FOR UPDATE OF an, ap`,
+      [captiveId]
+    );
+    captive = lockedCaptive.rows?.[0] || null;
+    if (!captive) throw captiveAdminError("captive_not_found", 404);
+    if (captive.profile_active !== true || captive.number_active !== true) {
+      throw captiveAdminError("captive_inactive", 409);
+    }
+
+    const overrideResult = await client.query(
+      `SELECT id, enabled, reason
+         FROM public.autopay_draw_captive_overrides
+        WHERE draw_id = $1
+          AND autopay_number_id = $2
+        FOR UPDATE`,
+      [context.draw_id, captiveId]
+    );
+    const currentOverride = overrideResult.rows?.[0] || null;
+    if (enabled && (!currentOverride || currentOverride.enabled === true)) {
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        draw_id: context.draw_id,
+        autopay_number_id: captiveId,
+        enabled: true,
+        already_enabled: true,
+      };
+    }
+
+    const authorizationResult = await client.query(
+      `SELECT *
+         FROM public.autopay_draw_authorizations
+        WHERE draw_id = $1
+          AND user_id = $2
+          AND captive_number = $3
+        LIMIT 1
+        FOR UPDATE`,
+      [context.draw_id, Number(captive.user_id), Number(captive.captive_number)]
+    );
+    authorization = authorizationResult.rows?.[0] || null;
+    await client.query(
+      `SELECT status, reservation_id
+         FROM public.numbers
+        WHERE draw_id = $1
+          AND n = $2
+        FOR UPDATE`,
+      [context.draw_id, Number(captive.captive_number)]
+    );
+    if (authorization) {
+      const paymentApproved =
+        await hasCompletedCaptivePreauthCharge(authorization.id, { pgClient: client }) ||
+        await hasApprovedPaymentForAuthorization(authorization, { pgClient: client });
+      if (["authorized", "charged"].includes(safeStatus(authorization.status)) || paymentApproved) {
+        throw captiveAdminError("participation_already_confirmed", 409);
+      }
+    }
+
+    const overrideReason = `${enabled ? "admin_enabled_current_draw" : "admin_disabled_current_draw"}: ${normalizedReason}`;
+
+    if (!enabled) {
+      await client.query(
+        `INSERT INTO public.autopay_draw_captive_overrides (
+            draw_id, autopay_number_id, user_id, enabled, reason, updated_by
+          ) VALUES ($1, $2, $3, false, $4, $5)
+          ON CONFLICT (draw_id, autopay_number_id) DO UPDATE
+            SET user_id = EXCLUDED.user_id,
+                enabled = false,
+                reason = EXCLUDED.reason,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = now()`,
+        [context.draw_id, captiveId, Number(captive.user_id), overrideReason, adminId]
+      );
+
+      let canClose = authorization && safeStatus(authorization.status) === "pending";
+      if (authorization && ["pending", "failed"].includes(safeStatus(authorization.status))) {
+        const expiresAt = authorization.expires_at ? new Date(authorization.expires_at).getTime() : null;
+        const lockedReservation = expiresAt && expiresAt > Date.now()
+          ? await lockCaptivePreauthReservation(client, authorization)
+          : { ok: false };
+        if (safeStatus(authorization.status) === "failed") canClose = lockedReservation.ok === true;
+      }
+
+      if (canClose) {
+        const setParts = [
+          "status = 'expired'",
+          "token_hash = $2",
+          "authorized_at = NULL",
+          "declined_at = NULL",
+          "charged_at = NULL",
+          "expired_at = now()",
+          "expires_at = now()",
+          "notification_status = 'skipped'",
+          "notification_error = 'admin_disabled_current_draw'",
+          "updated_at = now()",
+        ];
+        if (authorizationSchema.confirmation_code_hash) setParts.push("confirmation_code_hash = NULL");
+        if (authorizationSchema.confirmation_code_created_at) setParts.push("confirmation_code_created_at = NULL");
+        const closed = await client.query(
+          `UPDATE public.autopay_draw_authorizations
+              SET ${setParts.join(", ")}
+            WHERE id = $1
+              AND status IN ('pending', 'failed')
+            RETURNING *`,
+          [authorization.id, hashToken(createToken())]
+        );
+        authorization = closed.rows?.[0] || authorization;
+        reservationResult = await releasePendingCaptiveReservationForAuthorization(authorization, { pgClient: client });
+        authorizationClosed = closed.rowCount > 0;
+      }
+
+      await client.query("COMMIT");
+      log("admin_current_draw_captive_disabled", {
+        admin_user_id: adminId,
+        draw_id: context.draw_id,
+        user_id: Number(captive.user_id),
+        captive_number: Number(captive.captive_number),
+        authorization_id: authorization?.id || null,
+        reservation_id: reservationResult?.reservation_id || null,
+      });
+      return {
+        ok: true,
+        draw_id: context.draw_id,
+        autopay_number_id: captiveId,
+        enabled: false,
+        authorization_closed: authorizationClosed,
+        reservation_released: reservationResult?.released === true,
+      };
+    }
+
+    if (authorization && safeStatus(authorization.status) === "declined") {
+      throw captiveAdminError("participation_declined_by_customer", 409);
+    }
+
+    token = createToken();
+    const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + getCaptivePreauthExpiresHours() * 60 * 60 * 1000);
+    if (authorizationSchema.confirmation_code_hash && authorizationSchema.confirmation_code_created_at) {
+      confirmationCode = createConfirmationCode();
+    }
+
+    if (authorization) {
+      const params = [authorization.id, context.official_amount_cents, tokenHash, expiresAt];
+      const setParts = [
+        "amount_cents = $2",
+        "token_hash = $3",
+        "expires_at = $4",
+        "status = 'pending'",
+        "authorized_at = NULL",
+        "declined_at = NULL",
+        "expired_at = NULL",
+        "charged_at = NULL",
+        "notification_dispatch_id = NULL",
+        "notification_status = NULL",
+        "notification_error = NULL",
+        "updated_at = now()",
+      ];
+      if (confirmationCode) {
+        params.push(hashConfirmationCode(confirmationCode));
+        setParts.push(`confirmation_code_hash = $${params.length}`);
+        setParts.push("confirmation_code_created_at = now()");
+      }
+      const updated = await client.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET ${setParts.join(", ")}
+          WHERE id = $1
+            AND status IN ('pending', 'failed', 'expired')
+          RETURNING *`,
+        params
+      );
+      authorization = updated.rows?.[0] || null;
+    } else {
+      const params = [
+        context.draw_id,
+        Number(captive.user_id),
+        captive.autopay_profile_id,
+        captiveId,
+        Number(captive.captive_number),
+        context.official_amount_cents,
+        tokenHash,
+      ];
+      const columns = [];
+      const values = [];
+      if (confirmationCode) {
+        params.push(hashConfirmationCode(confirmationCode));
+        columns.push("confirmation_code_hash", "confirmation_code_created_at");
+        values.push(`$${params.length}`, "now()");
+      }
+      params.push(expiresAt, adminId);
+      const inserted = await client.query(
+        `INSERT INTO public.autopay_draw_authorizations (
+            draw_id, user_id, autopay_profile_id, autopay_number_id,
+            captive_number, amount_cents, status, token_hash,
+            ${columns.length ? `${columns.join(", ")},` : ""}
+            expires_at, created_by
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, 'pending', $7,
+            ${values.length ? `${values.join(", ")},` : ""}
+            $${params.length - 1}, $${params.length}
+          )
+          RETURNING *`,
+        params
+      );
+      authorization = inserted.rows?.[0] || null;
+    }
+
+    if (!authorization) throw captiveAdminError("authorization_not_available", 409);
+    reservationResult = await createPendingCaptiveReservationForAuthorization(authorization, { pgClient: client });
+    if (!reservationResult.ok) {
+      throw captiveAdminError(reservationResult.reason || "number_not_available", 409);
+    }
+
+    await client.query(
+      `INSERT INTO public.autopay_draw_captive_overrides (
+          draw_id, autopay_number_id, user_id, enabled, reason, updated_by
+        ) VALUES ($1, $2, $3, true, $4, $5)
+        ON CONFLICT (draw_id, autopay_number_id) DO UPDATE
+          SET user_id = EXCLUDED.user_id,
+              enabled = true,
+              reason = EXCLUDED.reason,
+              updated_by = EXCLUDED.updated_by,
+              updated_at = now()`,
+      [context.draw_id, captiveId, Number(captive.user_id), overrideReason, adminId]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const notification = await sendManualActivationNotification({
+    authorization,
+    captive,
+    draw: context.draw,
+    token,
+    confirmationCode,
+  });
+  log("admin_current_draw_captive_enabled", {
+    admin_user_id: adminId,
+    draw_id: context.draw_id,
+    user_id: Number(captive.user_id),
+    captive_number: Number(captive.captive_number),
+    authorization_id: authorization.id,
+    reservation_id: reservationResult?.reservation_id || null,
+    notification_status: notification.notification_status,
+  });
+  return {
+    ok: true,
+    draw_id: context.draw_id,
+    autopay_number_id: captiveId,
+    enabled: true,
+    already_enabled: false,
+    authorization_id: String(authorization.id),
+    amount_cents: Number(authorization.amount_cents),
+    reservation_id: reservationResult?.reservation_id || null,
+    notification_status: notification.notification_status,
+    notification_error: notification.notification_error,
+  };
 }
 
 async function getAuthorizationByToken(token) {
@@ -2392,7 +3109,10 @@ async function recoverFailedAuthorizationForRetry(row, source = "account") {
          FROM public.payments
         WHERE draw_id = $1
           AND user_id = $2
-          AND lower(status) IN ('approved', 'paid', 'pago')
+          AND (
+            lower(status) IN ('approved', 'paid', 'pago')
+            OR lower(coalesce(vindi_status, '')) IN ('approved', 'paid', 'pago', 'success', 'successful')
+          )
           AND $3 = ANY(numbers)
         LIMIT 1`,
       [Number(current.draw_id), Number(current.user_id), Number(current.captive_number)]
@@ -2545,6 +3265,8 @@ export default {
   lookupCaptivePreauthForUser,
   authorizeCaptivePreauthForUser,
   declineCaptivePreauthForUser,
+  getCurrentCaptiveDrawContext,
+  setCurrentDrawCaptiveParticipation,
   reissueAndResendPendingCaptivePreauths,
   chargeAuthorizedCaptivePreauth,
   expirePendingCaptivePreauths,

@@ -1,6 +1,10 @@
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import {
+  getCurrentCaptiveDrawContext,
+  setCurrentDrawCaptiveParticipation,
+} from "../services/autopay/captivePreauthService.js";
 
 const router = Router();
 const LOG_PREFIX = "[admin-captives]";
@@ -16,6 +20,9 @@ const ALLOWED_STATUS = new Set([
 ]);
 
 const CARD_READY_SQL = "(ap.vindi_customer_id IS NOT NULL AND ap.vindi_payment_profile_id IS NOT NULL)";
+const HISTORY_STATUSES = new Set(["accepted", "sent", "delivered", "skipped", "failed"]);
+const HISTORY_ATTEMPT_TYPES = new Set(["initial", "reissue", "manual_activation"]);
+const PARTICIPATION_FILTERS = new Set(["all", "enabled", "disabled", "pending", "confirmed", "failed"]);
 
 function getDefaultAmountCents() {
   const n = Number(process.env.CAPTIVE_AUTOPAY_DEFAULT_AMOUNT_CENTS);
@@ -52,6 +59,16 @@ function maskPhone(phone) {
   if (digits.length <= 4) return "****";
   const prefix = digits.length > 10 ? digits.slice(0, 2) : "";
   return `${prefix}${"*".repeat(Math.max(4, digits.length - prefix.length - 4))}${digits.slice(-4)}`;
+}
+
+function maskHistoryPhone(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (!digits) return null;
+  const last4 = digits.slice(-4).padStart(4, "*");
+  if (digits.startsWith("55") && digits.length >= 12) {
+    return `+${digits.slice(0, 2)} ${digits.slice(2, 4)} *****-${last4}`;
+  }
+  return `*****-${last4}`;
 }
 
 function normalizeConsentStatus(status) {
@@ -231,6 +248,364 @@ function buildCaptivesBaseSql({
     ${includeWhere}
   `;
 }
+
+const HISTORY_EFFECTIVE_STATUS_SQL = `CASE
+  WHEN LOWER(COALESCE(nd.delivery_status, '')) IN ('delivered', 'read') THEN 'delivered'
+  WHEN LOWER(COALESCE(nd.delivery_status, '')) IN ('failed', 'undelivered') THEN 'failed'
+  WHEN LOWER(COALESCE(nd.status, '')) = 'failed' THEN 'failed'
+  WHEN LOWER(COALESCE(nd.status, '')) = 'skipped' THEN 'skipped'
+  WHEN LOWER(COALESCE(nd.status, '')) = 'sent' THEN 'sent'
+  WHEN LOWER(COALESCE(nd.status, '')) = 'accepted' THEN 'accepted'
+  ELSE attempt.status
+END`;
+
+router.get("/notification-history", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const page = toPositiveInt(req.query?.page, 1, 100000);
+    const limit = toPositiveInt(req.query?.limit, 50, 100);
+    const offset = (page - 1) * limit;
+    const search = String(req.query?.search || "").trim();
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    const attemptType = String(req.query?.attempt_type || "").trim().toLowerCase();
+    const rawDrawId = String(req.query?.draw_id || "").trim();
+    const drawId = rawDrawId ? Number(rawDrawId) : null;
+    if (rawDrawId && (!Number.isInteger(drawId) || drawId <= 0)) {
+      return res.status(400).json({ ok: false, error: "invalid_draw_id" });
+    }
+    if (status && !HISTORY_STATUSES.has(status)) {
+      return res.status(400).json({ ok: false, error: "invalid_status" });
+    }
+    if (attemptType && !HISTORY_ATTEMPT_TYPES.has(attemptType)) {
+      return res.status(400).json({ ok: false, error: "invalid_attempt_type" });
+    }
+
+    const params = [];
+    const where = [];
+    const addParam = (value) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+    if (drawId) where.push(`attempt.draw_id = ${addParam(drawId)}`);
+    if (status) where.push(`${HISTORY_EFFECTIVE_STATUS_SQL} = ${addParam(status)}`);
+    if (attemptType) where.push(`attempt.attempt_type = ${addParam(attemptType)}`);
+    if (search) {
+      const searchParam = addParam(`%${search}%`);
+      where.push(`(
+        u.name ILIKE ${searchParam}
+        OR u.email ILIKE ${searchParam}
+        OR CAST(attempt.captive_number AS text) ILIKE ${searchParam}
+      )`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const fromSql = `
+      FROM public.captive_preauth_notification_attempts attempt
+      JOIN public.autopay_draw_authorizations auth
+        ON auth.id = attempt.authorization_id
+      JOIN public.users u ON u.id = attempt.user_id
+      LEFT JOIN public.draws d ON d.id = attempt.draw_id
+      LEFT JOIN public.notification_dispatches nd
+        ON nd.id = attempt.provider_dispatch_id
+      ${whereSql}`;
+    const countResult = await query(`SELECT COUNT(*)::int AS total ${fromSql}`, params);
+    const total = Number(countResult.rows?.[0]?.total || 0);
+    const rows = await query(
+      `SELECT attempt.id,
+              attempt.authorization_id,
+              attempt.draw_id,
+              attempt.user_id,
+              attempt.captive_number,
+              attempt.amount_cents,
+              COALESCE(attempt.template_id, nd.provider_template_id) AS template_id,
+              attempt.attempt_type,
+              ${HISTORY_EFFECTIVE_STATUS_SQL} AS status,
+              COALESCE(
+                attempt.error_code,
+                CASE WHEN ${HISTORY_EFFECTIVE_STATUS_SQL} = 'failed' THEN 'provider_failed' END
+              ) AS error_code,
+              attempt.created_at,
+              auth.status AS authorization_status,
+              u.name AS user_name,
+              u.email AS user_email,
+              u.phone AS user_phone,
+              COALESCE(d.product_name, 'Sorteio #' || attempt.draw_id::text) AS draw_title
+         ${fromSql}
+        ORDER BY attempt.created_at DESC, attempt.id DESC
+        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    );
+
+    return res.json({
+      ok: true,
+      page,
+      limit,
+      total,
+      items: (rows.rows || []).map((row) => ({
+        id: String(row.id),
+        authorization_id: String(row.authorization_id),
+        draw_id: Number(row.draw_id),
+        draw_title: row.draw_title,
+        user_id: Number(row.user_id),
+        user_name: row.user_name || null,
+        user_email: row.user_email || null,
+        user_phone_masked: maskHistoryPhone(row.user_phone),
+        captive_number: Number(row.captive_number),
+        amount_cents: Number(row.amount_cents),
+        template_id: row.template_id || null,
+        attempt_type: row.attempt_type,
+        status: row.status,
+        error_code: row.error_code || null,
+        authorization_status: row.authorization_status || null,
+        created_at: row.created_at,
+      })),
+    });
+  } catch (error) {
+    console.error(`${LOG_PREFIX} notification_history_failed`, {
+      admin_user_id: req.user?.id || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "notification_history_failed" });
+  }
+});
+
+const APPROVED_PARTICIPATION_SQL = `(
+  LOWER(COALESCE(auth.status, '')) = 'charged'
+  OR EXISTS (
+    SELECT 1
+      FROM public.autopay_runs run
+     WHERE run.status = 'charged_ok'
+       AND run.provider_request->>'authorization_id' = auth.id::text
+  )
+  OR EXISTS (
+    SELECT 1
+      FROM public.payments payment
+     WHERE payment.draw_id = auth.draw_id
+       AND payment.user_id = auth.user_id
+       AND (
+         LOWER(payment.status) IN ('approved', 'paid', 'pago')
+         OR LOWER(COALESCE(payment.vindi_status, '')) IN ('approved', 'paid', 'pago', 'success', 'successful')
+       )
+       AND an.n::integer = ANY(payment.numbers)
+  )
+)`;
+
+async function loadCurrentDrawParticipation({ search = "", status = "all", page = 1, limit = 50, autopayNumberId = null } = {}) {
+  const context = await getCurrentCaptiveDrawContext();
+  if (!context.draw) {
+    return {
+      ok: true,
+      draw: null,
+      page: 1,
+      limit,
+      total: 0,
+      pending_authorizations: 0,
+      disabled_count: 0,
+      items: [],
+    };
+  }
+
+  const safePage = toPositiveInt(page, 1, 100000);
+  const safeLimit = toPositiveInt(limit, 50, 100);
+  const offset = (safePage - 1) * safeLimit;
+  const normalizedStatus = PARTICIPATION_FILTERS.has(status) ? status : "all";
+  const params = [context.draw_id];
+  const where = ["ap.active = true", "an.active = true"];
+  const addParam = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+  if (autopayNumberId) where.push(`an.id = ${addParam(autopayNumberId)}`);
+  if (search) {
+    const searchParam = addParam(`%${search}%`);
+    where.push(`(
+      u.name ILIKE ${searchParam}
+      OR u.email ILIKE ${searchParam}
+      OR CAST(an.n AS text) ILIKE ${searchParam}
+    )`);
+  }
+  if (normalizedStatus === "enabled") where.push("COALESCE(draw_override.enabled, true) = true");
+  if (normalizedStatus === "disabled") where.push("COALESCE(draw_override.enabled, true) = false");
+  if (normalizedStatus === "pending") where.push("LOWER(COALESCE(auth.status, '')) = 'pending'");
+  if (normalizedStatus === "confirmed") where.push(APPROVED_PARTICIPATION_SQL);
+  if (normalizedStatus === "failed") where.push("LOWER(COALESCE(auth.status, '')) = 'failed'");
+  const whereSql = `WHERE ${where.join(" AND ")}`;
+  const fromSql = `
+    FROM public.autopay_numbers an
+    JOIN public.autopay_profiles ap ON ap.id = an.autopay_id
+    JOIN public.users u ON u.id = ap.user_id
+    LEFT JOIN public.autopay_draw_captive_overrides draw_override
+      ON draw_override.draw_id = $1
+     AND draw_override.autopay_number_id = an.id
+    LEFT JOIN public.autopay_draw_authorizations auth
+      ON auth.draw_id = $1
+     AND auth.user_id = ap.user_id
+     AND auth.captive_number = an.n
+     AND (auth.autopay_number_id = an.id OR auth.autopay_number_id IS NULL)
+    LEFT JOIN public.numbers draw_number
+      ON draw_number.draw_id = $1
+     AND draw_number.n = an.n
+    LEFT JOIN public.reservations reservation
+      ON reservation.id = draw_number.reservation_id
+    ${whereSql}`;
+
+  const countResult = await query(`SELECT COUNT(*)::int AS total ${fromSql}`, params);
+  const total = Number(countResult.rows?.[0]?.total || 0);
+  const rows = await query(
+    `SELECT an.id AS autopay_number_id,
+            ap.user_id,
+            u.name AS user_name,
+            u.email AS user_email,
+            an.n AS captive_number,
+            ap.active AS profile_active,
+            an.active AS number_active,
+            COALESCE(draw_override.enabled, true) AS enabled_current_draw,
+            draw_override.reason AS override_reason,
+            auth.id AS authorization_id,
+            auth.status AS authorization_status,
+            auth.amount_cents AS authorization_amount_cents,
+            auth.expires_at AS authorization_expires_at,
+            auth.notification_status,
+            auth.notification_error,
+            draw_number.status AS draw_number_status,
+            draw_number.reservation_id,
+            reservation.status AS reservation_status,
+            ${APPROVED_PARTICIPATION_SQL} AS payment_approved,
+            (
+              LOWER(COALESCE(auth.status, '')) = 'failed'
+              AND auth.expires_at > now()
+              AND LOWER(COALESCE(draw_number.status, '')) = 'reserved'
+              AND draw_number.reservation_id IS NOT NULL
+              AND LOWER(COALESCE(reservation.status, '')) IN ('pending', 'active', 'reserved', '')
+              AND reservation.user_id = auth.user_id
+              AND an.n::integer = ANY(reservation.numbers)
+              AND NOT ${APPROVED_PARTICIPATION_SQL}
+            ) AS failed_retryable
+       ${fromSql}
+      ORDER BY an.n ASC, u.name ASC NULLS LAST
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, safeLimit, offset]
+  );
+
+  const stats = await query(
+    `SELECT
+        COUNT(*) FILTER (WHERE COALESCE(draw_override.enabled, true) = false)::int AS disabled_count,
+        COUNT(*) FILTER (
+          WHERE COALESCE(draw_override.enabled, true) = true
+            AND LOWER(COALESCE(auth.status, '')) = 'pending'
+            AND auth.expires_at > now()
+        )::int AS pending_authorizations
+       FROM public.autopay_numbers an
+       JOIN public.autopay_profiles ap ON ap.id = an.autopay_id
+       LEFT JOIN public.autopay_draw_captive_overrides draw_override
+         ON draw_override.draw_id = $1
+        AND draw_override.autopay_number_id = an.id
+       LEFT JOIN public.autopay_draw_authorizations auth
+         ON auth.draw_id = $1
+        AND auth.user_id = ap.user_id
+        AND auth.captive_number = an.n
+        AND (auth.autopay_number_id = an.id OR auth.autopay_number_id IS NULL)
+      WHERE ap.active = true
+        AND an.active = true`,
+    [context.draw_id]
+  );
+
+  return {
+    ok: true,
+    draw: {
+      draw_id: context.draw_id,
+      amount_cents: context.official_amount_cents,
+      default_amount_cents: context.default_amount_cents,
+      preauth_required: context.preauth_required,
+    },
+    page: safePage,
+    limit: safeLimit,
+    total,
+    pending_authorizations: Number(stats.rows?.[0]?.pending_authorizations || 0),
+    disabled_count: Number(stats.rows?.[0]?.disabled_count || 0),
+    items: (rows.rows || []).map((row) => {
+      const enabledCurrentDraw = row.enabled_current_draw === true;
+      const authorizationStatus = String(row.authorization_status || "").toLowerCase() || null;
+      let participationState = "no_authorization";
+      if (!enabledCurrentDraw) participationState = "disabled";
+      else if (row.payment_approved === true) participationState = "confirmed";
+      else if (authorizationStatus === "pending") participationState = "pending";
+      else if (authorizationStatus === "failed" && row.failed_retryable === true) participationState = "failed_retryable";
+      else if (authorizationStatus === "failed") participationState = "failed";
+      else if (authorizationStatus === "authorized") participationState = "authorized";
+      else if (authorizationStatus === "declined") participationState = "declined";
+      else if (authorizationStatus === "expired") participationState = "expired";
+      return {
+        autopay_number_id: String(row.autopay_number_id),
+        user_id: Number(row.user_id),
+        user_name: row.user_name || null,
+        user_email: row.user_email || null,
+        captive_number: Number(row.captive_number),
+        permanent_status: row.profile_active === true && row.number_active === true ? "active" : "inactive",
+        enabled_current_draw: enabledCurrentDraw,
+        override_reason: row.override_reason || null,
+        participation_state: participationState,
+        authorization_id: row.authorization_id ? String(row.authorization_id) : null,
+        authorization_status: authorizationStatus,
+        reservation_id: row.reservation_id ? String(row.reservation_id) : null,
+        reservation_status: row.reservation_status || null,
+        draw_number_status: row.draw_number_status || null,
+        notification_status: row.notification_status || null,
+        notification_error: row.notification_error || null,
+        authorization_amount_cents: row.authorization_amount_cents == null ? null : Number(row.authorization_amount_cents),
+        authorization_expires_at: row.authorization_expires_at || null,
+        payment_approved: row.payment_approved === true,
+        retryable: row.failed_retryable === true,
+      };
+    }),
+  };
+}
+
+router.get("/current-draw-participation", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const payload = await loadCurrentDrawParticipation({
+      search: String(req.query?.search || "").trim(),
+      status: String(req.query?.status || "all").trim().toLowerCase(),
+      page: req.query?.page,
+      limit: req.query?.limit,
+    });
+    return res.json(payload);
+  } catch (error) {
+    console.error(`${LOG_PREFIX} current_draw_participation_failed`, {
+      admin_user_id: req.user?.id || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "current_draw_participation_failed" });
+  }
+});
+
+router.patch("/current-draw-participation/:autopayNumberId", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await setCurrentDrawCaptiveParticipation({
+      autopayNumberId: req.params.autopayNumberId,
+      enabled: req.body?.enabled,
+      reason: req.body?.reason,
+      adminUserId: req.user?.id,
+    });
+    const refreshed = await loadCurrentDrawParticipation({
+      autopayNumberId: req.params.autopayNumberId,
+      page: 1,
+      limit: 1,
+    });
+    return res.json({ ...result, item: refreshed.items?.[0] || null });
+  } catch (error) {
+    console.error(`${LOG_PREFIX} current_draw_participation_update_failed`, {
+      admin_user_id: req.user?.id || null,
+      autopay_number_id: req.params?.autopayNumberId || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(error?.status || 500).json({
+      ok: false,
+      error: error?.message || "current_draw_participation_update_failed",
+    });
+  }
+});
 
 router.get("/", requireAuth, requireAdmin, async (req, res) => {
   try {
