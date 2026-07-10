@@ -39,7 +39,12 @@ const ADMIN_AUTHORIZATION_ERROR_CODES = new Set([
   "payment_failed_retry_required",
   "participation_not_pending",
   "authorization_amount_outdated",
+  "authorization_amount_mismatch",
   "payment_in_progress",
+  "payment_method_unavailable",
+  "group_already_partially_or_fully_charged",
+  "group_requires_review",
+  "group_changed",
   "admin_authorization_failed",
 ]);
 
@@ -103,7 +108,12 @@ function adminAuthorizationMessage(code) {
     payment_failed_retry_required: "A cobrança anterior falhou. É necessária uma nova confirmação antes de tentar novamente.",
     participation_not_pending: "Esta participação não está pendente de confirmação.",
     authorization_amount_outdated: "O valor da autorização está desatualizado. Reemita a confirmação antes de autorizar.",
+    authorization_amount_mismatch: "O grupo possui autorizações com valor diferente do preço atual do sorteio.",
     payment_in_progress: "Já existe uma cobrança em processamento para esta participação.",
+    payment_method_unavailable: "O cliente não possui cartão cadastrado disponível para esta cobrança.",
+    group_already_partially_or_fully_charged: "O grupo possui uma participação já cobrada e precisa de revisão.",
+    group_requires_review: "O grupo possui participações inconsistentes e precisa de revisão.",
+    group_changed: "O grupo foi alterado durante a autorização. Atualize a lista e revise as participações.",
     payment_failed: "A autorização foi registrada, mas a cobrança não foi aprovada.",
     authorization_charge_not_configured: "A autorização foi registrada, mas o cartão não está disponível para cobrança.",
   }[code] || "Não foi possível autorizar a cobrança.";
@@ -458,21 +468,6 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
     return `$${params.length}`;
   };
   if (autopayNumberId) where.push(`an.id = ${addParam(autopayNumberId)}`);
-  if (search) {
-    const searchParam = addParam(`%${search}%`);
-    where.push(`(
-      u.name ILIKE ${searchParam}
-      OR u.email ILIKE ${searchParam}
-      OR CAST(an.n AS text) ILIKE ${searchParam}
-    )`);
-  }
-  if (normalizedStatus === "enabled") where.push("COALESCE(draw_override.enabled, true) = true");
-  if (normalizedStatus === "disabled") where.push("COALESCE(draw_override.enabled, true) = false");
-  if (normalizedStatus === "pending") where.push("LOWER(COALESCE(auth.status, '')) = 'pending'");
-  if (normalizedStatus === "confirmed") {
-    where.push(`(${APPROVED_PARTICIPATION_SQL} OR LOWER(COALESCE(auth.status, '')) = 'authorized')`);
-  }
-  if (normalizedStatus === "failed") where.push("LOWER(COALESCE(auth.status, '')) = 'failed'");
   const whereSql = `WHERE ${where.join(" AND ")}`;
   const fromSql = `
     FROM public.autopay_numbers an
@@ -558,7 +553,7 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
        ${fromSql}
       ORDER BY an.n ASC, u.name ASC NULLS LAST
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-    [...params, safeLimit, offset]
+    [...params, autopayNumberId ? 1 : 100, autopayNumberId ? offset : 0]
   );
 
   const stats = await query(
@@ -584,20 +579,7 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
     [context.draw_id]
   );
 
-  return {
-    ok: true,
-    draw: {
-      draw_id: context.draw_id,
-      amount_cents: context.official_amount_cents,
-      default_amount_cents: context.default_amount_cents,
-      preauth_required: context.preauth_required,
-    },
-    page: safePage,
-    limit: safeLimit,
-    total,
-    pending_authorizations: Number(stats.rows?.[0]?.pending_authorizations || 0),
-    disabled_count: Number(stats.rows?.[0]?.disabled_count || 0),
-    items: (rows.rows || []).map((row) => {
+  const mappedItems = (rows.rows || []).map((row) => {
       const enabledCurrentDraw = row.enabled_current_draw === true;
       const authorizationStatus = String(row.authorization_status || "").toLowerCase() || null;
       const authorizationSource = row.authorization_source || (
@@ -643,6 +625,7 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
         authorization_expires_at: row.authorization_expires_at || null,
         payment_approved: row.payment_approved === true,
         payment_in_progress: row.payment_in_progress === true,
+        reservation_valid: row.reservation_valid === true,
         payment_status: row.payment_approved === true || authorizationStatus === "charged"
           ? "paid"
           : row.payment_in_progress === true || authorizationStatus === "authorized"
@@ -652,7 +635,7 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
         can_admin_authorize:
           context.preauth_required === true &&
           enabledCurrentDraw &&
-          authorizationStatus === "pending" &&
+          (authorizationStatus === "pending" || (authorizationStatus === "failed" && row.failed_retryable === true)) &&
           row.payment_approved !== true &&
           row.payment_in_progress !== true &&
           row.reservation_valid === true &&
@@ -660,8 +643,111 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
           Boolean(row.authorization_expires_at) &&
           new Date(row.authorization_expires_at).getTime() > Date.now(),
       };
-    }),
+    });
+  const basePayload = {
+    ok: true,
+    draw: {
+      draw_id: context.draw_id,
+      amount_cents: context.official_amount_cents,
+      default_amount_cents: context.default_amount_cents,
+      preauth_required: context.preauth_required,
+    },
+    page: safePage,
+    limit: safeLimit,
+    pending_authorizations: Number(stats.rows?.[0]?.pending_authorizations || 0),
+    disabled_count: Number(stats.rows?.[0]?.disabled_count || 0),
   };
+  if (autopayNumberId) {
+    return { ...basePayload, total, items: mappedItems };
+  }
+
+  const groupsByUser = new Map();
+  for (const item of mappedItems) {
+    const key = `${context.draw_id}:${item.user_id}`;
+    const current = groupsByUser.get(key) || {
+      group_key: key,
+      draw_id: context.draw_id,
+      user_id: item.user_id,
+      user_name: item.user_name,
+      user_email: item.user_email,
+      items: [],
+    };
+    current.items.push(item);
+    groupsByUser.set(key, current);
+  }
+  let groups = [...groupsByUser.values()].map((groupItem) => {
+    const groupItems = [...groupItem.items].sort((a, b) => a.captive_number - b.captive_number);
+    const statuses = groupItems.map((item) => item.authorization_status);
+    const allConfirmed = groupItems.every((item) => item.payment_approved || item.authorization_status === "charged");
+    const allDisabled = groupItems.every((item) => item.enabled_current_draw !== true);
+    const hasInconsistentState = groupItems.some((item) => (
+      !item.authorization_id ||
+      item.enabled_current_draw !== true ||
+      item.payment_approved ||
+      item.payment_in_progress ||
+      ["charged", "authorized", "declined", "expired"].includes(item.authorization_status) ||
+      !["pending", "failed"].includes(item.authorization_status) ||
+      (item.authorization_status === "failed" && item.retryable !== true) ||
+      item.reservation_valid !== true ||
+      Number(item.authorization_amount_cents) !== Number(context.official_amount_cents)
+    ));
+    const eligibleItems = groupItems.filter((item) => item.can_admin_authorize === true);
+    const canAdminAuthorize =
+      context.preauth_required === true &&
+      eligibleItems.length === groupItems.length &&
+      groupItems.length > 0 &&
+      !hasInconsistentState;
+    const unitAmountCents = Number(context.official_amount_cents);
+    const totalAmountCents = groupItems.reduce(
+      (sum, item) => sum + Number(item.authorization_amount_cents || 0),
+      0
+    );
+    let participationState = "review_required";
+    if (allConfirmed) participationState = "confirmed";
+    else if (allDisabled) participationState = "disabled";
+    else if (canAdminAuthorize && statuses.includes("failed")) participationState = "failed_retryable";
+    else if (canAdminAuthorize) participationState = "pending";
+    else if (groupItems.some((item) => item.payment_in_progress)) participationState = "payment_processing";
+    return {
+      ...groupItem,
+      items: groupItems,
+      authorization_id: eligibleItems[0]?.authorization_id || groupItems[0]?.authorization_id || null,
+      authorization_ids: groupItems.map((item) => item.authorization_id).filter(Boolean),
+      captive_numbers: groupItems.map((item) => item.captive_number),
+      quantity: groupItems.length,
+      unit_amount_cents: unitAmountCents,
+      total_amount_cents: totalAmountCents,
+      participation_state: participationState,
+      can_admin_authorize: canAdminAuthorize,
+      requires_review: !canAdminAuthorize && !allConfirmed && !allDisabled,
+      payment_approved: allConfirmed,
+      payment_in_progress: groupItems.some((item) => item.payment_in_progress),
+      enabled_current_draw: groupItems.every((item) => item.enabled_current_draw === true),
+    };
+  });
+
+  const normalizedSearch = String(search || "").trim().toLowerCase();
+  if (normalizedSearch) {
+    groups = groups.filter((groupItem) => (
+      String(groupItem.user_name || "").toLowerCase().includes(normalizedSearch) ||
+      String(groupItem.user_email || "").toLowerCase().includes(normalizedSearch) ||
+      groupItem.captive_numbers.some((number) => String(number).includes(normalizedSearch))
+    ));
+  }
+  if (normalizedStatus === "enabled") groups = groups.filter((item) => item.enabled_current_draw);
+  if (normalizedStatus === "disabled") groups = groups.filter((item) => !item.enabled_current_draw);
+  if (normalizedStatus === "pending") groups = groups.filter((item) => item.participation_state === "pending");
+  if (normalizedStatus === "confirmed") groups = groups.filter((item) => item.participation_state === "confirmed");
+  if (normalizedStatus === "failed") {
+    groups = groups.filter((item) => ["failed_retryable", "review_required"].includes(item.participation_state));
+  }
+  groups.sort((a, b) => (
+    String(a.user_name || "").localeCompare(String(b.user_name || ""), "pt-BR") ||
+    a.user_id - b.user_id
+  ));
+  const groupedTotal = groups.length;
+  const paginatedGroups = groups.slice(offset, offset + safeLimit);
+  return { ...basePayload, total: groupedTotal, items: paginatedGroups };
 }
 
 router.get("/current-draw-participation", requireAuth, requireAdmin, async (req, res) => {
@@ -698,7 +784,12 @@ router.post("/current-draw-participation/:authorizationId/authorize", requireAut
         })
       : null;
     if (!result.ok) {
-      return res.status(402).json({
+      const status = result.code === "payment_method_unavailable"
+        ? 422
+        : ["group_changed", "group_requires_review", "group_already_partially_or_fully_charged", "authorization_amount_mismatch"].includes(result.code)
+          ? 409
+          : 402;
+      return res.status(status).json({
         ...result,
         error: result.code || "payment_failed",
         message: adminAuthorizationMessage(result.code || "payment_failed"),

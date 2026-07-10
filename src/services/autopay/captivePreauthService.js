@@ -2451,22 +2451,345 @@ async function hasCaptivePreauthChargeInProgress(authorization, pgClient) {
       WHERE draw_id = $1
         AND user_id = $2
         AND lower(coalesce(status, '')) IN ('attempt', 'reserved', 'billed', 'charged')
-        AND (
-          provider_request->>'authorization_id' = $3
-          OR $4::smallint = ANY(coalesce(tried_numbers, '{}'::smallint[]))
-        )
       LIMIT 1`,
     [
       Number(authorization.draw_id),
       Number(authorization.user_id),
-      String(authorization.id),
-      Number(authorization.captive_number),
     ]
   );
   return result.rowCount > 0;
 }
 
 export async function authorizeCurrentDrawCaptivePreauthForAdmin({
+  authorizationId,
+  drawId,
+  adminUserId,
+}) {
+  const authId = String(authorizationId || "").trim();
+  const requestedDrawId = toPositiveInt(drawId);
+  const adminId = toPositiveInt(adminUserId);
+  if (!UUID_RE.test(authId)) throw captiveAdminError("participation_not_found", 404);
+  if (!requestedDrawId) throw captiveAdminError("invalid_draw_id", 400);
+  if (!adminId) throw captiveAdminError("invalid_admin_user", 400);
+
+  const context = await getCurrentCaptiveDrawContext();
+  if (!context.draw) throw captiveAdminError("current_principal_draw_not_found", 404);
+  if (context.draw_id !== requestedDrawId) throw captiveAdminError("draw_not_current_principal", 409);
+  if (!context.preauth_required) throw captiveAdminError("captive_preauth_not_required", 409);
+
+  const pool = await getPool();
+  const client = await pool.connect();
+  let group = null;
+
+  try {
+    await client.query("BEGIN");
+    const anchorResult = await client.query(
+      `SELECT id, draw_id, user_id
+         FROM public.autopay_draw_authorizations
+        WHERE id = $1
+          AND draw_id = $2
+        LIMIT 1`,
+      [authId, context.draw_id]
+    );
+    const anchor = anchorResult.rows?.[0] || null;
+    if (!anchor) throw captiveAdminError("participation_not_found", 404);
+
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+      `captive-preauth-admin:${context.draw_id}:${Number(anchor.user_id)}`,
+    ]);
+
+    const lockedDraw = await client.query(
+      `SELECT id, status, draw_type
+         FROM public.draws
+        WHERE id = $1
+        FOR UPDATE`,
+      [context.draw_id]
+    );
+    const draw = lockedDraw.rows?.[0] || null;
+    if (
+      !draw ||
+      String(draw.status || "").toLowerCase() !== "open" ||
+      String(draw.draw_type || "principal").toLowerCase() !== "principal"
+    ) {
+      throw captiveAdminError("current_principal_draw_changed", 409);
+    }
+
+    const authorizationResult = await client.query(
+      `SELECT *
+         FROM public.autopay_draw_authorizations
+        WHERE draw_id = $1
+          AND user_id = $2
+        ORDER BY id
+        FOR UPDATE`,
+      [context.draw_id, Number(anchor.user_id)]
+    );
+    const authorizations = authorizationResult.rows || [];
+    if (!authorizations.some((item) => String(item.id) === authId)) {
+      throw captiveAdminError("participation_not_found", 404);
+    }
+
+    const authorizationIds = authorizations.map((item) => String(item.id));
+    const captiveNumbers = authorizations.map((item) => Number(item.captive_number)).sort((a, b) => a - b);
+    const captiveResult = await client.query(
+      `SELECT ada.id AS authorization_id,
+              an.id AS autopay_number_id,
+              an.n AS captive_number,
+              an.active AS number_active,
+              ap.user_id,
+              ap.active AS profile_active,
+              ap.vindi_customer_id,
+              ap.vindi_payment_profile_id
+         FROM public.autopay_draw_authorizations ada
+         JOIN public.autopay_profiles ap
+           ON ap.id = ada.autopay_profile_id
+          AND ap.user_id = ada.user_id
+         JOIN public.autopay_numbers an
+           ON an.autopay_id = ap.id
+          AND an.n = ada.captive_number
+          AND (ada.autopay_number_id IS NULL OR an.id = ada.autopay_number_id)
+        WHERE ada.id = ANY($1::uuid[])
+        ORDER BY ada.id
+        FOR UPDATE OF ap, an`,
+      [authorizationIds]
+    );
+    const captives = captiveResult.rows || [];
+    if (
+      captives.length !== authorizations.length ||
+      captives.some((item) => (
+        item.profile_active !== true ||
+        item.number_active !== true ||
+        Number(item.user_id) !== Number(anchor.user_id)
+      ))
+    ) {
+      throw captiveAdminError("captive_number_not_available_for_user", 409);
+    }
+    if (captives.some((item) => !item.vindi_customer_id || !item.vindi_payment_profile_id)) {
+      throw captiveAdminError("payment_method_unavailable", 422);
+    }
+
+    const autopayNumberIds = captives.map((item) => String(item.autopay_number_id));
+    const overrideResult = await client.query(
+      `SELECT autopay_number_id, enabled
+         FROM public.autopay_draw_captive_overrides
+        WHERE draw_id = $1
+          AND autopay_number_id = ANY($2::uuid[])
+        ORDER BY autopay_number_id
+        FOR UPDATE`,
+      [context.draw_id, autopayNumberIds]
+    );
+    if ((overrideResult.rows || []).some((item) => item.enabled === false)) {
+      throw captiveAdminError("participation_disabled_current_draw", 409);
+    }
+
+    const paymentResult = await client.query(
+      `SELECT id, numbers
+         FROM public.payments
+        WHERE draw_id = $1
+          AND user_id = $2
+          AND (
+            lower(status) IN ('approved', 'paid', 'pago')
+            OR lower(coalesce(vindi_status, '')) IN ('approved', 'paid', 'pago', 'success', 'successful')
+          )
+        FOR UPDATE`,
+      [context.draw_id, Number(anchor.user_id)]
+    );
+    const approvedNumbers = new Set(
+      (paymentResult.rows || []).flatMap((item) => (item.numbers || []).map(Number))
+    );
+    const statuses = authorizations.map((item) => safeStatus(item.status));
+    const chargedCount = authorizations.filter((item) => (
+      safeStatus(item.status) === "charged" || approvedNumbers.has(Number(item.captive_number))
+    )).length;
+    const totalAmountCents = authorizations.reduce(
+      (total, item) => total + Number(item.amount_cents),
+      0
+    );
+    if (chargedCount === authorizations.length) {
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        code: "already_charged",
+        status: "charged",
+        charged: true,
+        already_charged: true,
+        draw_id: context.draw_id,
+        user_id: Number(anchor.user_id),
+        authorization_ids: authorizationIds,
+        captive_numbers: captiveNumbers,
+        quantity: authorizations.length,
+        unit_amount_cents: Number(context.official_amount_cents),
+        total_amount_cents: totalAmountCents,
+      };
+    }
+    if (chargedCount > 0 || paymentResult.rowCount > 0 || statuses.includes("charged")) {
+      throw captiveAdminError("group_already_partially_or_fully_charged", 409);
+    }
+    if (statuses.some((status) => ["declined", "expired", "authorized"].includes(status))) {
+      throw captiveAdminError("group_requires_review", 409);
+    }
+    if (statuses.some((status) => !["pending", "failed"].includes(status))) {
+      throw captiveAdminError("group_requires_review", 409);
+    }
+    if (authorizations.some((item) => (
+      !Number.isInteger(Number(item.amount_cents)) ||
+      Number(item.amount_cents) <= 0 ||
+      Number(item.amount_cents) !== Number(context.official_amount_cents)
+    ))) {
+      throw captiveAdminError("authorization_amount_mismatch", 409);
+    }
+    if (authorizations.some((item) => {
+      const expiresAt = item.expires_at ? new Date(item.expires_at).getTime() : null;
+      return !expiresAt || expiresAt <= Date.now();
+    })) {
+      throw captiveAdminError("authorization_expired", 410);
+    }
+    if (await hasCaptivePreauthChargeInProgress(authorizations[0], client)) {
+      throw captiveAdminError("payment_in_progress", 409);
+    }
+
+    const numberResult = await client.query(
+      `SELECT n, status, reservation_id
+         FROM public.numbers
+        WHERE draw_id = $1
+          AND n = ANY($2::smallint[])
+        ORDER BY n
+        FOR UPDATE`,
+      [context.draw_id, captiveNumbers]
+    );
+    const numberRows = numberResult.rows || [];
+    const reservationIds = [...new Set(numberRows.map((item) => item.reservation_id).filter(Boolean).map(String))];
+    const reservationResult = reservationIds.length
+      ? await client.query(
+          `SELECT id, user_id, numbers, status, expires_at
+             FROM public.reservations
+            WHERE id = ANY($1::text[])
+            ORDER BY id
+            FOR UPDATE`,
+          [reservationIds]
+        )
+      : { rows: [] };
+    const reservationsById = new Map((reservationResult.rows || []).map((item) => [String(item.id), item]));
+    const reservationsValid = numberRows.length === authorizations.length && numberRows.every((numberRow) => {
+      const reservation = reservationsById.get(String(numberRow.reservation_id || ""));
+      const reservationStatus = safeStatus(reservation?.status);
+      const expiresAt = reservation?.expires_at ? new Date(reservation.expires_at).getTime() : null;
+      return safeStatus(numberRow.status) === "reserved" &&
+        reservation &&
+        ["pending", "active", "reserved", ""].includes(reservationStatus) &&
+        (!expiresAt || expiresAt > Date.now()) &&
+        Number(reservation.user_id) === Number(anchor.user_id) &&
+        (reservation.numbers || []).map(Number).includes(Number(numberRow.n));
+    });
+    if (!reservationsValid) {
+      throw captiveAdminError("captive_number_not_available_for_user", 409);
+    }
+
+    const updated = await client.query(
+      `UPDATE public.autopay_draw_authorizations
+          SET status = 'authorized',
+              authorized_at = now(),
+              charged_at = NULL,
+              updated_at = now()
+        WHERE id = ANY($1::uuid[])
+          AND status IN ('pending', 'failed')
+        RETURNING *`,
+      [authorizationIds]
+    );
+    if (updated.rowCount !== authorizations.length) {
+      throw captiveAdminError("group_requires_review", 409);
+    }
+    const anchorAuthorization = authorizations.find((item) => String(item.id) === authId) || authorizations[0];
+    const anchorCaptive = captives.find((item) => String(item.authorization_id) === String(anchorAuthorization.id));
+    group = {
+      anchor: anchorAuthorization,
+      anchor_autopay_number_id: String(anchorCaptive.autopay_number_id),
+      authorization_ids: authorizationIds,
+      captive_numbers: captiveNumbers,
+      previous_statuses: Object.fromEntries(
+        authorizations.map((item) => [String(item.id), safeStatus(item.status)])
+      ),
+      draw_id: context.draw_id,
+      user_id: Number(anchor.user_id),
+      quantity: authorizations.length,
+      unit_amount_cents: Number(context.official_amount_cents),
+      total_amount_cents: totalAmountCents,
+    };
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const chargedResult = await chargeAuthorizedCaptivePreauthWithAutopay(authId, {
+    adminGroup: true,
+    expectedAuthorizationIds: group.authorization_ids,
+  });
+  const audit = await query(
+    `INSERT INTO public.captive_preauth_authorization_events (
+        authorization_id, draw_id, user_id, autopay_number_id, captive_number,
+        amount_cents, previous_status, new_status, authorization_source,
+        admin_user_id, origin, authorization_ids, captive_numbers, quantity,
+        unit_amount_cents, total_amount_cents, result, provider_bill_id, provider_charge_id
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, 'admin',
+        $9, 'admin_panel_grouped', $10::uuid[], $11::smallint[], $12,
+        $13, $14, $15, $16, $17
+      )
+      RETURNING id`,
+    [
+      group.anchor.id,
+      group.draw_id,
+      group.user_id,
+      group.anchor_autopay_number_id,
+      Number(group.anchor.captive_number),
+      group.unit_amount_cents,
+      JSON.stringify(group.previous_statuses),
+      chargedResult.ok ? "charged" : "failed",
+      adminId,
+      group.authorization_ids,
+      group.captive_numbers,
+      group.quantity,
+      group.unit_amount_cents,
+      group.total_amount_cents,
+      chargedResult.ok ? "charged" : chargedResult.code || "payment_failed",
+      chargedResult.provider_bill_id || null,
+      chargedResult.provider_charge_id || null,
+    ]
+  );
+  log("admin_authorization_completed", {
+    authorization_id: group.anchor.id,
+    authorization_ids: group.authorization_ids,
+    draw_id: group.draw_id,
+    user_id: group.user_id,
+    captive_numbers: group.captive_numbers,
+    admin_user_id: adminId,
+    status: chargedResult.status,
+    charged: chargedResult.charged === true,
+  });
+  return {
+    ok: chargedResult.ok === true,
+    code: chargedResult.code,
+    status: chargedResult.status,
+    charged: chargedResult.charged === true,
+    already_charged: chargedResult.code === "already_charged",
+    draw_id: group.draw_id,
+    user_id: group.user_id,
+    authorization_ids: group.authorization_ids,
+    captive_numbers: group.captive_numbers,
+    quantity: group.quantity,
+    unit_amount_cents: group.unit_amount_cents,
+    total_amount_cents: group.total_amount_cents,
+    authorization_source: "admin",
+    authorized_by_admin_id: adminId,
+    audit_event_id: audit.rows?.[0]?.id ? String(audit.rows[0].id) : null,
+  };
+}
+
+async function authorizeCurrentDrawCaptivePreauthForAdminLegacy({
   authorizationId,
   drawId,
   adminUserId,
