@@ -14,6 +14,11 @@ router.use(requireAuth, requireAdmin);
 
 /* =============== helpers =============== */
 
+const USER_SELECT_COLS = `
+  id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents,
+  winner_balance_cents, winner_balance_updated_at
+`;
+
 const mapUser = (r) => ({
   id: Number(r.id),
   name: r.name || "",
@@ -23,6 +28,8 @@ const mapUser = (r) => ({
   created_at: r.created_at,
   coupon_code: r.coupon_code || "",
   coupon_value_cents: Number(r.coupon_value_cents || 0),
+  winner_balance_cents: r.winner_balance_cents == null ? null : Number(r.winner_balance_cents),
+  winner_balance_updated_at: r.winner_balance_updated_at || null,
 });
 
 const normStr = (v, max = 255) => String(v ?? "").trim().slice(0, max);
@@ -38,6 +45,21 @@ function safeJsonMeta(meta) {
   } catch {
     return "{}";
   }
+}
+
+function parsePositiveUserId(value) {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function normalizeWinnerReason(value) {
+  const reason = String(value || "").trim().slice(0, 500);
+  return reason || null;
+}
+
+function parseWinnerAmountCents(value) {
+  const amount = Number(value);
+  return Number.isInteger(amount) && amount > 0 ? amount : null;
 }
 
 async function getTicketPriceCentsFromAppConfig(q) {
@@ -114,9 +136,7 @@ router.get("/", async (req, res, next) => {
     const like = `%${String(q).trim()}%`;
     const hasQ = String(q).trim().length > 0;
 
-    const cols = `
-      id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents
-    `;
+    const cols = USER_SELECT_COLS;
     const base = `FROM public.users`;
     const where = hasQ
       ? ` WHERE (name ILIKE $3
@@ -162,7 +182,7 @@ router.get("/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const { rows } = await query(
-      `SELECT id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents
+      `SELECT ${USER_SELECT_COLS}
          FROM public.users
         WHERE id = $1`,
       [id]
@@ -212,7 +232,7 @@ router.post("/", async (req, res, next) => {
       `INSERT INTO public.users
          (name, email, phone, is_admin, coupon_code, coupon_value_cents, pass_hash)
        VALUES ($1,$2,$3,$4,$5,$6, crypt($7, gen_salt('bf')))
-       RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
+       RETURNING ${USER_SELECT_COLS}`,
       [...vals, DEFAULT_PASSWORD]
     );
 
@@ -308,7 +328,7 @@ router.put("/:id", async (req, res, next) => {
               coupon_code        = COALESCE($6, coupon_code),
               coupon_value_cents = COALESCE($7, coupon_value_cents)
         WHERE id = $1
-        RETURNING id, name, email, phone, is_admin, created_at, coupon_code, coupon_value_cents`,
+        RETURNING ${USER_SELECT_COLS}`,
       [
         id,
         name != null ? normStr(name, 255) : null,
@@ -359,6 +379,126 @@ router.put("/:id", async (req, res, next) => {
     } catch {}
     if (e.code === "23505") return res.status(409).json({ error: "duplicated" });
     next(e);
+  } finally {
+    client.release();
+  }
+});
+
+/* =============== SALDO VENCEDOR =============== */
+/** PATCH /api/admin/users/:id/winner-balance */
+router.patch("/:id/winner-balance", async (req, res, next) => {
+  const pool = await getPool();
+  const client = await pool.connect();
+  try {
+    const id = parsePositiveUserId(req.params.id);
+    const amountCents = parseWinnerAmountCents(req.body?.amount_cents);
+    const reason = normalizeWinnerReason(req.body?.reason);
+
+    if (!id) return res.status(400).json({ error: "invalid_user_id" });
+    if (!amountCents) return res.status(400).json({ error: "invalid_winner_balance_amount" });
+    if (!reason) return res.status(400).json({ error: "winner_balance_reason_required" });
+
+    await client.query("BEGIN");
+    const current = await client.query(
+      `SELECT ${USER_SELECT_COLS}
+         FROM public.users
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if (!current.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "not_found" });
+    }
+
+    const previousBalanceCents = current.rows[0].winner_balance_cents == null
+      ? null
+      : Number(current.rows[0].winner_balance_cents);
+    const action = previousBalanceCents == null ? "ASSIGNED" : "UPDATED";
+
+    const updated = await client.query(
+      `UPDATE public.users
+          SET winner_balance_cents = $2,
+              winner_balance_updated_at = now()
+        WHERE id = $1
+        RETURNING ${USER_SELECT_COLS}`,
+      [id, amountCents]
+    );
+
+    await client.query(
+      `INSERT INTO public.winner_balance_history
+         (user_id, admin_user_id, previous_balance_cents, new_balance_cents, action, reason, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now())`,
+      [id, req.user?.id ?? null, previousBalanceCents, amountCents, action, reason]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, user: mapUser(updated.rows[0]) });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    return next(e);
+  } finally {
+    client.release();
+  }
+});
+
+/** DELETE /api/admin/users/:id/winner-balance */
+router.delete("/:id/winner-balance", async (req, res, next) => {
+  const pool = await getPool();
+  const client = await pool.connect();
+  try {
+    const id = parsePositiveUserId(req.params.id);
+    const reason = normalizeWinnerReason(req.body?.reason);
+
+    if (!id) return res.status(400).json({ error: "invalid_user_id" });
+    if (!reason) return res.status(400).json({ error: "winner_balance_reason_required" });
+
+    await client.query("BEGIN");
+    const current = await client.query(
+      `SELECT ${USER_SELECT_COLS}
+         FROM public.users
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if (!current.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "not_found" });
+    }
+
+    const previousBalanceCents = current.rows[0].winner_balance_cents == null
+      ? null
+      : Number(current.rows[0].winner_balance_cents);
+    if (previousBalanceCents == null) {
+      await client.query("COMMIT");
+      return res.json({ ok: true, user: mapUser(current.rows[0]), already_hidden: true });
+    }
+
+    const updated = await client.query(
+      `UPDATE public.users
+          SET winner_balance_cents = NULL,
+              winner_balance_updated_at = now()
+        WHERE id = $1
+        RETURNING ${USER_SELECT_COLS}`,
+      [id]
+    );
+
+    await client.query(
+      `INSERT INTO public.winner_balance_history
+         (user_id, admin_user_id, previous_balance_cents, new_balance_cents, action, reason, created_at)
+       VALUES ($1, $2, $3, NULL, 'HIDDEN', $4, now())`,
+      [id, req.user?.id ?? null, previousBalanceCents, reason]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, user: mapUser(updated.rows[0]) });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    return next(e);
   } finally {
     client.release();
   }
