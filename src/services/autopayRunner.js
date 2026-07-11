@@ -42,6 +42,18 @@ function shouldRequireCaptivePreauth({ currentAmountCents, authorizedBaseAmountC
 /* ------------------------------------------------------- *
  * Autopay Runs (1 linha por attempt_trace_id) — com CASTS explícitos
  * ------------------------------------------------------- */
+function isAutopayRunsUserDrawUniqueViolation(error) {
+  const constraint = String(error?.constraint || error?.constraint_name || "").toLowerCase();
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    String(error?.code) === "23505" &&
+    (
+      constraint === "autopay_runs_user_draw_unique" ||
+      message.includes("autopay_runs_user_draw_unique")
+    )
+  );
+}
+
 async function insertAutopayRunAttempt(client, run) {
   const {
     run_trace_id,
@@ -65,50 +77,71 @@ async function insertAutopayRunAttempt(client, run) {
   const providerRequestJson = provider_request != null ? JSON.stringify(provider_request) : null;
   const providerResponseJson = provider_response != null ? JSON.stringify(provider_response) : null;
 
-  await client.query(
-    `insert into public.autopay_runs (
-        run_trace_id, attempt_trace_id,
-        autopay_id, user_id, draw_id,
+  let inserted;
+  try {
+    inserted = await client.query(
+      `insert into public.autopay_runs (
+          run_trace_id, attempt_trace_id,
+          autopay_id, user_id, draw_id,
+          tried_numbers,
+          reservation_id,
+          provider, status, amount_cents,
+          provider_status, provider_bill_id, provider_charge_id,
+          provider_request, provider_response,
+          error_message
+        ) values (
+          $1::uuid, $2::uuid,
+          $3::uuid, $4::int4, $5::int4,
+          $6::int2[],
+          $7::uuid,
+          $8::text, $9::text, $10::int4,
+          $11::int4, $12::text, $13::text,
+          $14::jsonb, $15::jsonb,
+          $16::text
+        )
+        returning id`,
+      [
+        run_trace_id,
+        attempt_trace_id,
+        autopay_id,
+        user_id,
+        draw_id,
         tried_numbers,
         reservation_id,
-        provider, status, amount_cents,
-        provider_status, provider_bill_id, provider_charge_id,
-        provider_request, provider_response,
-        error_message
-      ) values (
-        $1::uuid, $2::uuid,
-        $3::uuid, $4::int4, $5::int4,
-        $6::int2[],
-        $7::uuid,
-        $8::text, $9::text, $10::int4,
-        $11::int4, $12::text, $13::text,
-        $14::jsonb, $15::jsonb,
-        $16::text
-      )`,
-    [
-      run_trace_id,
-      attempt_trace_id,
-      autopay_id,
-      user_id,
-      draw_id,
-      tried_numbers,
-      reservation_id,
-      provider,
-      status,
-      amount_cents,
-      provider_status,
-      provider_bill_id,
-      provider_charge_id,
-      providerRequestJson,
-      providerResponseJson,
-      error_message,
-    ]
-  );
+        provider,
+        status,
+        amount_cents,
+        provider_status,
+        provider_bill_id,
+        provider_charge_id,
+        providerRequestJson,
+        providerResponseJson,
+        error_message,
+      ]
+    );
+  } catch (error) {
+    if (isAutopayRunsUserDrawUniqueViolation(error)) {
+      const schemaError = new Error("autopay_runs_schema_not_migrated");
+      schemaError.code = "autopay_runs_schema_not_migrated";
+      schemaError.reason = "autopay_runs_user_draw_unique";
+      throw schemaError;
+    }
+    throw error;
+  }
+
+  const autopayRunId = inserted.rows?.[0]?.id ?? null;
+  if (autopayRunId == null) {
+    const insertError = new Error("autopay_run_insert_failed");
+    insertError.code = "autopay_run_insert_failed";
+    throw insertError;
+  }
+  return autopayRunId;
 }
 
 async function updateAutopayRunAttempt(client, run) {
   const {
-    attempt_trace_id,
+    id = null,
+    attempt_trace_id = null,
     reservation_id = null,
     status,
     amount_cents = null,
@@ -122,6 +155,36 @@ async function updateAutopayRunAttempt(client, run) {
 
   const providerRequestJson = provider_request != null ? JSON.stringify(provider_request) : null;
   const providerResponseJson = provider_response != null ? JSON.stringify(provider_response) : null;
+  const autopayRunId = id != null ? id : null;
+
+  if (autopayRunId != null) {
+    await client.query(
+      `update public.autopay_runs
+          set reservation_id   = coalesce($2::uuid, reservation_id),
+              status           = $3::text,
+              amount_cents     = coalesce($4::int4, amount_cents),
+              provider_status  = coalesce($5::int4, provider_status),
+              provider_bill_id = coalesce($6::text, provider_bill_id),
+              provider_charge_id = coalesce($7::text, provider_charge_id),
+              provider_request = coalesce($8::jsonb, provider_request),
+              provider_response = coalesce($9::jsonb, provider_response),
+              error_message    = coalesce($10::text, error_message)
+        where id = $1`,
+      [
+        autopayRunId,
+        reservation_id,
+        status,
+        amount_cents,
+        provider_status,
+        provider_bill_id,
+        provider_charge_id,
+        providerRequestJson,
+        providerResponseJson,
+        error_message,
+      ]
+    );
+    return;
+  }
 
   await client.query(
     `update public.autopay_runs
@@ -928,6 +991,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
   let paymentProfileLookupStarted = false;
   let paymentProfileResolved = false;
   let attemptPersisted = false;
+  let autopayRunId = null;
   let billRequestStarted = false;
   let billResponseReceived = false;
 
@@ -1175,7 +1239,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
     };
     await client.query("COMMIT");
     financialStage = "attempt_persisting";
-    await insertAutopayRunAttempt(pool, {
+    autopayRunId = await insertAutopayRunAttempt(pool, {
       run_trace_id: runTraceId,
       attempt_trace_id: attemptTraceId,
       autopay_id,
@@ -1196,6 +1260,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
     financialStage = "payment_profile_lookup";
     providerRequest = { ...providerRequest, stage: financialStage };
     await updateAutopayRunAttempt(pool, {
+      id: autopayRunId,
       attempt_trace_id: attemptTraceId,
       status: "payment_profile_lookup",
       provider_request: providerRequest,
@@ -1276,6 +1341,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
     financialStage = "payment_profile_resolved";
     providerRequest = { ...providerRequest, stage: financialStage };
     await updateAutopayRunAttempt(pool, {
+      id: autopayRunId,
       attempt_trace_id: attemptTraceId,
       status: "payment_profile_resolved",
       provider_request: providerRequest,
@@ -1325,6 +1391,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
         financialStage = "bill_request_started";
         providerRequest = { ...providerRequest, stage: financialStage };
         await updateAutopayRunAttempt(pool, {
+          id: autopayRunId,
           attempt_trace_id: attemptTraceId,
           status: "bill_request_started",
           provider_request: providerRequest,
@@ -1337,6 +1404,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
     billId = bill.billId;
     chargeId = bill.chargeId;
     await updateAutopayRunAttempt(client, {
+      id: autopayRunId,
       attempt_trace_id: attemptTraceId,
       status: "billed",
       provider_status: bill.httpStatus ?? null,
@@ -1366,6 +1434,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
       const chargeResult = await chargeBill(billId, { traceId: attemptTraceId });
       chargeId = chargeResult.chargeId;
       await updateAutopayRunAttempt(client, {
+        id: autopayRunId,
         attempt_trace_id: attemptTraceId,
         status: "charged",
         provider_status: chargeResult.httpStatus ?? null,
@@ -1479,6 +1548,26 @@ async function chargeAuthorizedCaptivePreauthGroup({
         provider_charge_id: null,
       };
     }
+    if (error?.code === "autopay_runs_schema_not_migrated") {
+      console.error("[autopayRunner] autopay_runs_schema_not_migrated", {
+        draw_id: context.drawId,
+        user_id: context.userId,
+        authorization_ids: context.authorizationIds,
+      });
+      return {
+        ok: false,
+        code: "autopay_runs_schema_not_migrated",
+        status: "failed",
+        charged: false,
+        definitive: true,
+        retryable: false,
+        financial_stage: financialStage,
+        bill_request_started: false,
+        reason: "autopay_runs_user_draw_unique",
+        provider_bill_id: null,
+        provider_charge_id: null,
+      };
+    }
     if (billRequestStarted && billId) {
       try {
         const billInfo = await getBill(billId);
@@ -1557,6 +1646,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
     if (attemptPersisted) {
       try {
         await updateAutopayRunAttempt(pool, {
+          id: autopayRunId,
           attempt_trace_id: attemptTraceId,
           status: runStatus,
           provider_status: providerStatus,
@@ -1579,7 +1669,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
       }
     } else {
       try {
-        await insertAutopayRunAttempt(pool, {
+        autopayRunId = await insertAutopayRunAttempt(pool, {
           run_trace_id: runTraceId,
           attempt_trace_id: attemptTraceId,
           autopay_id: context.autopayProfileId,
@@ -1596,6 +1686,26 @@ async function chargeAuthorizedCaptivePreauthGroup({
         });
         attemptPersisted = true;
       } catch (runInsertError) {
+        if (runInsertError?.code === "autopay_runs_schema_not_migrated") {
+          console.error("[autopayRunner] autopay_runs_schema_not_migrated", {
+            draw_id: context.drawId,
+            user_id: context.userId,
+            authorization_ids: context.authorizationIds,
+          });
+          return {
+            ok: false,
+            code: "autopay_runs_schema_not_migrated",
+            status: "failed",
+            charged: false,
+            definitive: true,
+            retryable: false,
+            financial_stage: financialStage,
+            bill_request_started: false,
+            reason: "autopay_runs_user_draw_unique",
+            provider_bill_id: null,
+            provider_charge_id: null,
+          };
+        }
         err("admin_captive_payment_attempt_insert_failed", {
           event: "admin_captive_payment_attempt_insert_failed",
           stage: financialStage,
