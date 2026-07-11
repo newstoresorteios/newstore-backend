@@ -911,6 +911,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
     autopayProfileId: null,
     customerId: null,
     paymentProfileId: null,
+    financialStage: "preflight",
   };
   const runTraceId = crypto.randomUUID();
   const attemptTraceId = crypto.randomUUID();
@@ -1043,12 +1044,23 @@ async function chargeAuthorizedCaptivePreauthGroup({
       return { ok: false, code: "authorization_amount_mismatch", status: "failed", charged: false, definitive: true };
     }
 
+    financialStage = "existing_payment_check";
+    context.financialStage = financialStage;
+    providerRequest = {
+      stage: financialStage,
+      authorization_ids: context.authorizationIds,
+      numbers: context.captiveNumbers,
+      amount_cents: context.totalAmountCents,
+      customer_id: context.customerId,
+      payment_profile_id: context.paymentProfileId,
+      idempotency_key: lockKey,
+    };
     const existingPayment = await client.query(
       `SELECT 1
          FROM public.payments
         WHERE draw_id = $1
           AND user_id = $2
-          AND numbers && $3::int2[]
+          AND numbers && $3::int[]
           AND (
             lower(status) IN ('approved', 'paid', 'pago')
             OR lower(coalesce(vindi_status, '')) IN ('approved', 'paid', 'pago', 'success', 'successful')
@@ -1539,6 +1551,9 @@ async function chargeAuthorizedCaptivePreauthGroup({
       ...(providerRequest || {}),
       stage: financialStage,
     };
+    const technicalErrorMessage = `${financialStage}: ${String(
+      error?.message || failureReason || failureCode
+    )}`.replace(/\s+/g, " ").slice(0, 180);
     if (attemptPersisted) {
       try {
         await updateAutopayRunAttempt(pool, {
@@ -1549,7 +1564,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
           provider_charge_id: chargeId,
           provider_request: providerRequest,
           provider_response: error?.response || null,
-          error_message: String(failureReason || error?.message || failureCode).slice(0, 180),
+          error_message: technicalErrorMessage,
         });
       } catch (runUpdateError) {
         err("admin_captive_payment_attempt_persist_failed", {
@@ -1577,7 +1592,7 @@ async function chargeAuthorizedCaptivePreauthGroup({
           amount_cents: context.totalAmountCents,
           provider_status: providerStatus,
           provider_request: providerRequest,
-          error_message: String(failureReason || error?.message || failureCode).slice(0, 180),
+          error_message: technicalErrorMessage,
         });
         attemptPersisted = true;
       } catch (runInsertError) {
