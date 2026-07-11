@@ -778,7 +778,7 @@ async function finalizePaidReservationGroup(client, {
           SET status = 'paid',
               payment_id = $2,
               expires_at = now()
-        WHERE id = ANY($1::text[])
+        WHERE id = ANY($1::uuid[])
           AND draw_id = $3
           AND user_id = $4`,
       [reservationIds, paymentId, draw_id, user_id]
@@ -791,7 +791,7 @@ async function finalizePaidReservationGroup(client, {
           SET status = 'sold'
         WHERE draw_id = $1
           AND n = ANY($2::int2[])
-          AND reservation_id = ANY($3::text[])`,
+          AND reservation_id = ANY($3::uuid[])`,
       [draw_id, numbers, reservationIds]
     );
     if (numberUpdate.rowCount !== numbers.length) {

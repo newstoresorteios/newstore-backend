@@ -2662,7 +2662,7 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
       ? await client.query(
           `SELECT id, user_id, numbers, status, expires_at
              FROM public.reservations
-            WHERE id = ANY($1::text[])
+            WHERE id = ANY($1::uuid[])
             ORDER BY id
             FOR UPDATE`,
           [reservationIds]
