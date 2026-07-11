@@ -43,6 +43,9 @@ const ADMIN_AUTHORIZATION_ERROR_CODES = new Set([
   "payment_failed_retry_required",
   "payment_failed",
   "payment_result_unknown",
+  "payment_provider_unavailable",
+  "payment_preflight_failed",
+  "payment_attempt_persist_failed",
   "participation_not_pending",
   "authorization_amount_outdated",
   "authorization_amount_mismatch",
@@ -126,6 +129,9 @@ function adminAuthorizationMessage(code) {
     group_changed: "O grupo foi alterado durante a autorização. Atualize a lista e revise as participações.",
     payment_failed: "A cobrança não foi aprovada pelo cartão cadastrado.",
     payment_result_unknown: "Não foi possível confirmar o resultado da cobrança. Verifique a Vindi antes de tentar novamente.",
+    payment_provider_unavailable: "A Vindi está temporariamente indisponível. Tente novamente mais tarde.",
+    payment_preflight_failed: "A validação financeira falhou antes do envio da cobrança.",
+    payment_attempt_persist_failed: "Não foi possível registrar a tentativa financeira.",
     authorization_charge_not_configured: "A autorização foi registrada, mas o cartão não está disponível para cobrança.",
   }[code] || "Não foi possível autorizar a cobrança.";
 }
@@ -822,9 +828,13 @@ router.post("/current-draw-participation/:authorizationId/authorize", requireAut
         })
       : null;
     if (!result.ok) {
-      const status = ["captive_payment_profile_mismatch", "captive_group_changed", "group_changed", "group_requires_review", "group_already_partially_or_fully_charged", "authorization_amount_mismatch", "payment_result_unknown", "payment_in_progress"].includes(result.code)
-          ? 409
-          : 402;
+      const status = result.code === "payment_provider_unavailable"
+        ? 503
+        : result.code === "payment_attempt_persist_failed"
+          ? 500
+          : ["captive_payment_profile_mismatch", "captive_group_changed", "group_changed", "group_requires_review", "group_already_partially_or_fully_charged", "authorization_amount_mismatch", "payment_result_unknown", "payment_in_progress", "payment_preflight_failed"].includes(result.code)
+            ? 409
+            : 402;
       return res.status(status).json({
         ...result,
         error: result.code || "payment_failed",

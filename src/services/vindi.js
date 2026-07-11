@@ -540,7 +540,7 @@ export async function createPaymentProfileWithCardData({
  * @param {object} params - { customerId, amount, description, metadata?, paymentProfileId, dueAt? }
  * @returns {Promise<{billId: string, status: string}>}
  */
-export async function createBill({ customerId, amount_cents_total, quantity, description, metadata, paymentProfileId, dueAt, idempotencyKey, traceId }) {
+export async function createBill({ customerId, amount_cents_total, quantity, description, metadata, paymentProfileId, dueAt, idempotencyKey, traceId, onRequestStarted }) {
   if (!customerId || !paymentProfileId) {
     throw new Error("customerId e paymentProfileId são obrigatórios");
   }
@@ -606,6 +606,9 @@ export async function createBill({ customerId, amount_cents_total, quantity, des
       body: summarizeBillBodyForLogs(body),
     });
 
+    if (typeof onRequestStarted === "function") {
+      await onRequestStarted();
+    }
     const { data: created, httpStatus } = await vindiRequestWithMeta("POST", "/bills", body, { traceId });
     const bill = created.bill;
     const charge0 = bill?.charges?.[0] || null;

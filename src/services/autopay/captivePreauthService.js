@@ -2835,6 +2835,7 @@ const reservations = reservationResult.rows || [];
   if (!chargedResult.ok && chargedResult.definitive !== true) {
     warn("admin_captive_group_payment_result_unknown", {
       event: "admin_captive_group_payment_result_unknown",
+      stage: chargedResult.financial_stage || null,
       draw_id: group.draw_id,
       user_id: group.user_id,
       authorization_ids: group.authorization_ids,
@@ -2842,6 +2843,68 @@ const reservations = reservationResult.rows || [];
       provider_bill_id: chargedResult.provider_bill_id || null,
       provider_charge_id: chargedResult.provider_charge_id || null,
     });
+    const unknownClient = await pool.connect();
+    try {
+      await unknownClient.query("BEGIN");
+      const lockedUnknown = await unknownClient.query(
+        `SELECT id, status
+           FROM public.autopay_draw_authorizations
+          WHERE id = ANY($1::uuid[])
+            AND draw_id = $2
+            AND user_id = $3
+          ORDER BY id
+          FOR UPDATE`,
+        [group.authorization_ids, group.draw_id, group.user_id]
+      );
+      const unknownRows = lockedUnknown.rows || [];
+      const actualIds = unknownRows.map((item) => String(item.id)).sort();
+      const expectedIds = [...group.authorization_ids].map(String).sort();
+      if (
+        actualIds.length !== expectedIds.length ||
+        expectedIds.some((value, index) => value !== actualIds[index]) ||
+        unknownRows.some((item) => safeStatus(item.status) !== "authorized")
+      ) {
+        throw captiveAdminError("captive_group_changed", 409, "unknown_result_group_changed");
+      }
+      await unknownClient.query(
+        `INSERT INTO public.captive_preauth_authorization_events (
+            authorization_id, draw_id, user_id, autopay_number_id, captive_number,
+            amount_cents, previous_status, new_status, authorization_source,
+            admin_user_id, origin, authorization_ids, captive_numbers, quantity,
+            unit_amount_cents, total_amount_cents, result, provider_bill_id, provider_charge_id
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, 'authorized', 'admin',
+            $8, $16, $9::uuid[], $10::smallint[], $11,
+            $12, $13, 'payment_result_unknown', $14, $15
+          )`,
+        [
+          group.anchor.id,
+          group.draw_id,
+          group.user_id,
+          group.anchor_autopay_number_id,
+          Number(group.anchor.captive_number),
+          group.unit_amount_cents,
+          JSON.stringify(group.previous_statuses),
+          adminId,
+          group.authorization_ids,
+          group.captive_numbers,
+          group.quantity,
+          group.unit_amount_cents,
+          group.total_amount_cents,
+          chargedResult.provider_bill_id || null,
+          chargedResult.provider_charge_id || null,
+          group.audit_origin,
+        ]
+      );
+      await unknownClient.query("COMMIT");
+    } catch (unknownError) {
+      try {
+        await unknownClient.query("ROLLBACK");
+      } catch {}
+      throw unknownError;
+    } finally {
+      unknownClient.release();
+    }
     return {
       ok: false,
       code: chargedResult.code || "payment_result_unknown",
@@ -2948,7 +3011,7 @@ const reservations = reservationResult.rows || [];
       );
       const reservationRows = reservationResult.rows || [];
       retryable =
-        chargedResult.code === "payment_failed" &&
+        chargedResult.retryable === true &&
         reservationRows.length === group.quantity &&
         reservationRows.every((item) => {
           const expiresAt = item.expires_at ? new Date(item.expires_at).getTime() : null;
