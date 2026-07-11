@@ -808,6 +808,17 @@ export async function refundCharge(chargeId, cancelBill = true) {
 /**
  * Busca um payment profile existente sem criar ou alterar dados de cartão.
  */
+function extractPaymentProfile(response) {
+  const candidate =
+    response?.payment_profile ??
+    response?.data?.payment_profile ??
+    response?.data ??
+    response;
+  return candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    ? candidate
+    : null;
+}
+
 export async function getPaymentProfile(paymentProfileId) {
   if (!paymentProfileId) {
     throw new Error("paymentProfileId é obrigatório");
@@ -815,7 +826,7 @@ export async function getPaymentProfile(paymentProfileId) {
 
   try {
     const result = await vindiRequest("GET", `/payment_profiles/${encodeURIComponent(String(paymentProfileId))}`);
-    return result?.payment_profile || null;
+    return extractPaymentProfile(result);
   } catch (e) {
     err("getPaymentProfile falhou", {
       paymentProfileIdLast4: String(paymentProfileId).slice(-4),
@@ -824,6 +835,25 @@ export async function getPaymentProfile(paymentProfileId) {
     });
     throw e;
   }
+}
+
+export async function getCustomerPaymentProfiles(customerId) {
+  if (!customerId) {
+    throw new Error("customerId é obrigatório");
+  }
+
+  const result = await vindiRequest(
+    "GET",
+    `/payment_profiles?query=customer_id:${encodeURIComponent(String(customerId))}`
+  );
+  const candidates =
+    result?.payment_profiles ??
+    result?.data?.payment_profiles ??
+    result?.data ??
+    [];
+  return Array.isArray(candidates)
+    ? candidates.map(extractPaymentProfile).filter(Boolean)
+    : [];
 }
 /**
  * Busca informações de uma bill
@@ -964,6 +994,7 @@ export default {
   createPaymentProfile,
   createPaymentProfileWithCardData,
   getPaymentProfile,
+  getCustomerPaymentProfiles,
   createBill,
   chargeBill,
   refundCharge,

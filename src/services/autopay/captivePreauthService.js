@@ -2479,15 +2479,15 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
   adminUserId,
 }) {
   const authId = String(authorizationId || "").trim();
-  const requestedDrawId = toPositiveInt(drawId);
+  const requestedDrawId = drawId == null ? null : toPositiveInt(drawId);
   const adminId = toPositiveInt(adminUserId);
   if (!UUID_RE.test(authId)) throw captiveAdminError("participation_not_found", 404);
-  if (!requestedDrawId) throw captiveAdminError("invalid_draw_id", 400);
+  if (drawId != null && !requestedDrawId) throw captiveAdminError("invalid_draw_id", 400);
   if (!adminId) throw captiveAdminError("invalid_admin_user", 400);
 
   const context = await getCurrentCaptiveDrawContext();
   if (!context.draw) throw captiveAdminError("current_principal_draw_not_found", 404);
-  if (context.draw_id !== requestedDrawId) throw captiveAdminError("draw_not_current_principal", 409);
+  if (requestedDrawId && context.draw_id !== requestedDrawId) throw captiveAdminError("draw_not_current_principal", 409);
   if (!context.preauth_required) throw captiveAdminError("captive_preauth_not_required", 409);
 
   const pool = await getPool();
@@ -3118,6 +3118,7 @@ const reservations = reservationResult.rows || [];
     total_amount_cents: group.total_amount_cents,
     provider_bill_id: chargedResult.provider_bill_id || null,
     provider_charge_id: chargedResult.provider_charge_id || null,
+    reason: chargedResult.reason || null,
     authorization_source: "admin",
     authorized_by_admin_id: adminId,
     audit_event_id: auditEventId,

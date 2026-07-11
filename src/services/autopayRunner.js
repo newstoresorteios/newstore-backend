@@ -2,7 +2,7 @@
 import { getPool } from "../db.js";
 // MP desabilitado para autopay (mantido apenas para compatibilidade de imports, não usado)
 // import { mpChargeCard } from "./mercadopago.js";
-import { createBill, chargeBill, refundCharge, getBill, getPaymentProfile, cancelBill } from "./vindi.js";
+import { createBill, chargeBill, refundCharge, getBill, getPaymentProfile, getCustomerPaymentProfiles, cancelBill } from "./vindi.js";
 import { creditCouponOnApprovedPayment } from "./couponBalance.js";
 import { closeDrawIfSoldOut } from "./drawLifecycle.js";
 import crypto from "node:crypto";
@@ -1095,6 +1095,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       paymentProfileId: String(authorizations[0].vindi_payment_profile_id),
       autopay_id,
       failureCode: null,
+      failureReason: null,
       definitivePaymentFailure: false,
     };
     const amountReais = Number((totalAmountCents / 100).toFixed(2));
@@ -1127,7 +1128,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       tried_numbers: captiveNumbers,
       reservation_id: reservationIds[0] || null,
       provider: "vindi",
-      status: "attempt",
+      status: "preflight",
       amount_cents: totalAmountCents,
       provider_request: providerRequest,
     });
@@ -1135,60 +1136,94 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     financialStage = "attempt_persisted";
 
     let paymentProfile = null;
+    paymentProfileLookupStarted = true;
+    financialStage = "payment_profile_lookup";
+    providerRequest = { ...providerRequest, stage: financialStage };
+    await updateAutopayRunAttempt(pool, {
+      attempt_trace_id: attemptTraceId,
+      status: "payment_profile_lookup",
+      provider_request: providerRequest,
+    });
     try {
-      paymentProfileLookupStarted = true;
-      financialStage = "profile_lookup";
-      providerRequest = { ...providerRequest, stage: financialStage };
-      await updateAutopayRunAttempt(pool, {
-        attempt_trace_id: attemptTraceId,
-        status: "profile_lookup",
-        provider_request: providerRequest,
-      });
       paymentProfile = await getPaymentProfile(group.paymentProfileId);
-    } catch (profileError) {
-      if ([404, 422].includes(Number(profileError?.status))) {
+      if (!paymentProfile || !paymentProfile.id) {
         group.failureCode = "payment_method_unavailable";
+        group.failureReason = "payment_profile_response_invalid";
+        group.definitivePaymentFailure = true;
+        throw new Error(group.failureReason);
+      }
+
+      const resolvedProfileId = String(paymentProfile.id);
+      if (resolvedProfileId !== String(group.paymentProfileId)) {
+        group.failureCode = "captive_payment_profile_mismatch";
+        group.failureReason = "payment_profile_response_invalid";
+        group.definitivePaymentFailure = true;
+        throw new Error(group.failureReason);
+      }
+
+      const directCustomerId = paymentProfile?.customer?.id ?? paymentProfile?.customer_id ?? null;
+      if (directCustomerId != null) {
+        if (String(directCustomerId) !== String(group.customerId)) {
+          group.failureCode = "captive_payment_profile_mismatch";
+          group.failureReason = "payment_profile_customer_mismatch";
+          group.definitivePaymentFailure = true;
+          throw new Error(group.failureReason);
+        }
+      } else {
+        const customerProfiles = await getCustomerPaymentProfiles(group.customerId);
+        const ownedProfile = customerProfiles.find(
+          (item) => String(item?.id || "") === String(group.paymentProfileId)
+        );
+        if (!ownedProfile) {
+          group.failureCode = "captive_payment_profile_mismatch";
+          group.failureReason = "payment_profile_customer_mismatch";
+          group.definitivePaymentFailure = true;
+          throw new Error(group.failureReason);
+        }
+        paymentProfile = { ...ownedProfile, ...paymentProfile };
+      }
+
+      const paymentMethodCode = String(
+        paymentProfile?.payment_method?.code || paymentProfile?.payment_method_code || ""
+      ).toLowerCase();
+      const paymentProfileStatus = String(paymentProfile?.status || "").toLowerCase();
+      if (
+        paymentProfile?.active === false ||
+        ["inactive", "deleted", "removed", "canceled", "cancelled"].includes(paymentProfileStatus)
+      ) {
+        group.failureCode = "payment_method_unavailable";
+        group.failureReason = "payment_profile_inactive";
+        group.definitivePaymentFailure = true;
+        throw new Error(group.failureReason);
+      }
+      if (paymentMethodCode && paymentMethodCode !== "credit_card") {
+        group.failureCode = "payment_method_unavailable";
+        group.failureReason = "payment_method_not_credit_card";
+        group.definitivePaymentFailure = true;
+        throw new Error(group.failureReason);
+      }
+
+      paymentProfileResolved = true;
+    } catch (profileError) {
+      const profileStatus = Number(profileError?.status || profileError?.provider_status);
+      if (!group.failureCode && [404, 422].includes(profileStatus)) {
+        group.failureCode = "payment_method_unavailable";
+        group.failureReason = "payment_profile_not_found";
+        group.definitivePaymentFailure = true;
+      } else if (!group.failureCode && (!profileStatus || profileStatus >= 500)) {
+        group.failureCode = "payment_provider_unavailable";
+        group.failureReason = "payment_profile_lookup_failed";
         group.definitivePaymentFailure = true;
       }
       throw profileError;
     }
-    paymentProfileResolved = true;
-    financialStage = "profile_resolved";
+    financialStage = "payment_profile_resolved";
     providerRequest = { ...providerRequest, stage: financialStage };
     await updateAutopayRunAttempt(pool, {
       attempt_trace_id: attemptTraceId,
-      status: "profile_resolved",
+      status: "payment_profile_resolved",
       provider_request: providerRequest,
     });
-    const resolvedProfileId = String(paymentProfile?.id || "");
-    const resolvedCustomerId = String(paymentProfile?.customer?.id || paymentProfile?.customer_id || "");
-    const paymentMethodCode = String(
-      paymentProfile?.payment_method?.code || paymentProfile?.payment_method_code || ""
-    ).toLowerCase();
-    const paymentProfileStatus = String(paymentProfile?.status || "").toLowerCase();
-    if (!paymentProfile || !resolvedProfileId) {
-      group.failureCode = "payment_method_unavailable";
-      group.definitivePaymentFailure = true;
-      throw new Error("payment_method_unavailable");
-    }
-    if (
-      resolvedProfileId !== group.paymentProfileId ||
-      !resolvedCustomerId ||
-      resolvedCustomerId !== group.customerId
-    ) {
-      group.failureCode = "captive_payment_profile_mismatch";
-      group.definitivePaymentFailure = true;
-      throw new Error("captive_payment_profile_mismatch");
-    }
-    if (
-      paymentProfile?.active === false ||
-      ["inactive", "deleted", "removed", "canceled", "cancelled"].includes(paymentProfileStatus) ||
-      (paymentMethodCode && paymentMethodCode !== "credit_card")
-    ) {
-      group.failureCode = "payment_method_unavailable";
-      group.definitivePaymentFailure = true;
-      throw new Error("payment_method_unavailable");
-    }
     log("admin_captive_payment_profile_resolved", {
       event: "admin_captive_payment_profile_resolved",
       draw_id,
@@ -1211,7 +1246,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       provider_charge_id: null,
       provider_status: "starting",
     });
-    const description = `Autopay preauth admin draw ${draw_id} - ${captiveNumbers.length} cativo(s)`;
+    const description = `Autopay preauth draw ${draw_id} - numeros ${captiveNumbers.join(",")}`;
     bill = await createBill({
       customerId: group.customerId,
       amount_cents_total: totalAmountCents,
@@ -1373,19 +1408,29 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     const preBillFailure = billRequestStarted !== true;
     let definitive = group?.definitivePaymentFailure === true;
     let failureCode = group?.failureCode || null;
+    let failureReason = group?.failureReason || null;
     let retryable = false;
     let runStatus = "preflight_failed";
 
     if (preBillFailure) {
       definitive = true;
       if (!failureCode && financialStage === "attempt_persisting") {
-        failureCode = "payment_attempt_persist_failed";
+        failureCode = "payment_preflight_internal_error";
+        failureReason = "attempt_persistence_failed";
       } else if (!failureCode && paymentProfileLookupStarted && !paymentProfileResolved) {
         failureCode = [404, 422].includes(providerStatus)
           ? "payment_method_unavailable"
           : "payment_provider_unavailable";
+        failureReason = [404, 422].includes(providerStatus)
+          ? "payment_profile_not_found"
+          : "payment_profile_lookup_failed";
       } else if (!failureCode) {
-        failureCode = "payment_preflight_failed";
+        failureCode = "payment_preflight_internal_error";
+        failureReason = error?.code === "VINDI_CONFIG_ERROR"
+          ? "vindi_configuration_invalid"
+          : ["payment_profile_lookup", "payment_profile_resolved"].includes(financialStage)
+            ? "attempt_status_persistence_failed"
+            : "preflight_internal_error";
       }
       retryable = failureCode === "payment_provider_unavailable";
       runStatus = failureCode === "payment_method_unavailable"
@@ -1420,6 +1465,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       stage: financialStage,
       bill_request_started: billRequestStarted,
       bill_response_received: billResponseReceived,
+      failure_reason: failureReason,
     };
     if (attemptPersisted) {
       try {
@@ -1431,7 +1477,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
           provider_charge_id: chargeId,
           provider_request: providerRequest,
           provider_response: error?.response || null,
-          error_message: String(error?.message || failureCode).slice(0, 180),
+          error_message: String(failureReason || error?.message || failureCode).slice(0, 180),
         });
       } catch (runUpdateError) {
         err("admin_captive_payment_attempt_persist_failed", {
@@ -1459,7 +1505,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
           amount_cents: group?.totalAmountCents || null,
           provider_status: providerStatus,
           provider_request: providerRequest,
-          error_message: String(error?.message || failureCode).slice(0, 180),
+          error_message: String(failureReason || error?.message || failureCode).slice(0, 180),
         });
         attemptPersisted = true;
       } catch (runInsertError) {
@@ -1489,6 +1535,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
         has_payment_profile_id: Boolean(group?.paymentProfileId),
         bill_request_started: false,
         error_code: failureCode,
+        reason: failureReason,
         provider_status: providerStatus,
       });
     } else {
@@ -1515,6 +1562,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       retryable,
       financial_stage: financialStage,
       bill_request_started: billRequestStarted,
+      reason: failureReason,
       provider_bill_id: billId != null ? String(billId) : null,
       provider_charge_id: chargeId != null ? String(chargeId) : null,
     };
