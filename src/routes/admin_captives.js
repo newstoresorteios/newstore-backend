@@ -36,10 +36,13 @@ const ADMIN_AUTHORIZATION_ERROR_CODES = new Set([
   "captive_reservation_invalid",
   "captive_group_row_mismatch",
   "captive_group_changed",
+  "captive_payment_profile_mismatch",
   "participation_disabled_current_draw",
   "participation_declined_by_customer",
   "authorization_expired",
   "payment_failed_retry_required",
+  "payment_failed",
+  "payment_result_unknown",
   "participation_not_pending",
   "authorization_amount_outdated",
   "authorization_amount_mismatch",
@@ -108,19 +111,21 @@ function adminAuthorizationMessage(code) {
     captive_reservation_invalid: "Uma das reservas do grupo não está mais válida. Atualize a lista e revise os números.",
     captive_group_row_mismatch: "A quantidade de autorizações, números ou reservas do grupo está inconsistente.",
     captive_group_changed: "A participação foi alterada depois que a lista foi carregada. Atualize a página antes de tentar novamente.",
+    captive_payment_profile_mismatch: "O perfil de pagamento dos números selecionados está inconsistente.",
     participation_disabled_current_draw: "O número cativo está desativado neste sorteio.",
     participation_declined_by_customer: "O cliente recusou esta participação. É necessário reabrir a autorização antes de confirmar administrativamente.",
     authorization_expired: "O prazo desta autorização expirou.",
     payment_failed_retry_required: "A cobrança anterior falhou. É necessária uma nova confirmação antes de tentar novamente.",
     participation_not_pending: "Esta participação não está pendente de confirmação.",
     authorization_amount_outdated: "O valor da autorização está desatualizado. Reemita a confirmação antes de autorizar.",
-    authorization_amount_mismatch: "O grupo possui autorizações com valor diferente do preço atual do sorteio.",
+    authorization_amount_mismatch: "O valor calculado para a cobrança está inconsistente.",
     payment_in_progress: "Já existe uma cobrança em processamento para esta participação.",
-    payment_method_unavailable: "O cliente não possui cartão cadastrado disponível para esta cobrança.",
+    payment_method_unavailable: "O cliente não possui um cartão válido disponível para cobrança.",
     group_already_partially_or_fully_charged: "O grupo possui uma participação já cobrada e precisa de revisão.",
     group_requires_review: "O grupo possui participações inconsistentes e precisa de revisão.",
     group_changed: "O grupo foi alterado durante a autorização. Atualize a lista e revise as participações.",
-    payment_failed: "A autorização foi registrada, mas a cobrança não foi aprovada.",
+    payment_failed: "A cobrança não foi aprovada pelo cartão cadastrado.",
+    payment_result_unknown: "Não foi possível confirmar o resultado da cobrança. Verifique a Vindi antes de tentar novamente.",
     authorization_charge_not_configured: "A autorização foi registrada, mas o cartão não está disponível para cobrança.",
   }[code] || "Não foi possível autorizar a cobrança.";
 }
@@ -817,9 +822,7 @@ router.post("/current-draw-participation/:authorizationId/authorize", requireAut
         })
       : null;
     if (!result.ok) {
-      const status = result.code === "payment_method_unavailable"
-        ? 422
-        : ["group_changed", "group_requires_review", "group_already_partially_or_fully_charged", "authorization_amount_mismatch"].includes(result.code)
+      const status = ["captive_payment_profile_mismatch", "captive_group_changed", "group_changed", "group_requires_review", "group_already_partially_or_fully_charged", "authorization_amount_mismatch", "payment_result_unknown", "payment_in_progress"].includes(result.code)
           ? 409
           : 402;
       return res.status(status).json({
@@ -858,6 +861,7 @@ router.post("/current-draw-participation/:authorizationId/authorize", requireAut
       error: code,
       message: adminAuthorizationMessage(code),
       reason: error?.reason || null,
+      retryable: false,
     });
   }
 });

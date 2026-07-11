@@ -803,6 +803,26 @@ export async function refundCharge(chargeId, cancelBill = true) {
 }
 
 /**
+ * Busca um payment profile existente sem criar ou alterar dados de cartão.
+ */
+export async function getPaymentProfile(paymentProfileId) {
+  if (!paymentProfileId) {
+    throw new Error("paymentProfileId é obrigatório");
+  }
+
+  try {
+    const result = await vindiRequest("GET", `/payment_profiles/${encodeURIComponent(String(paymentProfileId))}`);
+    return result?.payment_profile || null;
+  } catch (e) {
+    err("getPaymentProfile falhou", {
+      paymentProfileIdLast4: String(paymentProfileId).slice(-4),
+      msg: e?.message,
+      status: e?.status,
+    });
+    throw e;
+  }
+}
+/**
  * Busca informações de uma bill
  * @param {string} billId
  * @returns {Promise<object>}
@@ -940,6 +960,7 @@ export default {
   ensureCustomer,
   createPaymentProfile,
   createPaymentProfileWithCardData,
+  getPaymentProfile,
   createBill,
   chargeBill,
   refundCharge,

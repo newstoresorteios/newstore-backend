@@ -2555,6 +2555,8 @@ const duplicateCaptiveNumber = authorizations.find((item, index) =>
     const captiveNumbers = authorizations.map((item) => Number(item.captive_number)).sort((a, b) => a - b);
     const captiveResult = await client.query(
       `SELECT ada.id AS authorization_id,
+              ada.autopay_profile_id,
+              ap.id AS profile_id,
               an.id AS autopay_number_id,
               an.n AS captive_number,
               an.active AS number_active,
@@ -2576,6 +2578,23 @@ const duplicateCaptiveNumber = authorizations.find((item, index) =>
       [authorizationIds]
     );
 const captives = captiveResult.rows || [];
+    const authorizationProfileIds = new Set(authorizations.map((item) => String(item.autopay_profile_id || "")));
+    const captiveProfileIds = new Set(captives.map((item) => String(item.profile_id || "")));
+    if (
+      authorizationProfileIds.size !== 1 ||
+      captiveProfileIds.size !== 1 ||
+      [...authorizationProfileIds][0] !== [...captiveProfileIds][0]
+    ) {
+      warn("admin_captive_payment_profile_mismatch", {
+        event: "admin_captive_payment_profile_mismatch",
+        draw_id: context.draw_id,
+        user_id: Number(anchor.user_id),
+        authorization_ids: authorizationIds,
+        captive_numbers: captiveNumbers,
+        profile_count: authorizationProfileIds.size,
+      });
+      throw captiveAdminError("captive_payment_profile_mismatch", 409, "mixed_autopay_profiles");
+    }
     const captivesByAuthorizationId = new Map(captives.map((item) => [String(item.authorization_id), item]));
     const invalidBinding = authorizations.find((authorization) => {
       const captive = captivesByAuthorizationId.get(String(authorization.id));
@@ -2599,7 +2618,16 @@ const captives = captiveResult.rows || [];
       throw captiveAdminError("captive_binding_invalid", 409, "autopay_number_id_mismatch");
     }
     if (captives.some((item) => !item.vindi_customer_id || !item.vindi_payment_profile_id)) {
-      throw captiveAdminError("payment_method_unavailable", 422);
+      warn("admin_captive_payment_method_unavailable", {
+        event: "admin_captive_payment_method_unavailable",
+        draw_id: context.draw_id,
+        user_id: Number(anchor.user_id),
+        authorization_ids: authorizationIds,
+        captive_numbers: captiveNumbers,
+        has_vindi_customer: captives.every((item) => Boolean(item.vindi_customer_id)),
+        has_payment_profile: captives.every((item) => Boolean(item.vindi_payment_profile_id)),
+      });
+      throw captiveAdminError("payment_method_unavailable", 402, "missing_vindi_payment_reference");
     }
 
     const autopayNumberIds = captives.map((item) => String(item.autopay_number_id));
@@ -2803,39 +2831,204 @@ const reservations = reservationResult.rows || [];
     adminGroup: true,
     expectedAuthorizationIds: group.authorization_ids,
   });
-  const audit = await query(
-    `INSERT INTO public.captive_preauth_authorization_events (
-        authorization_id, draw_id, user_id, autopay_number_id, captive_number,
-        amount_cents, previous_status, new_status, authorization_source,
-        admin_user_id, origin, authorization_ids, captive_numbers, quantity,
-        unit_amount_cents, total_amount_cents, result, provider_bill_id, provider_charge_id
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, 'admin',
-        $9, $18, $10::uuid[], $11::smallint[], $12,
-        $13, $14, $15, $16, $17
-      )
-      RETURNING id`,
-    [
-      group.anchor.id,
-      group.draw_id,
-      group.user_id,
-      group.anchor_autopay_number_id,
-      Number(group.anchor.captive_number),
-      group.unit_amount_cents,
-      JSON.stringify(group.previous_statuses),
-      chargedResult.ok ? "charged" : "failed",
-      adminId,
-      group.authorization_ids,
-      group.captive_numbers,
-      group.quantity,
-      group.unit_amount_cents,
-      group.total_amount_cents,
-      chargedResult.ok ? "charged" : chargedResult.code || "payment_failed",
-      chargedResult.provider_bill_id || null,
-      chargedResult.provider_charge_id || null,
-      group.audit_origin,
-    ]
-  );
+
+  if (!chargedResult.ok && chargedResult.definitive !== true) {
+    warn("admin_captive_group_payment_result_unknown", {
+      event: "admin_captive_group_payment_result_unknown",
+      draw_id: group.draw_id,
+      user_id: group.user_id,
+      authorization_ids: group.authorization_ids,
+      captive_numbers: group.captive_numbers,
+      provider_bill_id: chargedResult.provider_bill_id || null,
+      provider_charge_id: chargedResult.provider_charge_id || null,
+    });
+    return {
+      ok: false,
+      code: chargedResult.code || "payment_result_unknown",
+      status: chargedResult.status || "authorized",
+      charged: false,
+      retryable: false,
+      draw_id: group.draw_id,
+      user_id: group.user_id,
+      authorization_ids: group.authorization_ids,
+      captive_numbers: group.captive_numbers,
+      quantity: group.quantity,
+      unit_amount_cents: group.unit_amount_cents,
+      total_amount_cents: group.total_amount_cents,
+      provider_bill_id: chargedResult.provider_bill_id || null,
+      provider_charge_id: chargedResult.provider_charge_id || null,
+      authorization_source: "admin",
+      authorized_by_admin_id: adminId,
+    };
+  }
+
+  const resultClient = await pool.connect();
+  let auditEventId = null;
+  let retryable = false;
+  try {
+    await resultClient.query("BEGIN");
+    const lockedResult = await resultClient.query(
+      `SELECT id, captive_number, status, charged_at
+         FROM public.autopay_draw_authorizations
+        WHERE id = ANY($1::uuid[])
+          AND draw_id = $2
+          AND user_id = $3
+        ORDER BY id
+        FOR UPDATE`,
+      [group.authorization_ids, group.draw_id, group.user_id]
+    );
+    const lockedRows = lockedResult.rows || [];
+    const lockedIds = lockedRows.map((item) => String(item.id)).sort();
+    const expectedIds = [...group.authorization_ids].map(String).sort();
+    const groupUnchanged =
+      lockedIds.length === expectedIds.length &&
+      expectedIds.every((value, index) => value === lockedIds[index]) &&
+      lockedRows.every((item) => safeStatus(item.status) === (chargedResult.ok ? "charged" : "authorized")) &&
+      (chargedResult.ok || lockedRows.every((item) => item.charged_at == null));
+
+    if (!groupUnchanged) {
+      await resultClient.query("ROLLBACK");
+      warn("admin_captive_group_result_state_mismatch", {
+        event: "admin_captive_group_result_state_mismatch",
+        draw_id: group.draw_id,
+        user_id: group.user_id,
+        authorization_ids: group.authorization_ids,
+        captive_numbers: group.captive_numbers,
+        expected_count: group.quantity,
+        locked_count: lockedRows.length,
+        result: chargedResult.ok ? "charged" : "payment_failed",
+      });
+      return {
+        ok: false,
+        code: "captive_group_changed",
+        status: "authorized",
+        charged: false,
+        retryable: false,
+        draw_id: group.draw_id,
+        user_id: group.user_id,
+        authorization_ids: group.authorization_ids,
+        captive_numbers: group.captive_numbers,
+        quantity: group.quantity,
+        unit_amount_cents: group.unit_amount_cents,
+        total_amount_cents: group.total_amount_cents,
+        authorization_source: "admin",
+        authorized_by_admin_id: adminId,
+      };
+    }
+
+    let updatedCount = 0;
+    if (!chargedResult.ok) {
+      const updated = await resultClient.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'failed',
+                updated_at = NOW()
+          WHERE id = ANY($1::uuid[])
+            AND draw_id = $2
+            AND user_id = $3
+            AND status = 'authorized'
+            AND charged_at IS NULL
+          RETURNING id, captive_number, status`,
+        [group.authorization_ids, group.draw_id, group.user_id]
+      );
+      updatedCount = Number(updated.rowCount || 0);
+      if (updatedCount !== group.quantity) {
+        throw captiveAdminError("captive_group_changed", 409, "failed_update_count_mismatch");
+      }
+
+      const reservationResult = await resultClient.query(
+        `SELECT n.n, n.status AS number_status, r.status AS reservation_status,
+                r.expires_at, r.user_id, r.numbers
+           FROM public.numbers n
+           JOIN public.reservations r ON r.id = n.reservation_id
+          WHERE n.draw_id = $1
+            AND n.n = ANY($2::smallint[])
+          ORDER BY n.n
+          FOR UPDATE OF n, r`,
+        [group.draw_id, group.captive_numbers]
+      );
+      const reservationRows = reservationResult.rows || [];
+      retryable =
+        chargedResult.code === "payment_failed" &&
+        reservationRows.length === group.quantity &&
+        reservationRows.every((item) => {
+          const expiresAt = item.expires_at ? new Date(item.expires_at).getTime() : null;
+          return normalizeNumberStatus(item.number_status) === "reserved" &&
+            ["pending", "active", "reserved", ""].includes(normalizeReservationStatus(item.reservation_status)) &&
+            (!expiresAt || expiresAt > Date.now()) &&
+            Number(item.user_id) === group.user_id &&
+            (item.numbers || []).map(Number).includes(Number(item.n));
+        });
+    }
+
+    const audit = await resultClient.query(
+      `INSERT INTO public.captive_preauth_authorization_events (
+          authorization_id, draw_id, user_id, autopay_number_id, captive_number,
+          amount_cents, previous_status, new_status, authorization_source,
+          admin_user_id, origin, authorization_ids, captive_numbers, quantity,
+          unit_amount_cents, total_amount_cents, result, provider_bill_id, provider_charge_id
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, 'admin',
+          $9, $18, $10::uuid[], $11::smallint[], $12,
+          $13, $14, $15, $16, $17
+        )
+        RETURNING id`,
+      [
+        group.anchor.id,
+        group.draw_id,
+        group.user_id,
+        group.anchor_autopay_number_id,
+        Number(group.anchor.captive_number),
+        group.unit_amount_cents,
+        JSON.stringify(group.previous_statuses),
+        chargedResult.ok ? "charged" : "failed",
+        adminId,
+        group.authorization_ids,
+        group.captive_numbers,
+        group.quantity,
+        group.unit_amount_cents,
+        group.total_amount_cents,
+        chargedResult.ok ? "charged" : chargedResult.code || "payment_failed",
+        chargedResult.provider_bill_id || null,
+        chargedResult.provider_charge_id || null,
+        group.audit_origin,
+      ]
+    );
+    auditEventId = audit.rows?.[0]?.id ? String(audit.rows[0].id) : null;
+    await resultClient.query("COMMIT");
+
+    if (!chargedResult.ok) {
+      warn("admin_captive_group_payment_failed", {
+        event: "admin_captive_group_payment_failed",
+        draw_id: group.draw_id,
+        user_id: group.user_id,
+        authorization_ids: group.authorization_ids,
+        captive_numbers: group.captive_numbers,
+        total_amount_cents: group.total_amount_cents,
+        updated_count: updatedCount,
+        provider_bill_id: chargedResult.provider_bill_id || null,
+        provider_charge_id: chargedResult.provider_charge_id || null,
+        result: "payment_failed",
+      });
+    }
+  } catch (error) {
+    try {
+      await resultClient.query("ROLLBACK");
+    } catch {}
+    warn("admin_captive_group_result_persist_failed", {
+      event: "admin_captive_group_result_persist_failed",
+      draw_id: group.draw_id,
+      user_id: group.user_id,
+      authorization_ids: group.authorization_ids,
+      captive_numbers: group.captive_numbers,
+      result: chargedResult.ok ? "charged" : "payment_failed",
+      reason: error?.reason || error?.message || "result_persist_failed",
+    });
+    if (error?.message === "captive_group_changed") throw error;
+    throw captiveAdminError("admin_authorization_failed", 500, "result_persist_failed");
+  } finally {
+    resultClient.release();
+  }
+
   log("admin_authorization_completed", {
     authorization_id: group.anchor.id,
     authorization_ids: group.authorization_ids,
@@ -2852,6 +3045,7 @@ const reservations = reservationResult.rows || [];
     status: chargedResult.status,
     charged: chargedResult.charged === true,
     already_charged: chargedResult.code === "already_charged",
+    retryable: chargedResult.ok ? undefined : retryable,
     draw_id: group.draw_id,
     user_id: group.user_id,
     authorization_ids: group.authorization_ids,
@@ -2859,12 +3053,13 @@ const reservations = reservationResult.rows || [];
     quantity: group.quantity,
     unit_amount_cents: group.unit_amount_cents,
     total_amount_cents: group.total_amount_cents,
+    provider_bill_id: chargedResult.provider_bill_id || null,
+    provider_charge_id: chargedResult.provider_charge_id || null,
     authorization_source: "admin",
     authorized_by_admin_id: adminId,
-    audit_event_id: audit.rows?.[0]?.id ? String(audit.rows[0].id) : null,
+    audit_event_id: auditEventId,
   };
 }
-
 async function authorizeCurrentDrawCaptivePreauthForAdminLegacy({
   authorizationId,
   drawId,

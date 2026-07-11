@@ -2,7 +2,7 @@
 import { getPool } from "../db.js";
 // MP desabilitado para autopay (mantido apenas para compatibilidade de imports, não usado)
 // import { mpChargeCard } from "./mercadopago.js";
-import { createBill, chargeBill, refundCharge, getBill, cancelBill } from "./vindi.js";
+import { createBill, chargeBill, refundCharge, getBill, getPaymentProfile, cancelBill } from "./vindi.js";
 import { creditCouponOnApprovedPayment } from "./couponBalance.js";
 import { closeDrawIfSoldOut } from "./drawLifecycle.js";
 import crypto from "node:crypto";
@@ -737,6 +737,9 @@ async function finalizePaidReservationGroup(client, {
   billId,
   chargeId,
   vindiPayload = null,
+  authorizationIds,
+  attemptTraceId,
+  providerRequest,
 }) {
   await client.query("BEGIN");
   try {
@@ -798,6 +801,32 @@ async function finalizePaidReservationGroup(client, {
     if (numberUpdate.rowCount !== numbers.length) {
       throw new Error(`numbers_update_mismatch expected=${numbers.length} updated=${numberUpdate.rowCount}`);
     }
+    const authorizationUpdate = await client.query(
+      `UPDATE public.autopay_draw_authorizations
+          SET status = 'charged',
+              charged_at = COALESCE(charged_at, now()),
+              updated_at = now()
+        WHERE id = ANY($1::uuid[])
+          AND draw_id = $2
+          AND user_id = $3
+          AND status = 'authorized'
+          AND charged_at IS NULL
+        RETURNING id`,
+      [authorizationIds, draw_id, user_id]
+    );
+    if (authorizationUpdate.rowCount !== authorizationIds.length) {
+      throw new Error(
+        `authorizations_update_mismatch expected=${authorizationIds.length} updated=${authorizationUpdate.rowCount}`
+      );
+    }
+    await updateAutopayRunAttempt(client, {
+      attempt_trace_id: attemptTraceId,
+      status: "charged_ok",
+      provider_bill_id: billId,
+      provider_charge_id: chargeId,
+      provider_request: providerRequest,
+      error_message: null,
+    });
     await closeDrawIfSoldOut(draw_id, client);
     await client.query("COMMIT");
     return { paymentId };
@@ -877,7 +906,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     const user_id = Number(anchor.user_id);
     const expectedIds = [...new Set((options.expectedAuthorizationIds || []).map((value) => String(value).trim()))].sort();
     if (!expectedIds.length || expectedIds.some((value) => !UUID_RE.test(value)) || !expectedIds.includes(id)) {
-      return { ok: false, code: "group_changed", status: "failed", charged: false };
+      return { ok: false, code: "group_changed", status: "authorized", charged: false, definitive: false };
     }
     lockKey = `captive-preauth-admin:${draw_id}:${user_id}:${expectedIds.join(",")}`;
     await client.query("SELECT pg_advisory_lock(hashtext($1))", [lockKey]);
@@ -886,6 +915,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     const authResult = await client.query(
       `SELECT ada.*,
               ap.id AS profile_id,
+              ap.user_id AS profile_user_id,
               ap.active AS profile_active,
               ap.vindi_customer_id,
               ap.vindi_payment_profile_id
@@ -900,15 +930,6 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     );
     const authorizations = authResult.rows || [];
     const authorizationIds = authorizations.map((item) => String(item.id));
-    const markGroupFailed = async () => {
-      await pool.query(
-        `UPDATE public.autopay_draw_authorizations
-            SET status = 'failed', updated_at = now()
-          WHERE id = ANY($1::uuid[])
-            AND status = 'authorized'`,
-        [authorizationIds]
-      );
-    };
 
     const actualIds = [...authorizationIds].sort();
     if (
@@ -916,13 +937,22 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       expectedIds.some((value, index) => value !== actualIds[index])
     ) {
       await client.query("ROLLBACK");
-      await markGroupFailed();
-      return { ok: false, code: "group_changed", status: "failed", charged: false };
+      return { ok: false, code: "group_changed", status: "authorized", charged: false, definitive: false };
     }
     if (!authorizations.length || authorizations.some((item) => String(item.status || "").toLowerCase() !== "authorized")) {
       await client.query("ROLLBACK");
-      await markGroupFailed();
-      return { ok: false, code: "group_requires_review", status: "failed", charged: false };
+      return { ok: false, code: "group_requires_review", status: "authorized", charged: false, definitive: false };
+    }
+    const autopayProfileIds = new Set(authorizations.map((item) => String(item.autopay_profile_id || "")));
+    const joinedProfileIds = new Set(authorizations.map((item) => String(item.profile_id || "")));
+    const profileMismatch =
+      autopayProfileIds.size !== 1 ||
+      joinedProfileIds.size !== 1 ||
+      [...autopayProfileIds][0] !== [...joinedProfileIds][0] ||
+      authorizations.some((item) => Number(item.profile_user_id) !== user_id);
+    if (profileMismatch) {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "captive_payment_profile_mismatch", status: "failed", charged: false, definitive: true };
     }
     if (authorizations.some((item) => (
       !item.profile_active ||
@@ -930,15 +960,13 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       !item.vindi_payment_profile_id
     ))) {
       await client.query("ROLLBACK");
-      await markGroupFailed();
-      return { ok: false, code: "payment_method_unavailable", status: "failed", charged: false };
+      return { ok: false, code: "payment_method_unavailable", status: "failed", charged: false, definitive: true };
     }
     const customerIds = new Set(authorizations.map((item) => String(item.vindi_customer_id)));
     const paymentProfileIds = new Set(authorizations.map((item) => String(item.vindi_payment_profile_id)));
     if (customerIds.size !== 1 || paymentProfileIds.size !== 1) {
       await client.query("ROLLBACK");
-      await markGroupFailed();
-      return { ok: false, code: "payment_method_unavailable", status: "failed", charged: false };
+      return { ok: false, code: "captive_payment_profile_mismatch", status: "failed", charged: false, definitive: true };
     }
 
     const captiveNumbers = authorizations.map((item) => Number(item.captive_number)).sort((a, b) => a - b);
@@ -951,8 +979,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       totalAmountCents <= 0
     ) {
       await client.query("ROLLBACK");
-      await markGroupFailed();
-      return { ok: false, code: "authorization_amount_mismatch", status: "failed", charged: false };
+      return { ok: false, code: "authorization_amount_mismatch", status: "failed", charged: false, definitive: true };
     }
 
     const existingPayment = await client.query(
@@ -970,12 +997,12 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     );
     if (existingPayment.rowCount) {
       await client.query("ROLLBACK");
-      await markGroupFailed();
       return {
         ok: false,
         code: "group_already_partially_or_fully_charged",
-        status: "failed",
+        status: "authorized",
         charged: false,
+        definitive: false,
       };
     }
     const inProgressRun = await client.query(
@@ -989,8 +1016,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     );
     if (inProgressRun.rowCount) {
       await client.query("ROLLBACK");
-      await markGroupFailed();
-      return { ok: false, code: "payment_in_progress", status: "failed", charged: false };
+      return { ok: false, code: "payment_in_progress", status: "authorized", charged: false, definitive: false };
     }
 
     const existingRun = await client.query(
@@ -1046,13 +1072,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     });
     if (!reservationsValid) {
       await client.query("ROLLBACK");
-      await pool.query(
-        `UPDATE public.autopay_draw_authorizations
-            SET status = 'failed', updated_at = now()
-          WHERE id = ANY($1::uuid[]) AND status = 'authorized'`,
-        [authorizationIds]
-      );
-      return { ok: false, code: "preauth_reservation_not_available", status: "failed", charged: false };
+      return { ok: false, code: "preauth_reservation_not_available", status: "failed", charged: false, definitive: true };
     }
     const reservationIds = [...new Set(reservedRows.map((item) => String(item.reservation_id)))];
     const autopay_id = authorizations[0].autopay_profile_id || authorizations[0].profile_id;
@@ -1064,9 +1084,26 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       reservationIds,
       totalAmountCents,
       unitAmountCents: Number(authorizations[0].amount_cents),
-      customerId: authorizations[0].vindi_customer_id,
-      paymentProfileId: authorizations[0].vindi_payment_profile_id,
+      customerId: String(authorizations[0].vindi_customer_id),
+      paymentProfileId: String(authorizations[0].vindi_payment_profile_id),
       autopay_id,
+      failureCode: null,
+      definitivePaymentFailure: false,
+    };
+    const amountReais = Number((totalAmountCents / 100).toFixed(2));
+    providerRequest = {
+      endpoint: "/bills",
+      admin_group_key: lockKey,
+      idempotency_key: lockKey,
+      authorization_id: id,
+      authorization_ids: authorizationIds,
+      numbers: captiveNumbers,
+      quantity: captiveNumbers.length,
+      amount_cents: totalAmountCents,
+      amount_reais: amountReais,
+      draw_id,
+      user_id,
+      reservation_ids: reservationIds,
     };
     await insertAutopayRunAttempt(client, {
       run_trace_id: runTraceId,
@@ -1079,23 +1116,71 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       provider: "vindi",
       status: "attempt",
       amount_cents: totalAmountCents,
+      provider_request: providerRequest,
     });
     await client.query("COMMIT");
 
-    const amountReais = Number((totalAmountCents / 100).toFixed(2));
-    providerRequest = {
-      endpoint: "/bills",
-      admin_group_key: lockKey,
-      authorization_id: id,
-      authorization_ids: authorizationIds,
-      numbers: captiveNumbers,
-      quantity: captiveNumbers.length,
-      amount_cents: totalAmountCents,
-      amount_reais: amountReais,
+    let paymentProfile = null;
+    try {
+      paymentProfile = await getPaymentProfile(group.paymentProfileId);
+    } catch (profileError) {
+      if ([404, 422].includes(Number(profileError?.status))) {
+        group.failureCode = "payment_method_unavailable";
+        group.definitivePaymentFailure = true;
+      }
+      throw profileError;
+    }
+    const resolvedProfileId = String(paymentProfile?.id || "");
+    const resolvedCustomerId = String(paymentProfile?.customer?.id || paymentProfile?.customer_id || "");
+    const paymentMethodCode = String(
+      paymentProfile?.payment_method?.code || paymentProfile?.payment_method_code || ""
+    ).toLowerCase();
+    const paymentProfileStatus = String(paymentProfile?.status || "").toLowerCase();
+    if (!paymentProfile || !resolvedProfileId) {
+      group.failureCode = "payment_method_unavailable";
+      group.definitivePaymentFailure = true;
+      throw new Error("payment_method_unavailable");
+    }
+    if (
+      resolvedProfileId !== group.paymentProfileId ||
+      !resolvedCustomerId ||
+      resolvedCustomerId !== group.customerId
+    ) {
+      group.failureCode = "captive_payment_profile_mismatch";
+      group.definitivePaymentFailure = true;
+      throw new Error("captive_payment_profile_mismatch");
+    }
+    if (
+      paymentProfile?.active === false ||
+      ["inactive", "deleted", "removed", "canceled", "cancelled"].includes(paymentProfileStatus) ||
+      (paymentMethodCode && paymentMethodCode !== "credit_card")
+    ) {
+      group.failureCode = "payment_method_unavailable";
+      group.definitivePaymentFailure = true;
+      throw new Error("payment_method_unavailable");
+    }
+    log("admin_captive_payment_profile_resolved", {
+      event: "admin_captive_payment_profile_resolved",
       draw_id,
       user_id,
-      reservation_ids: reservationIds,
-    };
+      authorization_ids: authorizationIds,
+      captive_numbers: captiveNumbers,
+      autopay_profile_id: autopay_id,
+      has_vindi_customer: true,
+      has_payment_profile: true,
+    });
+    log("admin_captive_payment_attempt", {
+      event: "admin_captive_payment_attempt",
+      draw_id,
+      user_id,
+      authorization_ids: authorizationIds,
+      captive_numbers: captiveNumbers,
+      total_amount_cents: totalAmountCents,
+      idempotency_key: lockKey,
+      provider_bill_id: null,
+      provider_charge_id: null,
+      provider_status: "starting",
+    });
     const description = `Autopay preauth admin draw ${draw_id} - ${captiveNumbers.length} cativo(s)`;
     bill = await createBill({
       customerId: group.customerId,
@@ -1127,8 +1212,21 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
       provider_request: providerRequest,
       provider_response: bill.raw || null,
     });
+    log("admin_captive_payment_attempt", {
+      event: "admin_captive_payment_attempt",
+      draw_id,
+      user_id,
+      authorization_ids: authorizationIds,
+      captive_numbers: captiveNumbers,
+      total_amount_cents: totalAmountCents,
+      idempotency_key: lockKey,
+      provider_bill_id: billId != null ? String(billId) : null,
+      provider_charge_id: chargeId != null ? String(chargeId) : null,
+      provider_status: bill.lastTransactionStatus || bill.chargeStatus || bill.billStatus || bill.httpStatus || null,
+    });
     const norm = (value) => String(value || "").toLowerCase();
     if (norm(bill.lastTransactionStatus) === "rejected") {
+      group.definitivePaymentFailure = true;
       throw new Error(`Vindi rejected: ${bill.gatewayMessage || "rejected"}`);
     }
     if (!chargeId) {
@@ -1145,6 +1243,18 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     await sleep(1000);
     const billInfo = await getBill(billId);
     if (!isVindiPaymentApproved({ bill, billInfo, chargeId })) {
+      const charge0 = billInfo?.charges?.[0] || null;
+      const providerStatuses = [
+        billInfo?.status,
+        bill?.billStatus,
+        charge0?.status,
+        bill?.chargeStatus,
+        charge0?.last_transaction?.status,
+        bill?.lastTransactionStatus,
+      ].map(norm).filter(Boolean);
+      group.definitivePaymentFailure = providerStatuses.some((status) =>
+        ["rejected", "failed", "declined", "canceled", "cancelled", "not_paid"].includes(status)
+      );
       throw new Error("payment_not_approved");
     }
     const fin = await finalizePaidReservationGroup(client, {
@@ -1163,34 +1273,28 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
         authorization_ids: authorizationIds,
         numbers: captiveNumbers,
       },
+      authorizationIds,
+      attemptTraceId,
+      providerRequest,
     });
-    await updateAutopayRunAttempt(client, {
-      attempt_trace_id: attemptTraceId,
-      status: "charged_ok",
-      provider_bill_id: billId,
-      provider_charge_id: chargeId,
-      provider_request: providerRequest,
-      error_message: null,
-    });
-    await creditCouponOnApprovedPayment(fin.paymentId, {
-      channel: "VINDI",
-      source: "reconcile_sync",
-      runTraceId,
-      meta: { pricing_source: "autopay_draw_authorizations.amount_cents", autopay: true, captive_preauth: true },
-      pgClient: client,
-    });
-    const updated = await client.query(
-      `UPDATE public.autopay_draw_authorizations
-          SET status = 'charged',
-              charged_at = COALESCE(charged_at, now()),
-              updated_at = now()
-        WHERE id = ANY($1::uuid[])
-          AND status = 'authorized'
-        RETURNING id`,
-      [authorizationIds]
-    );
-    if (updated.rowCount !== authorizationIds.length) {
-      throw new Error(`authorizations_update_mismatch expected=${authorizationIds.length} updated=${updated.rowCount}`);
+    try {
+      await creditCouponOnApprovedPayment(fin.paymentId, {
+        channel: "VINDI",
+        source: "reconcile_sync",
+        runTraceId,
+        meta: { pricing_source: "autopay_draw_authorizations.amount_cents", autopay: true, captive_preauth: true },
+        pgClient: client,
+      });
+    } catch (couponError) {
+      err("admin_captive_coupon_credit_failed", {
+        event: "admin_captive_coupon_credit_failed",
+        draw_id,
+        user_id,
+        authorization_ids: authorizationIds,
+        captive_numbers: captiveNumbers,
+        payment_id: fin.paymentId,
+        reason: couponError?.message || "coupon_credit_failed",
+      });
     }
     return {
       ok: true,
@@ -1219,27 +1323,53 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
         else await cancelBill(billId, { traceId: attemptTraceId });
       } catch {}
     }
-    if (group?.authorizationIds?.length) {
-      try {
-        await pool.query(
-          `UPDATE public.autopay_draw_authorizations
-              SET status = 'failed', updated_at = now()
-            WHERE id = ANY($1::uuid[])
-              AND status = 'authorized'`,
-          [group.authorizationIds]
-        );
-      } catch {}
-    }
+
+    const definitive = group?.definitivePaymentFailure === true;
+    const failureCode = group?.failureCode || (definitive ? "payment_failed" : "payment_result_unknown");
     try {
       await updateAutopayRunAttempt(client, {
         attempt_trace_id: attemptTraceId,
-        status: "charged_fail",
+        status: definitive ? "charged_fail" : "result_unknown",
+        provider_status: Number.isInteger(Number(bill?.httpStatus || error?.provider_status || error?.status))
+          ? Number(bill?.httpStatus || error?.provider_status || error?.status)
+          : null,
+        provider_bill_id: billId,
+        provider_charge_id: chargeId,
         provider_request: providerRequest,
         provider_response: error?.response || null,
-        error_message: String(error?.message || "payment_failed").slice(0, 180),
+        error_message: String(error?.message || failureCode).slice(0, 180),
       });
-    } catch {}
-    return { ok: false, code: "payment_failed", status: "failed", charged: false };
+    } catch (runUpdateError) {
+      err("admin_captive_payment_attempt_persist_failed", {
+        event: "admin_captive_payment_attempt_persist_failed",
+        draw_id: group?.draw_id || null,
+        user_id: group?.user_id || null,
+        authorization_ids: group?.authorizationIds || [],
+        captive_numbers: group?.captiveNumbers || [],
+        reason: runUpdateError?.message || "autopay_run_update_failed",
+      });
+    }
+    log("admin_captive_payment_attempt", {
+      event: "admin_captive_payment_attempt",
+      draw_id: group?.draw_id || null,
+      user_id: group?.user_id || null,
+      authorization_ids: group?.authorizationIds || [],
+      captive_numbers: group?.captiveNumbers || [],
+      total_amount_cents: group?.totalAmountCents || null,
+      idempotency_key: lockKey,
+      provider_bill_id: billId != null ? String(billId) : null,
+      provider_charge_id: chargeId != null ? String(chargeId) : null,
+      provider_status: definitive ? "failed" : "unknown",
+    });
+    return {
+      ok: false,
+      code: failureCode,
+      status: definitive ? "failed" : "authorized",
+      charged: false,
+      definitive,
+      provider_bill_id: billId != null ? String(billId) : null,
+      provider_charge_id: chargeId != null ? String(chargeId) : null,
+    };
   } finally {
     if (lockKey) {
       try {
