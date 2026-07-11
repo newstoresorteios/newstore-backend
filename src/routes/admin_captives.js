@@ -32,7 +32,10 @@ const ADMIN_AUTHORIZATION_ERROR_CODES = new Set([
   "draw_not_current_principal",
   "current_principal_draw_changed",
   "captive_preauth_not_required",
-  "captive_number_not_available_for_user",
+  "captive_binding_invalid",
+  "captive_reservation_invalid",
+  "captive_group_row_mismatch",
+  "captive_group_changed",
   "participation_disabled_current_draw",
   "participation_declined_by_customer",
   "authorization_expired",
@@ -101,7 +104,10 @@ function adminAuthorizationMessage(code) {
     current_principal_draw_not_found: "Nenhum sorteio principal está aberto.",
     draw_not_current_principal: "A participação não pertence ao sorteio principal atual.",
     captive_preauth_not_required: "O sorteio atual utiliza o fluxo automático padrão.",
-    captive_number_not_available_for_user: "O número cativo não está disponível para este usuário.",
+    captive_binding_invalid: "O vínculo entre o cliente e um dos números cativos está inconsistente.",
+    captive_reservation_invalid: "Uma das reservas do grupo não está mais válida. Atualize a lista e revise os números.",
+    captive_group_row_mismatch: "A quantidade de autorizações, números ou reservas do grupo está inconsistente.",
+    captive_group_changed: "A participação foi alterada depois que a lista foi carregada. Atualize a página antes de tentar novamente.",
     participation_disabled_current_draw: "O número cativo está desativado neste sorteio.",
     participation_declined_by_customer: "O cliente recusou esta participação. É necessário reabrir a autorização antes de confirmar administrativamente.",
     authorization_expired: "O prazo desta autorização expirou.",
@@ -678,48 +684,49 @@ async function loadCurrentDrawParticipation({ search = "", status = "all", page 
   let groups = [...groupsByUser.values()].map((groupItem) => {
     const groupItems = [...groupItem.items].sort((a, b) => a.captive_number - b.captive_number);
     const statuses = groupItems.map((item) => item.authorization_status);
-    const allConfirmed = groupItems.every((item) => item.payment_approved || item.authorization_status === "charged");
+    const chargedItems = groupItems.filter((item) => item.payment_approved || item.authorization_status === "charged");
+    const remainingEligibleItems = groupItems.filter((item) => item.can_admin_authorize === true);
+const blockedItems = groupItems.filter((item) => !chargedItems.includes(item) && !remainingEligibleItems.includes(item));
+    const hardBlockedItems = blockedItems.filter((item) => !["declined", "expired"].includes(item.authorization_status));
+    const financialItems = [...chargedItems, ...remainingEligibleItems].sort((a, b) => a.captive_number - b.captive_number);
+    const allConfirmed = financialItems.length > 0 && chargedItems.length === financialItems.length;
     const allDisabled = groupItems.every((item) => item.enabled_current_draw !== true);
-    const hasInconsistentState = groupItems.some((item) => (
-      !item.authorization_id ||
-      item.enabled_current_draw !== true ||
-      item.payment_approved ||
-      item.payment_in_progress ||
-      ["charged", "authorized", "declined", "expired"].includes(item.authorization_status) ||
-      !["pending", "failed"].includes(item.authorization_status) ||
-      (item.authorization_status === "failed" && item.retryable !== true) ||
-      item.reservation_valid !== true ||
-      Number(item.authorization_amount_cents) !== Number(context.official_amount_cents)
-    ));
-    const eligibleItems = groupItems.filter((item) => item.can_admin_authorize === true);
-    const canAdminAuthorize =
-      context.preauth_required === true &&
-      eligibleItems.length === groupItems.length &&
-      groupItems.length > 0 &&
-      !hasInconsistentState;
+    const partiallyCharged = chargedItems.length > 0 && remainingEligibleItems.length > 0 && hardBlockedItems.length === 0;
+    const canAdminAuthorize = context.preauth_required === true && chargedItems.length === 0 && remainingEligibleItems.length > 0 && hardBlockedItems.length === 0;
+    const canAdminAuthorizeRemaining = context.preauth_required === true && partiallyCharged;
+    const eligibleItems = remainingEligibleItems;
     const unitAmountCents = Number(context.official_amount_cents);
-    const totalAmountCents = groupItems.reduce(
+    const totalAmountCents = financialItems.reduce(
       (sum, item) => sum + Number(item.authorization_amount_cents || 0),
       0
     );
     let participationState = "review_required";
     if (allConfirmed) participationState = "confirmed";
     else if (allDisabled) participationState = "disabled";
-    else if (canAdminAuthorize && statuses.includes("failed")) participationState = "failed_retryable";
+    else if ((canAdminAuthorize || canAdminAuthorizeRemaining) && statuses.includes("failed")) participationState = "failed_retryable";
     else if (canAdminAuthorize) participationState = "pending";
     else if (groupItems.some((item) => item.payment_in_progress)) participationState = "payment_processing";
     return {
       ...groupItem,
       items: groupItems,
       authorization_id: eligibleItems[0]?.authorization_id || groupItems[0]?.authorization_id || null,
-      authorization_ids: groupItems.map((item) => item.authorization_id).filter(Boolean),
-      captive_numbers: groupItems.map((item) => item.captive_number),
-      quantity: groupItems.length,
+      authorization_ids: financialItems.map((item) => item.authorization_id).filter(Boolean),
+      captive_numbers: financialItems.map((item) => item.captive_number),
+      quantity: financialItems.length,
+      charged_quantity: chargedItems.length,
+      remaining_quantity: remainingEligibleItems.length,
       unit_amount_cents: unitAmountCents,
-      total_amount_cents: totalAmountCents,
+      total_amount_cents: canAdminAuthorizeRemaining ? remainingEligibleItems.reduce((sum, item) => sum + Number(item.authorization_amount_cents || 0), 0) : totalAmountCents,
+      original_total_amount_cents: totalAmountCents,
+      charged_amount_cents: chargedItems.reduce((sum, item) => sum + Number(item.authorization_amount_cents || 0), 0),
+      remaining_amount_cents: remainingEligibleItems.reduce((sum, item) => sum + Number(item.authorization_amount_cents || 0), 0),
+      charged_captive_numbers: chargedItems.map((item) => item.captive_number),
+      remaining_captive_numbers: remainingEligibleItems.map((item) => item.captive_number),
+      partially_charged: partiallyCharged,
       participation_state: participationState,
       can_admin_authorize: canAdminAuthorize,
-      requires_review: !canAdminAuthorize && !allConfirmed && !allDisabled,
+      can_admin_authorize_remaining: canAdminAuthorizeRemaining,
+      requires_review: !canAdminAuthorize && !canAdminAuthorizeRemaining && !allConfirmed && !allDisabled,
       payment_approved: allConfirmed,
       payment_in_progress: groupItems.some((item) => item.payment_in_progress),
       enabled_current_draw: groupItems.every((item) => item.enabled_current_draw === true),
@@ -850,6 +857,7 @@ router.post("/current-draw-participation/:authorizationId/authorize", requireAut
       ok: false,
       error: code,
       message: adminAuthorizationMessage(code),
+      reason: error?.reason || null,
     });
   }
 });

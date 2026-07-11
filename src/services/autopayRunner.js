@@ -16,6 +16,7 @@ const warn = (msg, extra = null) => console.warn(`${LP} ${msg}`, extra ?? "");
 const err  = (msg, extra = null) => console.error(`${LP} ${msg}`, extra ?? "");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AUTOPAY_BASE_AMOUNT_COLUMNS = [
   "authorized_amount_cents",
   "max_authorized_amount_cents",
@@ -874,7 +875,11 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
     if (!anchor) return { ok: false, code: "authorization_not_found", status: "not_found" };
     const draw_id = Number(anchor.draw_id);
     const user_id = Number(anchor.user_id);
-    lockKey = `captive-preauth-admin:${draw_id}:${user_id}`;
+    const expectedIds = [...new Set((options.expectedAuthorizationIds || []).map((value) => String(value).trim()))].sort();
+    if (!expectedIds.length || expectedIds.some((value) => !UUID_RE.test(value)) || !expectedIds.includes(id)) {
+      return { ok: false, code: "group_changed", status: "failed", charged: false };
+    }
+    lockKey = `captive-preauth-admin:${draw_id}:${user_id}:${expectedIds.join(",")}`;
     await client.query("SELECT pg_advisory_lock(hashtext($1))", [lockKey]);
 
     await client.query("BEGIN");
@@ -888,9 +893,10 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
          JOIN public.autopay_profiles ap ON ap.id = ada.autopay_profile_id
         WHERE ada.draw_id = $1
           AND ada.user_id = $2
+          AND ada.id = ANY($3::uuid[])
         ORDER BY ada.id
         FOR UPDATE OF ada, ap`,
-      [draw_id, user_id]
+      [draw_id, user_id, expectedIds]
     );
     const authorizations = authResult.rows || [];
     const authorizationIds = authorizations.map((item) => String(item.id));
@@ -903,7 +909,7 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
         [authorizationIds]
       );
     };
-    const expectedIds = [...(options.expectedAuthorizationIds || [])].map(String).sort();
+
     const actualIds = [...authorizationIds].sort();
     if (
       expectedIds.length !== actualIds.length ||
@@ -954,12 +960,13 @@ async function chargeAuthorizedCaptivePreauthGroup(authorizationId, options = {}
          FROM public.payments
         WHERE draw_id = $1
           AND user_id = $2
+          AND numbers && $3::int2[]
           AND (
             lower(status) IN ('approved', 'paid', 'pago')
             OR lower(coalesce(vindi_status, '')) IN ('approved', 'paid', 'pago', 'success', 'successful')
           )
         LIMIT 1`,
-      [draw_id, user_id]
+      [draw_id, user_id, captiveNumbers]
     );
     if (existingPayment.rowCount) {
       await client.query("ROLLBACK");

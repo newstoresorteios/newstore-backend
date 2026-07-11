@@ -113,6 +113,18 @@ function safeStatus(status) {
   return AUTHORIZATION_STATUSES.has(s) ? s : "unknown";
 }
 
+function normalizeNumberStatus(status) {
+  const value = String(status || "").trim().toLowerCase();
+  return ["available", "reserved", "sold"].includes(value) ? value : "unknown";
+}
+
+function normalizeReservationStatus(status) {
+  const value = String(status || "").trim().toLowerCase();
+  return ["pending", "active", "reserved", "paid", "expired", "cancelled", ""].includes(value)
+    ? value
+    : "unknown";
+}
+
 function safeError(value, fallback = "notification_failed") {
   const text = String(value || fallback).trim();
   return text.replace(/[\r\n\t]+/g, " ").slice(0, 180);
@@ -2033,9 +2045,10 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
   return summary;
 }
 
-function captiveAdminError(code, status) {
+function captiveAdminError(code, status, reason = null) {
   const err = new Error(code);
   err.status = status;
+  if (reason) err.reason = reason;
   return err;
 }
 
@@ -2523,11 +2536,21 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
         FOR UPDATE`,
       [context.draw_id, Number(anchor.user_id)]
     );
-    const authorizations = authorizationResult.rows || [];
-    if (!authorizations.some((item) => String(item.id) === authId)) {
+    const allAuthorizations = authorizationResult.rows || [];
+    const authorizations = allAuthorizations.filter((item) => ["pending", "failed"].includes(safeStatus(item.status)));
+    if (!allAuthorizations.some((item) => String(item.id) === authId)) {
       throw captiveAdminError("participation_not_found", 404);
     }
+    if (!authorizations.some((item) => String(item.id) === authId)) {
+      throw captiveAdminError("captive_group_changed", 409);
+    }
 
+const duplicateCaptiveNumber = authorizations.find((item, index) =>
+      authorizations.findIndex((candidate) => Number(candidate.captive_number) === Number(item.captive_number)) !== index
+    );
+    if (duplicateCaptiveNumber) {
+      throw captiveAdminError("captive_group_row_mismatch", 409, "duplicate_authorization");
+    }
     const authorizationIds = authorizations.map((item) => String(item.id));
     const captiveNumbers = authorizations.map((item) => Number(item.captive_number)).sort((a, b) => a - b);
     const captiveResult = await client.query(
@@ -2552,16 +2575,28 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
         FOR UPDATE OF ap, an`,
       [authorizationIds]
     );
-    const captives = captiveResult.rows || [];
-    if (
-      captives.length !== authorizations.length ||
-      captives.some((item) => (
-        item.profile_active !== true ||
-        item.number_active !== true ||
-        Number(item.user_id) !== Number(anchor.user_id)
-      ))
-    ) {
-      throw captiveAdminError("captive_number_not_available_for_user", 409);
+const captives = captiveResult.rows || [];
+    const captivesByAuthorizationId = new Map(captives.map((item) => [String(item.authorization_id), item]));
+    const invalidBinding = authorizations.find((authorization) => {
+      const captive = captivesByAuthorizationId.get(String(authorization.id));
+      return !captive || captive.profile_active !== true || captive.number_active !== true ||
+        Number(captive.user_id) !== Number(anchor.user_id) ||
+        String(captive.autopay_number_id) !== String(authorization.autopay_number_id);
+    });
+    if (invalidBinding) {
+      warn("admin_captive_binding_validation_failed", {
+        event: "admin_captive_binding_validation_failed",
+        draw_id: context.draw_id,
+        user_id: Number(anchor.user_id),
+        anchor_authorization_id: authId,
+        authorization_count: authorizations.length,
+        captive_binding_count: captives.length,
+        authorization_ids: authorizationIds,
+        authorization_numbers: captiveNumbers,
+        matched_autopay_number_ids: captives.map((item) => String(item.autopay_number_id)),
+        reason: "autopay_number_id_mismatch",
+      });
+      throw captiveAdminError("captive_binding_invalid", 409, "autopay_number_id_mismatch");
     }
     if (captives.some((item) => !item.vindi_customer_id || !item.vindi_payment_profile_id)) {
       throw captiveAdminError("payment_method_unavailable", 422);
@@ -2621,7 +2656,7 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
         total_amount_cents: totalAmountCents,
       };
     }
-    if (chargedCount > 0 || paymentResult.rowCount > 0 || statuses.includes("charged")) {
+    if (chargedCount > 0 || statuses.includes("charged")) {
       throw captiveAdminError("group_already_partially_or_fully_charged", 409);
     }
     if (statuses.some((status) => ["declined", "expired", "authorized"].includes(status))) {
@@ -2668,20 +2703,57 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
           [reservationIds]
         )
       : { rows: [] };
-    const reservationsById = new Map((reservationResult.rows || []).map((item) => [String(item.id), item]));
-    const reservationsValid = numberRows.length === authorizations.length && numberRows.every((numberRow) => {
-      const reservation = reservationsById.get(String(numberRow.reservation_id || ""));
-      const reservationStatus = safeStatus(reservation?.status);
+const reservations = reservationResult.rows || [];
+    const reservationsById = new Map(reservations.map((item) => [String(item.id), item]));
+    const numberRowsByNumber = new Map(numberRows.map((item) => [Number(item.n), item]));
+    let reservationFailure = null;
+    for (const authorization of authorizations) {
+      const numberRow = numberRowsByNumber.get(Number(authorization.captive_number));
+      const reservationId = numberRow?.reservation_id ? String(numberRow.reservation_id) : null;
+      const reservation = reservationId ? reservationsById.get(reservationId) : null;
+      const reservationStatus = normalizeReservationStatus(reservation?.status);
       const expiresAt = reservation?.expires_at ? new Date(reservation.expires_at).getTime() : null;
-      return safeStatus(numberRow.status) === "reserved" &&
-        reservation &&
-        ["pending", "active", "reserved", ""].includes(reservationStatus) &&
-        (!expiresAt || expiresAt > Date.now()) &&
-        Number(reservation.user_id) === Number(anchor.user_id) &&
-        (reservation.numbers || []).map(Number).includes(Number(numberRow.n));
-    });
-    if (!reservationsValid) {
-      throw captiveAdminError("captive_number_not_available_for_user", 409);
+      let reason = null;
+      if (!numberRow) reason = "number_row_missing";
+      else if (normalizeNumberStatus(numberRow.status) !== "reserved") reason = "number_not_reserved";
+      else if (!reservationId) reason = "reservation_id_missing";
+      else if (!reservation) reason = "reservation_not_found";
+      else if (!["pending", "active", "reserved", ""].includes(reservationStatus)) reason = "reservation_status_invalid";
+      else if (expiresAt && expiresAt <= Date.now()) reason = "reservation_expired";
+      else if (Number(reservation.user_id) !== Number(anchor.user_id)) reason = "reservation_user_mismatch";
+      else if (!(reservation.numbers || []).map(Number).includes(Number(authorization.captive_number))) reason = "number_missing_from_reservation";
+      if (reason) {
+        reservationFailure = { authorization, reservationId, reason };
+        break;
+      }
+    }
+    if (reservationFailure || numberRows.length !== authorizations.length || reservations.length !== authorizations.length) {
+      const reason = reservationFailure?.reason || "reservation_not_found";
+      warn("admin_captive_reservation_validation_failed", {
+        event: "admin_captive_reservation_validation_failed",
+        draw_id: context.draw_id,
+        user_id: Number(anchor.user_id),
+        anchor_authorization_id: authId,
+        authorization_count: authorizations.length,
+        number_row_count: numberRows.length,
+        reservation_count: reservations.length,
+        authorization_ids: authorizationIds,
+        authorization_numbers: captiveNumbers,
+        reservation_ids: reservationIds,
+        invalid_items: reservationFailure ? [{
+          authorization_id: String(reservationFailure.authorization.id),
+          captive_number: Number(reservationFailure.authorization.captive_number),
+          autopay_number_id: String(reservationFailure.authorization.autopay_number_id),
+          reservation_id: reservationFailure.reservationId,
+          reason,
+        }] : [],
+        reason,
+      });
+      throw captiveAdminError(
+        reservationFailure ? "captive_reservation_invalid" : "captive_group_row_mismatch",
+        409,
+        reason
+      );
     }
 
     const updated = await client.query(
@@ -2713,6 +2785,9 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
       quantity: authorizations.length,
       unit_amount_cents: Number(context.official_amount_cents),
       total_amount_cents: totalAmountCents,
+      audit_origin: allAuthorizations.some((item) => safeStatus(item.status) === "charged")
+        ? "partial_group_recovery"
+        : "admin_panel_grouped",
     };
     await client.query("COMMIT");
   } catch (err) {
@@ -2736,7 +2811,7 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
         unit_amount_cents, total_amount_cents, result, provider_bill_id, provider_charge_id
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, 'admin',
-        $9, 'admin_panel_grouped', $10::uuid[], $11::smallint[], $12,
+        $9, $18, $10::uuid[], $11::smallint[], $12,
         $13, $14, $15, $16, $17
       )
       RETURNING id`,
@@ -2758,6 +2833,7 @@ export async function authorizeCurrentDrawCaptivePreauthForAdmin({
       chargedResult.ok ? "charged" : chargedResult.code || "payment_failed",
       chargedResult.provider_bill_id || null,
       chargedResult.provider_charge_id || null,
+      group.audit_origin,
     ]
   );
   log("admin_authorization_completed", {
@@ -2872,7 +2948,7 @@ async function authorizeCurrentDrawCaptivePreauthForAdminLegacy({
       Number(captive.user_id) !== Number(authorization.user_id) ||
       Number(captive.captive_number) !== Number(authorization.captive_number)
     ) {
-      throw captiveAdminError("captive_number_not_available_for_user", 409);
+      throw captiveAdminError("captive_binding_invalid", 409);
     }
     autopayNumberId = String(captive.autopay_number_id);
 
@@ -2954,7 +3030,7 @@ async function authorizeCurrentDrawCaptivePreauthForAdminLegacy({
 
     const reservation = await lockCaptivePreauthReservation(client, authorization);
     if (!reservation.ok) {
-      throw captiveAdminError("captive_number_not_available_for_user", 409);
+      throw captiveAdminError("captive_reservation_invalid", 409);
     }
 
     decision = await applyAuthorizationDecision(authorization, "authorize", "admin", { pgClient: client });
