@@ -45,6 +45,7 @@ const ADMIN_AUTHORIZATION_ERROR_CODES = new Set([
   "payment_result_unknown",
   "payment_provider_unavailable",
   "payment_preflight_failed",
+  "payment_preflight_contract_invalid",
   "payment_preflight_internal_error",
   "payment_attempt_persist_failed",
   "participation_not_pending",
@@ -132,6 +133,7 @@ function adminAuthorizationMessage(code) {
     payment_result_unknown: "Não foi possível confirmar o resultado da cobrança. Verifique a Vindi antes de tentar novamente.",
     payment_provider_unavailable: "A Vindi está temporariamente indisponível. Tente novamente mais tarde.",
     payment_preflight_failed: "A validação financeira falhou antes do envio da cobrança.",
+    payment_preflight_contract_invalid: "Ocorreu um erro interno no contexto da cobrança.",
     payment_preflight_internal_error: "Ocorreu um erro interno antes do envio da cobrança.",
     payment_attempt_persist_failed: "Não foi possível registrar a tentativa financeira.",
     authorization_charge_not_configured: "A autorização foi registrada, mas o cartão não está disponível para cobrança.",
@@ -832,7 +834,7 @@ router.post("/current-draw-participation/:authorizationId/authorize", requireAut
     if (!result.ok) {
       const status = result.code === "payment_provider_unavailable"
         ? 503
-        : ["payment_attempt_persist_failed", "payment_preflight_internal_error"].includes(result.code)
+        : ["payment_attempt_persist_failed", "payment_preflight_contract_invalid", "payment_preflight_internal_error"].includes(result.code)
           ? 500
           : ["captive_payment_profile_mismatch", "captive_group_changed", "group_changed", "group_requires_review", "group_already_partially_or_fully_charged", "authorization_amount_mismatch", "payment_result_unknown", "payment_in_progress", "payment_preflight_failed"].includes(result.code)
             ? 409

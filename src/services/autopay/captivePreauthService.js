@@ -2827,9 +2827,13 @@ const reservations = reservationResult.rows || [];
     client.release();
   }
 
-  const chargedResult = await chargeAuthorizedCaptivePreauthWithAutopay(authId, {
+  const chargedResult = await chargeAuthorizedCaptivePreauthWithAutopay({
+    drawId: group.draw_id,
+    userId: group.user_id,
     adminGroup: true,
     expectedAuthorizationIds: group.authorization_ids,
+    authorizationSource: "admin",
+    authorizedByAdminId: adminId,
   });
 
   if (!chargedResult.ok && chargedResult.definitive !== true) {
