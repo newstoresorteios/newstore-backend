@@ -3,10 +3,17 @@ import { normalizePhoneBR } from "./brevoWhatsApp.js";
 import { getWhatsappConsentStatusForUser } from "./communicationConsent.js";
 import { getBuiltinEmailTemplates } from "./manualNotificationCatalog.js";
 import { resolveManualBrevoWhatsAppTemplate } from "./manualWhatsAppTemplates.js";
+import {
+  EMAIL_ALL_CONSENTED_SUPPORTED,
+  EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
+  MANUAL_MAX_CAMPAIGN_USERS,
+  assertManualCampaignAudienceSize,
+  estimatedManualBatches,
+} from "./manualAudience.js";
 
 export const MANUAL_MAX_UNIQUE_USERS = 50;
 const CHANNELS = new Set(["whatsapp", "push", "email"]);
-const AUDIENCES = new Set(["selected", "all_active_push"]);
+const AUDIENCES = new Set(["selected", "all_active_push", "all_consented"]);
 
 function runQuery(pgClient, text, params) {
   if (pgClient) return pgClient.query(text, params);
@@ -57,12 +64,12 @@ function normalizeManualInput(payload = {}) {
     error.code = "manual_recipients_required";
     throw error;
   }
-  if (channel === "email" && audience !== "selected") {
+  if (channel === "email" && !["selected", "all_consented"].includes(audience)) {
     const error = new Error("manual_recipients_required");
     error.code = "manual_recipients_required";
     throw error;
   }
-  if (channel === "whatsapp" && audience !== "selected") {
+  if (channel === "whatsapp" && !["selected", "all_consented"].includes(audience)) {
     const error = new Error("manual_recipients_required");
     error.code = "manual_recipients_required";
     throw error;
@@ -112,6 +119,17 @@ async function loadSelectedUsers(pgClient, userIds) {
   return result.rows || [];
 }
 
+async function loadAllUsers(pgClient) {
+  const result = await runQuery(
+    pgClient,
+    `SELECT id, name, email, phone
+       FROM public.users
+      ORDER BY id`,
+    []
+  );
+  return result.rows || [];
+}
+
 async function loadPushSubscriptions(pgClient, { audience, userIds }) {
   const params = [];
   let where = `
@@ -135,17 +153,34 @@ async function loadPushSubscriptions(pgClient, { audience, userIds }) {
   return result.rows || [];
 }
 
-async function loadPushInactiveCount(pgClient, userIds) {
-  if (!userIds.length) return 0;
+async function loadPushExclusionStats(pgClient, { audience, userIds }) {
+  if (audience === "selected" && !userIds.length) {
+    return { inactiveSubscriptions: 0, blockedByConsent: 0 };
+  }
+  const params = [];
+  const selectedClause = audience === "selected"
+    ? "AND user_id = ANY($1::int[])"
+    : "AND user_id IS NOT NULL";
+  if (audience === "selected") params.push(userIds);
   const result = await runQuery(
     pgClient,
-    `SELECT COUNT(*)::int AS count
+    `SELECT COUNT(*) FILTER (
+              WHERE is_active IS DISTINCT FROM true
+            )::int AS inactive_count,
+            COUNT(DISTINCT user_id) FILTER (
+              WHERE is_active = true
+                AND operational_opt_in IS DISTINCT FROM true
+            )::int AS blocked_by_consent
        FROM public.push_subscriptions
-      WHERE user_id = ANY($1::int[])
-        AND (is_active IS DISTINCT FROM true OR operational_opt_in IS DISTINCT FROM true)`,
-    [userIds]
+      WHERE 1 = 1
+        ${selectedClause}`,
+    params
   );
-  return Number(result.rows?.[0]?.count || 0);
+  const row = result.rows?.[0] || {};
+  return {
+    inactiveSubscriptions: Number(row.inactive_count ?? row.count ?? 0),
+    blockedByConsent: Number(row.blocked_by_consent || 0),
+  };
 }
 
 async function resolveTemplate(pgClient, normalized) {
@@ -230,9 +265,13 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
   let users = [];
   let subscriptions = [];
   let inactiveSubscriptions = 0;
+  let blockedByConsent = 0;
+  let eligibleUserIds = [];
 
   if (normalized.audience === "selected") {
     users = await loadSelectedUsers(pgClient, normalized.userIds);
+  } else if (normalized.channel === "whatsapp" && normalized.audience === "all_consented") {
+    users = await loadAllUsers(pgClient);
   }
 
   if (normalized.channel === "push") {
@@ -241,20 +280,28 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
       userIds: normalized.userIds,
     });
     const uniqueUsers = Array.from(new Set(subscriptions.map((row) => Number(row.user_id)).filter(Boolean)));
-    if (normalized.audience === "all_active_push") {
+    if (normalized.audience !== "selected") {
       users = uniqueUsers.map((id) => ({ id }));
     }
-    inactiveSubscriptions = await loadPushInactiveCount(pgClient, normalized.userIds);
-    if (uniqueUsers.length > MANUAL_MAX_UNIQUE_USERS) {
+    const exclusionStats = await loadPushExclusionStats(pgClient, {
+      audience: normalized.audience,
+      userIds: normalized.userIds,
+    });
+    inactiveSubscriptions = exclusionStats.inactiveSubscriptions;
+    blockedByConsent = exclusionStats.blockedByConsent;
+    eligibleUserIds = uniqueUsers;
+    if (normalized.audience === "selected" && uniqueUsers.length > MANUAL_MAX_UNIQUE_USERS) {
       const error = new Error("manual_too_many_recipients");
       error.code = "manual_too_many_recipients";
       error.max = MANUAL_MAX_UNIQUE_USERS;
       throw error;
     }
+    if (normalized.audience !== "selected") {
+      assertManualCampaignAudienceSize(uniqueUsers.length);
+    }
   }
 
   let validPhones = 0;
-  let blockedByConsent = 0;
   let missingContact = 0;
   if (normalized.channel === "whatsapp") {
     for (const user of users) {
@@ -263,14 +310,23 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
         missingContact += 1;
         continue;
       }
-      const consent = await getWhatsappConsentStatusForUser({ pgClient, userId: user.id });
-      if (consent.whatsapp_can_send) validPhones += 1;
-      else blockedByConsent += 1;
+      const consent = await getWhatsappConsentStatusForUser({
+        pgClient,
+        userId: user.id,
+        ...(normalized.audience === "all_consented" && { category: "operational" }),
+      });
+      if (consent.whatsapp_can_send) {
+        validPhones += 1;
+        eligibleUserIds.push(Number(user.id));
+      } else blockedByConsent += 1;
+    }
+    if (normalized.audience === "all_consented") {
+      assertManualCampaignAudienceSize(eligibleUserIds.length);
     }
   }
 
   let validEmails = 0;
-  if (normalized.channel === "email") {
+  if (normalized.channel === "email" && normalized.audience === "selected") {
     const seen = new Set();
     for (const user of users) {
       const email = String(user.email || "").trim().toLowerCase();
@@ -281,6 +337,7 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
       if (seen.has(email)) continue;
       seen.add(email);
       validEmails += 1;
+      eligibleUserIds.push(Number(user.id));
     }
   }
 
@@ -292,16 +349,30 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
       ? validEmails
       : validPhones;
   const requiresBulkConfirmation =
-    normalized.audience === "all_active_push" || eligibleUsers > 1;
+    normalized.audience === "all_active_push" ||
+    normalized.audience === "all_consented" ||
+    eligibleUsers > 1;
+  const emailAllConsentedUnavailable =
+    normalized.channel === "email" &&
+    normalized.audience === "all_consented" &&
+    !EMAIL_ALL_CONSENTED_SUPPORTED;
+  const requestedUsers = normalized.audience === "selected"
+    ? normalized.userIds.length
+    : normalized.channel === "whatsapp"
+      ? users.length
+      : eligibleUsers;
+
+  normalized.eligibleUserIds = eligibleUserIds;
 
   return {
     ok: true,
-    can_send: eligibleUsers > 0 && (normalized.channel !== "push" || Boolean(text.title_preview && text.message_preview)),
+    can_send: !emailAllConsentedUnavailable && eligibleUsers > 0 &&
+      (normalized.channel !== "push" || Boolean(text.title_preview && text.message_preview)),
     channel: normalized.channel,
     provider: normalized.channel === "push" ? "web_push" : normalized.channel === "email" ? "brevo_smtp" : "brevo",
     template,
     ...text,
-    requested_users: normalized.audience === "selected" ? normalized.userIds.length : null,
+    requested_users: requestedUsers,
     eligible_users: eligibleUsers,
     eligible_devices: subscriptions.length,
     valid_emails: validEmails,
@@ -309,8 +380,14 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
     blocked_by_consent: blockedByConsent,
     missing_contact: missingContact,
     inactive_subscriptions: inactiveSubscriptions,
+    estimated_batches: estimatedManualBatches(eligibleUsers),
     warnings,
     requires_bulk_confirmation: requiresBulkConfirmation,
+    email_all_consented_supported: EMAIL_ALL_CONSENTED_SUPPORTED,
+    ...(emailAllConsentedUnavailable && {
+      reason: EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
+    }),
+    manual_audience_max_users: MANUAL_MAX_CAMPAIGN_USERS,
     normalized,
   };
 }

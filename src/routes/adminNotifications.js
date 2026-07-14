@@ -47,12 +47,14 @@ function manualErrorStatus(code) {
   if (
     code === "manual_email_smtp_not_configured" ||
     code === "manual_push_no_eligible_recipients" ||
-    code === "manual_email_no_valid_recipients"
+    code === "manual_email_no_valid_recipients" ||
+    code === "email_consent_not_available"
   ) return 400;
   if (
     code === "unsupported_manual_channel" ||
     code === "manual_recipients_required" ||
     code === "manual_too_many_recipients" ||
+    code === "manual_audience_too_large" ||
     code === "manual_bulk_confirmation_required" ||
     String(code || "").startsWith("manual_push_")
   ) return 400;
@@ -139,10 +141,24 @@ router.post("/manual/send", async (req, res) => {
         templateId: req.body?.template_id,
         message: req.body?.message,
         params: req.body?.params || {},
-        recipients: (preview.normalized.userIds || []).map((userId) => ({ user_id: userId })),
+        recipients: (
+          preview.normalized.audience === "all_consented"
+            ? preview.normalized.eligibleUserIds
+            : preview.normalized.userIds
+        ).map((userId) => ({ user_id: userId })),
         useCustomRecipient: false,
         dryRun: false,
         adminUserId: req.user?.id ?? null,
+        audience: preview.normalized.audience,
+        consentCategory:
+          preview.normalized.audience === "all_consented" ? "operational" : "manual",
+        audienceStats: {
+          requested_users: preview.requested_users,
+          eligible_users: preview.eligible_users,
+          blocked_by_consent: preview.blocked_by_consent,
+          missing_contact: preview.missing_contact,
+          estimated_batches: preview.estimated_batches,
+        },
       });
 
       if (out.error) {
@@ -165,6 +181,14 @@ router.post("/manual/send", async (req, res) => {
         requested_users: preview.requested_users,
         eligible_users: preview.eligible_users,
         valid_phones: preview.valid_phones,
+        eligible_devices: 0,
+        batches_processed: out.batches_processed || 0,
+        sent: out.sent || 0,
+        accepted: out.accepted || 0,
+        failed: out.failed || 0,
+        skipped: out.skipped || 0,
+        blocked_by_consent: preview.blocked_by_consent,
+        missing_contact: preview.missing_contact,
       });
     }
 

@@ -91,6 +91,27 @@ export async function sendManualEmailNotification({
 } = {}) {
   const preview = await buildManualNotificationPreview({ pgClient, payload: { ...payload, channel: "email" } });
   const normalized = preview.normalized;
+  if (normalized.audience === "all_consented" && preview.email_all_consented_supported === false) {
+    return {
+      ok: false,
+      error: preview.reason || "email_consent_not_available",
+      email_all_consented_supported: false,
+      reason: preview.reason || "email_consent_not_available",
+      requested_users: preview.requested_users,
+      eligible_users: 0,
+      eligible_devices: 0,
+      valid_emails: 0,
+      valid_phones: 0,
+      blocked_by_consent: preview.blocked_by_consent,
+      missing_contact: preview.missing_contact,
+      estimated_batches: 0,
+      requires_bulk_confirmation: true,
+      sent: 0,
+      accepted: 0,
+      failed: 0,
+      skipped: 0,
+    };
+  }
   if (normalized.userIds.length > MANUAL_MAX_UNIQUE_USERS) {
     throw coded("manual_too_many_recipients", { max: MANUAL_MAX_UNIQUE_USERS });
   }

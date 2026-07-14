@@ -35,6 +35,14 @@ import {
 import { getPushVapidConfigStatus } from "./pushNotifications.js";
 import { getSmtpConfigStatus } from "./manualEmailNotifications.js";
 import { resolveManualBrevoWhatsAppTemplate } from "./manualWhatsAppTemplates.js";
+import {
+  EMAIL_ALL_CONSENTED_SUPPORTED,
+  EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
+  MANUAL_BATCH_SIZE,
+  MANUAL_MAX_CAMPAIGN_USERS,
+  assertManualCampaignAudienceSize,
+  chunkManualAudience,
+} from "./manualAudience.js";
 
 export const DELIVERY_NOTE_ACCEPTED =
   "accepted_by_brevo_not_delivery_confirmed";
@@ -144,6 +152,7 @@ export async function getNotificationHealth() {
     manual_channels: {
       whatsapp: {
         enabled: isWhatsAppEnabled(),
+        audiences: ["selected", "all_consented"],
         brevo_configured: Boolean(
           String(process.env.BREVO_API_KEY || "").trim() &&
           String(process.env.BREVO_WHATSAPP_SENDER_NUMBER || "").trim()
@@ -151,6 +160,7 @@ export async function getNotificationHealth() {
       },
       push: {
         enabled: pushConfig.enabled,
+        audiences: ["selected", "all_active_push", "all_consented"],
         vapid_configured: Boolean(
           pushConfig.hasPublicKey &&
           pushConfig.hasPrivateKey &&
@@ -161,6 +171,13 @@ export async function getNotificationHealth() {
       email: {
         enabled: smtpConfig.configured,
         smtp_configured: smtpConfig.configured,
+        audiences: EMAIL_ALL_CONSENTED_SUPPORTED
+          ? ["selected", "all_consented"]
+          : ["selected"],
+        email_all_consented_supported: EMAIL_ALL_CONSENTED_SUPPORTED,
+        ...(!EMAIL_ALL_CONSENTED_SUPPORTED && {
+          reason: EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
+        }),
       },
     },
   };
@@ -1030,6 +1047,10 @@ export async function manualSendSelected({
   useCustomRecipient = false,
   dryRun = false,
   adminUserId = null,
+  audience = "selected",
+  audienceStats = {},
+  consentCategory = WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+  sendWhatsApp = sendBrevoWhatsAppTemplate,
 }) {
   if (channel !== "whatsapp" || provider !== "brevo") {
     return {
@@ -1053,7 +1074,9 @@ export async function manualSendSelected({
   if (!normalizedRecipients.length) {
     return { ok: false, error: "recipients_required" };
   }
-  if (normalizedRecipients.length > maxRecipients) {
+  if (audience === "all_consented") {
+    assertManualCampaignAudienceSize(normalizedRecipients.length);
+  } else if (normalizedRecipients.length > maxRecipients) {
     return {
       ok: false,
       error: "too_many_recipients",
@@ -1093,16 +1116,19 @@ export async function manualSendSelected({
     message: message != null ? String(message) : null,
     params: sendParams,
     admin_user_id: adminUserId || null,
+    audience,
     test_mode: security.testMode,
     allow_real_recipients: security.allowRealRecipients,
     use_custom_recipient: useCustomRecipient === true,
   };
 
   let campaign = null;
-  if (normalizedRecipients.length > 1) {
+  if (normalizedRecipients.length > 1 || audience === "all_consented") {
     const audienceSnapshot = {
-      source: "manual_selected",
+      source: "admin_manual",
+      audience,
       recipient_count: normalizedRecipients.length,
+      ...audienceStats,
       test_mode: security.testMode,
       allow_real_recipients: security.allowRealRecipients,
       real_send_blocked: security.blockBulkReal || security.forced,
@@ -1111,19 +1137,25 @@ export async function manualSendSelected({
 
     campaign = await createCampaign({
       pgClient,
-      name: `Manual selected — ${normalizedRecipients.length} destinatários`,
+      name: `Manual ${audience} — ${normalizedRecipients.length} destinatários`,
       channel,
       provider,
       templateKey,
       providerTemplateId: resolvedTemplateId,
-      audienceFilter: "manual_selected",
-      audienceParams: { recipient_count: normalizedRecipients.length },
+      audienceFilter: audience === "selected" ? "manual_selected" : audience,
+      audienceParams: {
+        recipient_count: normalizedRecipients.length,
+        ...(audience === "selected" && {
+          user_ids: normalizedRecipients.map((item) => item.user_id).filter(Boolean),
+        }),
+      },
       status: buildManualSendCampaignStatus(security),
       createdBy: adminUserId,
       payload: {
         source: "admin_manual",
         manual: true,
         manual_channel: "whatsapp",
+        audience,
         admin_user_id: adminUserId || null,
         test_mode: security.testMode,
         dry_run: dryRun === true,
@@ -1153,14 +1185,20 @@ export async function manualSendSelected({
   const allowAdminTestCustom =
     security.allowCustomReal && !security.blockBulkReal;
 
-  for (const item of normalizedRecipients) {
+  const batches = chunkManualAudience(normalizedRecipients, MANUAL_BATCH_SIZE);
+  let batchesProcessed = 0;
+
+  for (const [batchIndex, batch] of batches.entries()) {
+    const batchNumber = batchIndex + 1;
+    batchesProcessed += 1;
+    for (const item of batch) {
     let userRow = null;
-    let source = "manual_phone";
+    let source = audience === "all_consented" ? "all_consented" : "manual_phone";
     let requestedRecipient = null;
 
     if (item.user_id) {
       userRow = await lookupUserForRecipient(pgClient, item.user_id);
-      source = "selected_user";
+      source = audience === "all_consented" ? "all_consented" : "selected_user";
       requestedRecipient = userRow?.phone || `user:${item.user_id}`;
     } else {
       requestedRecipient = item.phone;
@@ -1242,6 +1280,9 @@ export async function manualSendSelected({
         source: "admin_manual",
         manual: true,
         manual_channel: "whatsapp",
+        audience,
+        batch_number: batchNumber,
+        total_batches: batches.length,
         params: sendParams,
         admin_user_id: adminUserId || null,
         test_mode: security.testMode,
@@ -1276,7 +1317,7 @@ export async function manualSendSelected({
       pgClient,
       userId: userRow?.id || item.user_id || null,
       phone: userRow?.phone || item.phone || null,
-      category: WHATSAPP_CONSENT_CATEGORY_DEFAULT,
+      category: consentCategory,
       source: "manual_send_selected",
       recipientForced: preResolved.recipient_forced === true,
     });
@@ -1292,16 +1333,27 @@ export async function manualSendSelected({
       continue;
     }
 
-    const result = await sendBrevoWhatsAppTemplate({
-      to: originalRecipient,
-      templateId: resolvedTemplateId,
-      params: sendParams,
-      templateKey,
-      correlationId: String(dispatch.id),
-      context: brevoContext,
-      allowAdminTestCustomRecipient: allowAdminTestCustom,
-      consentChecked: true,
-    });
+    let result;
+    try {
+      result = await sendWhatsApp({
+        to: originalRecipient,
+        templateId: resolvedTemplateId,
+        params: sendParams,
+        templateKey,
+        correlationId: String(dispatch.id),
+        context: brevoContext,
+        allowAdminTestCustomRecipient: allowAdminTestCustom,
+        consentChecked: true,
+      });
+    } catch (error) {
+      result = {
+        ok: false,
+        error: error?.code || "manual_whatsapp_send_failed",
+        reason: error?.message || null,
+        provider: "brevo",
+        channel: "whatsapp",
+      };
+    }
 
     recipientSnapshot.recipient_mode =
       result.recipient_mode || preResolved.recipient_mode;
@@ -1315,6 +1367,7 @@ export async function manualSendSelected({
       summary.accepted_count += 1;
     } else if (result?.ok) summary.accepted_count += 1;
     else summary.failed_count += 1;
+    }
   }
 
   if (campaign?.id && !dryRun) {
@@ -1337,10 +1390,21 @@ export async function manualSendSelected({
 
   return {
     ok: dryRun ? true : anyAccepted || summary.skipped_count > 0,
+    campaign_id: campaign?.id || null,
     campaign,
     dispatches,
     summary,
     warning,
     dry_run: dryRun === true,
+    requested_users: audienceStats.requested_users ?? normalizedRecipients.length,
+    eligible_users: normalizedRecipients.length,
+    eligible_devices: 0,
+    batches_processed: batchesProcessed,
+    sent: summary.accepted_count,
+    accepted: summary.accepted_count,
+    failed: summary.failed_count,
+    skipped: summary.skipped_count,
+    blocked_by_consent: Number(audienceStats.blocked_by_consent || 0),
+    missing_contact: Number(audienceStats.missing_contact || 0),
   };
 }

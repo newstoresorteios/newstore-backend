@@ -1,5 +1,9 @@
 import { query } from "../../db.js";
 import { getConnectedBrevoWhatsAppTemplates } from "./manualWhatsAppTemplates.js";
+import {
+  EMAIL_ALL_CONSENTED_SUPPORTED,
+  EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
+} from "./manualAudience.js";
 
 const EMAIL_BUILTIN_TEMPLATES = [
   {
@@ -192,6 +196,7 @@ export async function getManualNotificationCatalog({ pgClient } = {}) {
       whatsapp: {
         enabled: process.env.NOTIFICATION_WHATSAPP_AUTOMATION_ENABLED === "true",
         provider: "brevo",
+        audiences: ["selected", "all_consented"],
         connected_templates_count: whatsappTemplates.length,
         manual_templates_count: whatsappTemplates.filter(
           (template) => template.manual_send_allowed !== false
@@ -201,11 +206,19 @@ export async function getManualNotificationCatalog({ pgClient } = {}) {
       push: {
         enabled: process.env.PUSH_ENABLED === "true",
         provider: "web_push",
+        audiences: ["selected", "all_active_push", "all_consented"],
         templates: pushTemplates,
       },
       email: {
         enabled: Boolean(String(process.env.SMTP_HOST || "").trim()),
         provider: "brevo_smtp",
+        audiences: EMAIL_ALL_CONSENTED_SUPPORTED
+          ? ["selected", "all_consented"]
+          : ["selected"],
+        email_all_consented_supported: EMAIL_ALL_CONSENTED_SUPPORTED,
+        ...(!EMAIL_ALL_CONSENTED_SUPPORTED && {
+          reason: EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
+        }),
         templates: emailTemplates,
       },
     },

@@ -136,6 +136,11 @@ test("catalog returns whatsapp, push and database email templates without Brevo 
   assert.equal(catalog.channels.whatsapp.manual_templates_count, 4);
   assert.equal(catalog.channels.push.templates[0].event_key, "DRAW_REMAINING_NUMBERS_50");
   assert.equal(catalog.channels.email.templates[0].template_key, "EMAIL_DB");
+  assert.deepEqual(catalog.channels.whatsapp.audiences, ["selected", "all_consented"]);
+  assert.deepEqual(catalog.channels.push.audiences, ["selected", "all_active_push", "all_consented"]);
+  assert.deepEqual(catalog.channels.email.audiences, ["selected"]);
+  assert.equal(catalog.channels.email.email_all_consented_supported, false);
+  assert.equal(catalog.channels.email.reason, "email_consent_not_available");
   assert.equal(pgClient.calls.some((call) => /https?:\/\//i.test(call.sql)), false);
 });
 
@@ -304,6 +309,42 @@ test("preview all_active_push calculates unique users and requires confirmation"
   assert.equal(preview.requires_bulk_confirmation, true);
 });
 
+test("preview push all_consented recalculates unique users, devices and excluded subscriptions", async () => {
+  const pgClient = bulkPg({
+    userCount: 2,
+    extraPushDevices: 1,
+    inactiveSubscriptions: 3,
+    blockedPushUsers: 2,
+  });
+  const preview = await buildManualNotificationPreview({
+    pgClient,
+    payload: {
+      channel: "push",
+      template_key: "PUSH_TEMPLATE",
+      audience: "all_consented",
+      user_ids: [999],
+      phone: "5511999999999",
+      title: "Oi",
+      message: "Mensagem",
+    },
+  });
+
+  assert.equal(preview.requested_users, 2);
+  assert.equal(preview.eligible_users, 2);
+  assert.equal(preview.eligible_devices, 3);
+  assert.equal(preview.inactive_subscriptions, 3);
+  assert.equal(preview.blocked_by_consent, 2);
+  assert.equal(preview.estimated_batches, 1);
+  assert.equal(preview.requires_bulk_confirmation, true);
+  assert.equal(pgClient.calls.some((call) => call.sql.includes("INSERT INTO")), false);
+  const eligibleQuery = pgClient.calls.find(
+    (call) => call.sql.includes("FROM public.push_subscriptions") && call.sql.includes("SELECT id")
+  );
+  assert.match(eligibleQuery.sql, /is_active = true/);
+  assert.match(eligibleQuery.sql, /operational_opt_in = true/);
+  assert.match(eligibleQuery.sql, /user_id IS NOT NULL/);
+});
+
 test("preview whatsapp identifies phone and consent", async () => {
   const pgClient = previewPg();
   const preview = await buildManualNotificationPreview({
@@ -322,6 +363,41 @@ test("preview whatsapp identifies phone and consent", async () => {
     explicitTemplateId: 9999,
   });
   assert.equal(sendResolverId, preview.template.provider_template_id);
+});
+
+test("preview whatsapp all_consented requires valid phone and latest operational consent", async () => {
+  const pgClient = bulkPg({
+    userCount: 4,
+    invalidPhoneIds: new Set([3]),
+    consentStatuses: new Map([[2, null], [4, "revoked"]]),
+  });
+  const preview = await buildManualNotificationPreview({
+    pgClient,
+    payload: {
+      channel: "whatsapp",
+      template_key: "GENERIC_TEST",
+      audience: "all_consented",
+      user_ids: [999],
+      phone: "5511999999999",
+    },
+  });
+
+  assert.equal(preview.requested_users, 4);
+  assert.equal(preview.eligible_users, 1);
+  assert.equal(preview.valid_phones, 1);
+  assert.equal(preview.blocked_by_consent, 2);
+  assert.equal(preview.missing_contact, 1);
+  assert.deepEqual(preview.normalized.eligibleUserIds, [1]);
+  assert.equal(preview.requires_bulk_confirmation, true);
+  assert.equal(pgClient.calls.some((call) => call.sql.includes("INSERT INTO")), false);
+  assert.equal(
+    pgClient.calls
+      .filter((call) => call.sql.includes("communication_consents"))
+      .every((call) => call.params.some(
+        (param) => param === "operational" || (Array.isArray(param) && param.includes("operational"))
+      )),
+    true
+  );
 });
 
 test("preview rejects unknown and system-only WhatsApp templates", async () => {
@@ -381,6 +457,43 @@ test("preview email validates email addresses and removes invalid contacts", asy
   assert.equal(preview.missing_contact, 1);
 });
 
+test("email all_consented stays unavailable without explicit email consent", async () => {
+  const pgClient = bulkPg({ userCount: 3 });
+  const preview = await buildManualNotificationPreview({
+    pgClient,
+    payload: {
+      channel: "email",
+      template_key: "GENERIC_ADMIN_EMAIL",
+      audience: "all_consented",
+    },
+  });
+  assert.equal(preview.can_send, false);
+  assert.equal(preview.email_all_consented_supported, false);
+  assert.equal(preview.reason, "email_consent_not_available");
+  assert.equal(preview.valid_emails, 0);
+  assert.equal(preview.requires_bulk_confirmation, true);
+
+  let smtpCalls = 0;
+  const result = await sendManualEmailNotification({
+    pgClient,
+    payload: {
+      channel: "email",
+      template_key: "GENERIC_ADMIN_EMAIL",
+      audience: "all_consented",
+      confirm_bulk_send: true,
+    },
+    transporter: {
+      async sendMail() {
+        smtpCalls += 1;
+        throw new Error("should_not_send");
+      },
+    },
+  });
+  assert.equal(result.error, "email_consent_not_available");
+  assert.equal(smtpCalls, 0);
+  assert.equal(pgClient.calls.some((call) => call.sql.includes("INSERT INTO")), false);
+});
+
 function dispatchPg() {
   let campaignId = 10;
   let dispatchId = 20;
@@ -404,6 +517,109 @@ function dispatchPg() {
     if (sql.includes("INSERT INTO public.notification_dispatches")) return rowResult([{ id: dispatchId++, status: "pending" }]);
     if (sql.includes("UPDATE public.notification_dispatches")) return rowResult([{ id: params[0], status: sql.includes("status = 'accepted'") ? "accepted" : "failed" }]);
     if (sql.includes("UPDATE public.notification_campaigns")) return rowResult([{ id: params[0], status: "created" }]);
+    return rowResult([]);
+  });
+}
+
+function bulkPg({
+  userCount = 120,
+  extraPushDevices = 0,
+  inactiveSubscriptions = 0,
+  blockedPushUsers = 0,
+  invalidPhoneIds = new Set(),
+  consentStatuses = new Map(),
+} = {}) {
+  const users = Array.from({ length: userCount }, (_value, index) => {
+    const id = index + 1;
+    return {
+      id,
+      name: `User ${id}`,
+      email: `user${id}@example.com`,
+      phone: invalidPhoneIds.has(id) ? "" : `219${String(10000000 + id).padStart(8, "0")}`,
+    };
+  });
+  const subscriptions = users.map((user) => ({
+    id: `s-${user.id}-1`,
+    user_id: user.id,
+    endpoint: `https://push/${user.id}/1`,
+    p256dh: "p",
+    auth: "a",
+  }));
+  for (let index = 0; index < extraPushDevices; index += 1) {
+    subscriptions.push({
+      id: `s-1-${index + 2}`,
+      user_id: 1,
+      endpoint: `https://push/1/${index + 2}`,
+      p256dh: "p",
+      auth: "a",
+    });
+  }
+
+  let campaignId = 100;
+  let dispatchId = 1000;
+  return fakePg((sql, params) => {
+    if (sql.includes("FROM public.users")) {
+      if (sql.includes("WHERE id = $1")) {
+        return rowResult(users.filter((user) => user.id === Number(params[0])));
+      }
+      if (Array.isArray(params[0])) {
+        return rowResult(users.filter((user) => params[0].includes(user.id)));
+      }
+      return rowResult(users);
+    }
+    if (sql.includes("FROM public.push_subscriptions") && sql.includes("COUNT")) {
+      return rowResult([{
+        inactive_count: inactiveSubscriptions,
+        blocked_by_consent: blockedPushUsers,
+      }]);
+    }
+    if (sql.includes("FROM public.push_subscriptions")) return rowResult(subscriptions);
+    if (sql.includes("UPDATE public.push_subscriptions")) {
+      return rowResult([{ id: params[0], is_active: false }]);
+    }
+    if (sql.includes("notification_push_rules")) {
+      return rowResult([{ event_key: "PUSH_TEMPLATE", title_template: "T", body_template: "B" }]);
+    }
+    if (sql.includes("communication_consents")) {
+      const userId = Number(params[0]);
+      const status = consentStatuses.has(userId) ? consentStatuses.get(userId) : "granted";
+      if (!status) return rowResult([]);
+      return rowResult([{
+        user_id: userId,
+        channel: "whatsapp",
+        category: "operational",
+        status,
+        source: "test",
+        created_at: new Date(),
+      }]);
+    }
+    if (sql.includes("notification_templates") && sql.includes("channel = 'email'")) {
+      return rowResult([]);
+    }
+    if (sql.includes("notification_templates") && sql.includes("channel = 'whatsapp'")) {
+      return rowResult([{
+        id: "generic",
+        template_key: "GENERIC_TEST",
+        provider_template_id: "3",
+        default_message: "Teste",
+        is_active: true,
+      }]);
+    }
+    if (sql.includes("INSERT INTO public.notification_campaigns")) {
+      return rowResult([{ id: campaignId++, status: "created" }]);
+    }
+    if (sql.includes("INSERT INTO public.notification_dispatches")) {
+      return rowResult([{ id: dispatchId++, status: "pending" }]);
+    }
+    if (sql.includes("UPDATE public.notification_dispatches")) {
+      return rowResult([{ id: params[0], status: sql.includes("status = 'accepted'") ? "accepted" : "failed" }]);
+    }
+    if (sql.includes("UPDATE public.notification_campaigns")) {
+      return rowResult([{ id: params[0], status: "created" }]);
+    }
+    if (sql.includes("SELECT * FROM public.notification_campaigns WHERE id")) {
+      return rowResult([{ id: params[0], status: "created" }]);
+    }
     return rowResult([]);
   });
 }
@@ -452,10 +668,77 @@ test("manual push all_active_push requires confirmation before sending", async (
   assert.equal(result.error, "manual_bulk_confirmation_required");
 });
 
+test("manual push all_consented always requires confirmation before campaign or provider", async () => {
+  const pgClient = bulkPg({ userCount: 1 });
+  let providerCalls = 0;
+  const result = await sendManualPushNotification({
+    pgClient,
+    payload: {
+      channel: "push",
+      audience: "all_consented",
+      user_ids: [999],
+      template_key: "PUSH_TEMPLATE",
+      title: "Titulo",
+      message: "Mensagem",
+      url: "/",
+    },
+    sendPush: async () => {
+      providerCalls += 1;
+      return { ok: true };
+    },
+  });
+
+  assert.equal(result.error, "manual_bulk_confirmation_required");
+  assert.equal(providerCalls, 0);
+  assert.equal(pgClient.calls.some((call) => call.sql.includes("INSERT INTO")), false);
+});
+
+test("manual push all_consented processes 120 unique users in three internal batches", async () => {
+  const pgClient = bulkPg({ userCount: 120, extraPushDevices: 1 });
+  const sent = [];
+  const result = await sendManualPushNotification({
+    pgClient,
+    adminUserId: 99,
+    payload: {
+      channel: "push",
+      audience: "all_consented",
+      user_ids: [999],
+      template_key: "PUSH_TEMPLATE",
+      title: "Titulo",
+      message: "Mensagem",
+      url: "/",
+      confirm_bulk_send: true,
+    },
+    sendPush: async ({ subscriptionRow, payload }) => {
+      sent.push({ id: subscriptionRow.id, payload });
+      return { ok: true, dispatch: { id: `push-${subscriptionRow.id}` } };
+    },
+  });
+
+  assert.equal(result.requested_users, 120);
+  assert.equal(result.eligible_users, 120);
+  assert.equal(result.eligible_devices, 121);
+  assert.equal(result.batches_processed, 3);
+  assert.equal(result.sent, 121);
+  assert.equal(result.accepted, 121);
+  assert.equal(sent.length, 121);
+  assert.equal(sent[0].payload.audience, "all_consented");
+  assert.equal(sent.at(-1).payload.total_batches, 3);
+  assert.equal(
+    pgClient.calls.filter((call) => call.sql.includes("INSERT INTO public.notification_campaigns")).length,
+    1
+  );
+  assert.equal(
+    pgClient.calls.filter((call) => call.sql.includes("INSERT INTO public.notification_dispatches")).length,
+    121
+  );
+});
+
 test("manual push device failure does not stop remaining devices", async () => {
+  const pgClient = dispatchPg();
   let count = 0;
   const result = await sendManualPushNotification({
-    pgClient: dispatchPg(),
+    pgClient,
     payload: {
       channel: "push",
       audience: "selected",
@@ -478,6 +761,92 @@ test("manual push device failure does not stop remaining devices", async () => {
   });
   assert.equal(result.failed, 1);
   assert.equal(result.sent, 1);
+  assert.equal(
+    pgClient.calls.some(
+      (call) => call.sql.includes("UPDATE public.push_subscriptions") && call.params[0] === "s1"
+    ),
+    true
+  );
+  assert.equal(
+    pgClient.calls
+      .filter((call) => call.sql.includes("communication_consents"))
+      .every((call) => /ORDER BY created_at DESC\s+LIMIT 1/.test(call.sql)),
+    true
+  );
+});
+
+test("manual WhatsApp all_consented processes more than 50 users in one campaign and continues after failure", async () => {
+  const pgClient = bulkPg({ userCount: 120 });
+  const oldTestMode = process.env.NOTIFICATION_TEST_MODE;
+  const oldAllowReal = process.env.NOTIFICATION_ALLOW_REAL_RECIPIENTS;
+  process.env.NOTIFICATION_TEST_MODE = "false";
+  process.env.NOTIFICATION_ALLOW_REAL_RECIPIENTS = "true";
+  let providerCalls = 0;
+
+  try {
+    const result = await manualSendSelected({
+      pgClient,
+      channel: "whatsapp",
+      provider: "brevo",
+      templateKey: "GENERIC_TEST",
+      recipients: Array.from({ length: 120 }, (_value, index) => ({ user_id: index + 1 })),
+      dryRun: false,
+      adminUserId: 99,
+      audience: "all_consented",
+      consentCategory: "operational",
+      audienceStats: { requested_users: 120, eligible_users: 120 },
+      sendWhatsApp: async () => {
+        providerCalls += 1;
+        if (providerCalls === 51) {
+          const error = new Error("individual_failure");
+          error.code = "test_whatsapp_failure";
+          throw error;
+        }
+        return { ok: true, provider_status: "accepted", delivery_status: "unknown" };
+      },
+    });
+
+    assert.equal(result.campaign_id, 100);
+    assert.equal(result.requested_users, 120);
+    assert.equal(result.eligible_users, 120);
+    assert.equal(result.batches_processed, 3);
+    assert.equal(result.sent, 119);
+    assert.equal(result.accepted, 119);
+    assert.equal(result.failed, 1);
+    assert.equal(providerCalls, 120);
+    assert.equal(
+      pgClient.calls.filter((call) => call.sql.includes("INSERT INTO public.notification_campaigns")).length,
+      1
+    );
+    assert.equal(
+      pgClient.calls.filter((call) => call.sql.includes("INSERT INTO public.notification_dispatches")).length,
+      120
+    );
+    const serializedParams = JSON.stringify(pgClient.calls.map((call) => call.params));
+    assert.match(serializedParams, /all_consented/);
+    assert.match(serializedParams, /batch_number/);
+  } finally {
+    if (oldTestMode === undefined) delete process.env.NOTIFICATION_TEST_MODE;
+    else process.env.NOTIFICATION_TEST_MODE = oldTestMode;
+    if (oldAllowReal === undefined) delete process.env.NOTIFICATION_ALLOW_REAL_RECIPIENTS;
+    else process.env.NOTIFICATION_ALLOW_REAL_RECIPIENTS = oldAllowReal;
+  }
+});
+
+test("all_consented rejects campaigns above the 500 unique user safety limit", async () => {
+  await assert.rejects(
+    buildManualNotificationPreview({
+      pgClient: bulkPg({ userCount: 501 }),
+      payload: {
+        channel: "push",
+        audience: "all_consented",
+        template_key: "PUSH_TEMPLATE",
+        title: "Titulo",
+        message: "Mensagem",
+      },
+    }),
+    (error) => error?.code === "manual_audience_too_large" && error?.max === 500
+  );
 });
 
 test("manual email sends individually, dedupes duplicated email and uses no real smtp", async () => {

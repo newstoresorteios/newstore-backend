@@ -2,6 +2,11 @@ import { query } from "../../db.js";
 import { createCampaign, createDispatch, markDispatchAccepted, markDispatchFailed, updateCampaignAudienceCounts } from "./notificationLog.js";
 import { sendPushToSubscriptionRow } from "./pushNotifications.js";
 import { MANUAL_MAX_UNIQUE_USERS, buildManualNotificationPreview } from "./manualNotificationPreview.js";
+import {
+  MANUAL_BATCH_SIZE,
+  assertManualCampaignAudienceSize,
+  chunkManualAudience,
+} from "./manualAudience.js";
 
 function runQuery(pgClient, text, params) {
   if (pgClient) return pgClient.query(text, params);
@@ -53,6 +58,32 @@ function summarizeSubscriptions(rows) {
   return { eligible_users: users.size, eligible_devices: rows.length };
 }
 
+function subscriptionBatches(rows) {
+  const byUser = new Map();
+  for (const row of rows) {
+    const userId = Number(row.user_id);
+    if (!Number.isInteger(userId) || userId <= 0) continue;
+    if (!byUser.has(userId)) byUser.set(userId, []);
+    byUser.get(userId).push(row);
+  }
+  return chunkManualAudience([...byUser.values()], MANUAL_BATCH_SIZE)
+    .map((groups) => groups.flat());
+}
+
+async function deactivateExpiredSubscription(pgClient, subscription, statusCode, errorCode) {
+  if (![404, 410].includes(statusCode) && errorCode !== "push_subscription_gone_or_expired") return;
+  await runQuery(
+    pgClient,
+    `UPDATE public.push_subscriptions
+        SET is_active = false,
+            last_error_at = NOW(),
+            last_error = $2,
+            updated_at = NOW()
+      WHERE id = $1`,
+    [subscription.id, statusCode ? `push_subscription_gone_or_expired:${statusCode}` : errorCode]
+  ).catch(() => {});
+}
+
 export async function sendManualPushNotification({
   pgClient,
   payload = {},
@@ -69,6 +100,21 @@ export async function sendManualPushNotification({
   const subscriptions = await loadSubscriptions(pgClient, normalized);
   const audience = summarizeSubscriptions(subscriptions);
 
+  if (
+    (audience.eligible_users > 1 ||
+      normalized.audience === "all_active_push" ||
+      normalized.audience === "all_consented") &&
+    payload.confirm_bulk_send !== true
+  ) {
+    return {
+      ok: false,
+      error: "manual_bulk_confirmation_required",
+      requested_users: preview.requested_users,
+      ...audience,
+      valid_phones: 0,
+      valid_emails: 0,
+    };
+  }
   if (!audience.eligible_devices) {
     return {
       ok: false,
@@ -80,18 +126,11 @@ export async function sendManualPushNotification({
       skipped: 0,
     };
   }
-  if (audience.eligible_users > MANUAL_MAX_UNIQUE_USERS) {
+  if (normalized.audience === "selected" && audience.eligible_users > MANUAL_MAX_UNIQUE_USERS) {
     throw coded("manual_too_many_recipients", { max: MANUAL_MAX_UNIQUE_USERS });
   }
-  if ((audience.eligible_users > 1 || normalized.audience === "all_active_push") && payload.confirm_bulk_send !== true) {
-    return {
-      ok: false,
-      error: "manual_bulk_confirmation_required",
-      requested_users: preview.requested_users,
-      ...audience,
-      valid_phones: 0,
-      valid_emails: 0,
-    };
+  if (normalized.audience !== "selected") {
+    assertManualCampaignAudienceSize(audience.eligible_users);
   }
 
   let campaign = await createCampaign({
@@ -111,6 +150,7 @@ export async function sendManualPushNotification({
       manual: true,
       admin_user_id: adminUserId || null,
       manual_channel: "push",
+      audience: normalized.audience,
     },
     messageSnapshot: {
       source: "admin_manual",
@@ -127,6 +167,8 @@ export async function sendManualPushNotification({
       audience: normalized.audience,
       eligible_users: audience.eligible_users,
       eligible_devices: audience.eligible_devices,
+      estimated_batches: preview.estimated_batches,
+      inactive_subscriptions: preview.inactive_subscriptions,
     },
     campaignType: "manual_admin",
     audienceCountExpected: audience.eligible_users,
@@ -136,8 +178,13 @@ export async function sendManualPushNotification({
   let failed = 0;
   let skipped = 0;
   const dispatches = [];
+  const batches = subscriptionBatches(subscriptions);
+  let batchesProcessed = 0;
 
-  for (const subscription of subscriptions) {
+  for (const [batchIndex, batch] of batches.entries()) {
+    const batchNumber = batchIndex + 1;
+    batchesProcessed += 1;
+    for (const subscription of batch) {
     const dispatch = await createDispatch({
       pgClient,
       eventKey: "MANUAL_ADMIN_PUSH",
@@ -152,6 +199,9 @@ export async function sendManualPushNotification({
         source: "admin_manual",
         manual: true,
         admin_user_id: adminUserId || null,
+        audience: normalized.audience,
+        batch_number: batchNumber,
+        total_batches: batches.length,
         template_key: normalized.templateKey || null,
         url: message.url,
       },
@@ -180,6 +230,9 @@ export async function sendManualPushNotification({
           source: "admin_manual",
           manual: true,
           admin_user_id: adminUserId || null,
+          audience: normalized.audience,
+          batch_number: batchNumber,
+          total_batches: batches.length,
           template_key: normalized.templateKey || null,
         },
         source: "admin_manual",
@@ -202,6 +255,7 @@ export async function sendManualPushNotification({
       dispatches.push(updated);
     } catch (error) {
       const statusCode = Number(error?.provider_status || error?.statusCode || error?.status || 0) || null;
+      await deactivateExpiredSubscription(pgClient, subscription, statusCode, error?.code);
       const updated = await markDispatchFailed({
         pgClient,
         dispatchId: dispatch.id,
@@ -214,6 +268,7 @@ export async function sendManualPushNotification({
       });
       failed += 1;
       dispatches.push(updated);
+    }
     }
   }
 
@@ -229,8 +284,13 @@ export async function sendManualPushNotification({
     requested_users: preview.requested_users,
     ...audience,
     sent,
+    accepted: sent,
     failed,
     skipped,
+    batches_processed: batchesProcessed,
+    blocked_by_consent: preview.blocked_by_consent,
+    missing_contact: preview.missing_contact,
+    inactive_subscriptions: preview.inactive_subscriptions,
     campaign_id: campaign?.id || null,
     campaign,
     dispatches,
