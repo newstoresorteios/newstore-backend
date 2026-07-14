@@ -4,12 +4,49 @@ import { getPool, query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
 import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
+import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
 import { formatAdditionalDraw, loadDrawConfigs } from "./additional_draws.js";
 
 const router = Router();
 const VALID_STATUSES = new Set(["draft", "open", "closed", "cancelled"]);
 
 router.use(requireAuth, requireAdmin);
+
+export async function emitAdminAdditionalDrawPublished(draw, handler = handlePushAutomationEvent) {
+  if (!draw?.id) return;
+
+  const productName = draw.product_name || "Sorteio adicional New Store";
+  try {
+    await handler({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      source: "admin",
+      referenceType: "additional_draw",
+      referenceKey: `additional_draw:${draw.id}:published`,
+      metadata: {
+        draw_id: Number(draw.id),
+        draw_type: "adicional",
+        is_additional_draw: true,
+        product_name: productName,
+        draw_name: productName,
+        draw_url: "/",
+        origin: "admin_additional_draws",
+      },
+      actor: {
+        type: "admin_additional_draws",
+      },
+      dryRun: process.env.PUSH_ENGINE_DRY_RUN !== "false",
+    });
+  } catch (error) {
+    console.warn("[admin_additional_draws] push automation event skipped", {
+      event_key: "NEW_DRAW_PUBLISHED",
+      reference_type: "additional_draw",
+      reference_key: `additional_draw:${draw.id}:published`,
+      draw_id: Number(draw.id),
+      code: error?.code || null,
+      message: error?.message || null,
+    });
+  }
+}
 
 function toOptionalString(value, maxLength) {
   if (value === undefined) return undefined;
@@ -285,6 +322,9 @@ router.post("/", async (req, res) => {
     await ensureDrawNumbers(client, draw.id, numberCount.count);
 
     await client.query("COMMIT");
+    if (draw.status === "open") {
+      await emitAdminAdditionalDrawPublished(draw);
+    }
     const configMap = await loadDrawConfigs([draw.id]);
     return res.status(201).json({
       draw: await formatAdditionalDraw(draw, configMap.get(String(draw.id))),
@@ -371,7 +411,7 @@ router.patch("/:id", async (req, res) => {
     await client.query("BEGIN");
 
     const current = await client.query(
-      `SELECT id, product_name
+      `SELECT id, status, product_name
          FROM public.draws
         WHERE id = $1
           AND draw_type IN ('adicional', 'secundario')
@@ -382,6 +422,7 @@ router.patch("/:id", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "draw_not_found" });
     }
+    const previousStatus = current.rows[0].status;
 
     let updatedRow;
     if (updates.length) {
@@ -410,6 +451,9 @@ router.patch("/:id", async (req, res) => {
     await upsertConfig(client, drawId, configValues, updatedRow.product_name || current.rows[0].product_name);
 
     await client.query("COMMIT");
+    if (previousStatus !== "open" && updatedRow.status === "open") {
+      await emitAdminAdditionalDrawPublished(updatedRow);
+    }
     const configMap = await loadDrawConfigs([drawId]);
     return res.json({
       draw: await formatAdditionalDraw(updatedRow, configMap.get(String(drawId))),
