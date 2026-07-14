@@ -8,24 +8,29 @@ import {
   markDispatchAccepted,
   markDispatchFailed,
 } from "./notificationLog.js";
+import { BACKEND_BREVO_WHATSAPP_TEMPLATES } from "./manualWhatsAppTemplates.js";
+
+const DRAW_50_TEMPLATE = BACKEND_BREVO_WHATSAPP_TEMPLATES.DRAW_REMAINING_NUMBERS_50;
+const DRAW_10_TEMPLATE = BACKEND_BREVO_WHATSAPP_TEMPLATES.DRAW_REMAINING_NUMBERS_10;
+const BALANCE_15_TEMPLATE = BACKEND_BREVO_WHATSAPP_TEMPLATES.BALANCE_EXPIRING_15_DAYS;
 
 const AUTOMATION_WHATSAPP_EVENTS = Object.freeze({
   DRAW_REMAINING_NUMBERS_50: {
-    templateKey: "DRAW_REMAINING_NUMBERS_50",
-    envName: "BREVO_WHATSAPP_DRAW_REMAINING_50_TEMPLATE_ID",
-    fallbackTemplateId: "25",
+    templateKey: DRAW_50_TEMPLATE.template_key,
+    envName: DRAW_50_TEMPLATE.env_names[0],
+    fallbackTemplateId: String(DRAW_50_TEMPLATE.approved_default_template_id),
     audience: "public",
   },
   DRAW_REMAINING_NUMBERS_10: {
-    templateKey: "DRAW_REMAINING_NUMBERS_10",
-    envName: "BREVO_WHATSAPP_DRAW_REMAINING_10_TEMPLATE_ID",
-    fallbackTemplateId: "26",
+    templateKey: DRAW_10_TEMPLATE.template_key,
+    envName: DRAW_10_TEMPLATE.env_names[0],
+    fallbackTemplateId: String(DRAW_10_TEMPLATE.approved_default_template_id),
     audience: "public",
   },
   BALANCE_EXPIRING_15_DAYS: {
-    templateKey: "BALANCE_EXPIRING_15_DAYS",
-    envName: "BREVO_WHATSAPP_BALANCE_EXPIRING_15_TEMPLATE_ID",
-    fallbackTemplateId: "27",
+    templateKey: BALANCE_15_TEMPLATE.template_key,
+    envName: BALANCE_15_TEMPLATE.env_names[0],
+    fallbackTemplateId: String(BALANCE_15_TEMPLATE.approved_default_template_id),
     audience: "user",
   },
 });

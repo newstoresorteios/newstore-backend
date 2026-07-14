@@ -2,6 +2,7 @@ import { query } from "../../db.js";
 import { normalizePhoneBR } from "./brevoWhatsApp.js";
 import { getWhatsappConsentStatusForUser } from "./communicationConsent.js";
 import { getBuiltinEmailTemplates } from "./manualNotificationCatalog.js";
+import { resolveManualBrevoWhatsAppTemplate } from "./manualWhatsAppTemplates.js";
 
 export const MANUAL_MAX_UNIQUE_USERS = 50;
 const CHANNELS = new Set(["whatsapp", "push", "email"]);
@@ -148,7 +149,14 @@ async function loadPushInactiveCount(pgClient, userIds) {
 }
 
 async function resolveTemplate(pgClient, normalized) {
-  if (!normalized.templateKey) return null;
+  if (!normalized.templateKey) {
+    if (normalized.channel === "whatsapp") {
+      const error = new Error("manual_template_not_found");
+      error.code = "manual_template_not_found";
+      throw error;
+    }
+    return null;
+  }
   if (normalized.channel === "push") {
     const result = await runQuery(
       pgClient,
@@ -176,17 +184,10 @@ async function resolveTemplate(pgClient, normalized) {
     });
     return result.rows?.[0] || getBuiltinEmailTemplates().find((item) => item.template_key === normalized.templateKey) || null;
   }
-  const result = await runQuery(
+  return resolveManualBrevoWhatsAppTemplate({
     pgClient,
-    `SELECT *
-       FROM public.notification_templates
-      WHERE channel = 'whatsapp'
-        AND provider = 'brevo'
-        AND template_key = $1
-      LIMIT 1`,
-    [normalized.templateKey]
-  );
-  return result.rows?.[0] || null;
+    templateKey: normalized.templateKey,
+  });
 }
 
 function buildPreviewText(normalized, template) {
@@ -284,7 +285,6 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
   }
 
   const template = await resolveTemplate(pgClient, normalized);
-  if (normalized.templateKey && !template) warnings.push("manual_template_not_found");
   const text = buildPreviewText(normalized, template);
   const eligibleUsers = normalized.channel === "push"
     ? new Set(subscriptions.map((row) => Number(row.user_id))).size

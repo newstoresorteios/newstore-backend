@@ -43,6 +43,7 @@ router.use(requireAuth, requireAdmin);
 
 function manualErrorStatus(code) {
   if (code === "manual_template_not_found") return 404;
+  if (code === "manual_template_not_allowed") return 400;
   if (
     code === "manual_email_smtp_not_configured" ||
     code === "manual_push_no_eligible_recipients" ||
@@ -565,11 +566,14 @@ router.post("/templates/sync-brevo-whatsapp", async (req, res) => {
       synced_count: result.synced_count,
     });
 
+    const catalog = await getManualNotificationCatalog();
+
     return res.json({
       ok: true,
       fetched_count: result.fetched_count,
       synced_count: result.synced_count,
       templates: result.templates,
+      catalog,
     });
   } catch (e) {
     console.error("[admin/notifications] sync brevo templates:error", {
@@ -899,6 +903,9 @@ router.post("/test-whatsapp", async (req, res) => {
       )
     );
   } catch (e) {
+    if (e?.code === "manual_template_not_found" || e?.code === "manual_template_not_allowed") {
+      return res.status(manualErrorStatus(e.code)).json({ ok: false, error: e.code });
+    }
     console.error("[admin/notifications] test-whatsapp error", {
       message: e?.message || null,
       stack: e?.stack || null,
@@ -1010,6 +1017,9 @@ router.post("/manual-send-selected", async (req, res) => {
       ...(out.message && { message: out.message }),
     });
   } catch (e) {
+    if (e?.code === "manual_template_not_found" || e?.code === "manual_template_not_allowed") {
+      return res.status(manualErrorStatus(e.code)).json({ ok: false, error: e.code });
+    }
     console.error("[admin/notifications] manual-send-selected error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
@@ -1064,6 +1074,9 @@ router.post("/manual-send", async (req, res) => {
       )
     );
   } catch (e) {
+    if (e?.code === "manual_template_not_found" || e?.code === "manual_template_not_allowed") {
+      return res.status(manualErrorStatus(e.code)).json({ ok: false, error: e.code });
+    }
     console.error("[admin/notifications] manual-send error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }

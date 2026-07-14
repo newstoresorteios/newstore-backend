@@ -1,5 +1,6 @@
 // src/services/notifications/brevoWhatsAppTemplates.js
 import { query } from "../../db.js";
+import { normalizeProviderTemplateId } from "./manualWhatsAppTemplates.js";
 
 async function runQuery(pgClient, text, params) {
   if (pgClient) return pgClient.query(text, params);
@@ -25,7 +26,8 @@ function mapBrevoApiError(body, statusCode) {
 }
 
 function normalizeTemplateRow(template) {
-  const brevoId = template?.id != null ? String(template.id) : null;
+  const normalizedId = normalizeProviderTemplateId(template?.id);
+  const brevoId = normalizedId == null ? null : String(normalizedId);
   return {
     brevo_id: brevoId,
     name: template?.name || template?.templateName || null,

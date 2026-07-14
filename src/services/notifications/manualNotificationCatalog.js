@@ -1,4 +1,5 @@
 import { query } from "../../db.js";
+import { getConnectedBrevoWhatsAppTemplates } from "./manualWhatsAppTemplates.js";
 
 const EMAIL_BUILTIN_TEMPLATES = [
   {
@@ -88,6 +89,7 @@ export async function getManualNotificationCatalog({ pgClient } = {}) {
     "provider_template_id",
     "name",
     "description",
+    "body_preview",
     "default_message",
     "default_params",
     "message_params",
@@ -141,7 +143,16 @@ export async function getManualNotificationCatalog({ pgClient } = {}) {
         ORDER BY template_key`,
       []
     );
-    whatsappTemplates = (result.rows || []).map((row) => project(row, whatsappColumns, "brevo"));
+    const databaseRows = (result.rows || []).map((row) => project(row, whatsappColumns, "brevo"));
+    whatsappTemplates = await getConnectedBrevoWhatsAppTemplates({
+      pgClient,
+      databaseRows,
+    });
+  } else {
+    whatsappTemplates = await getConnectedBrevoWhatsAppTemplates({
+      pgClient,
+      databaseRows: [],
+    });
   }
 
   let pushTemplates = [];
@@ -181,6 +192,10 @@ export async function getManualNotificationCatalog({ pgClient } = {}) {
       whatsapp: {
         enabled: process.env.NOTIFICATION_WHATSAPP_AUTOMATION_ENABLED === "true",
         provider: "brevo",
+        connected_templates_count: whatsappTemplates.length,
+        manual_templates_count: whatsappTemplates.filter(
+          (template) => template.manual_send_allowed !== false
+        ).length,
         templates: whatsappTemplates,
       },
       push: {

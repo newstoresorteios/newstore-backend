@@ -34,6 +34,7 @@ import {
 } from "../autopay/captivePreauthService.js";
 import { getPushVapidConfigStatus } from "./pushNotifications.js";
 import { getSmtpConfigStatus } from "./manualEmailNotifications.js";
+import { resolveManualBrevoWhatsAppTemplate } from "./manualWhatsAppTemplates.js";
 
 export const DELIVERY_NOTE_ACCEPTED =
   "accepted_by_brevo_not_delivery_confirmed";
@@ -207,29 +208,18 @@ export async function resolveTemplateId({
   templateKey,
   channel,
   provider,
-  explicitTemplateId,
+  explicitTemplateId: _explicitTemplateId,
 }) {
-  if (explicitTemplateId != null && String(explicitTemplateId).trim() !== "") {
-    return String(explicitTemplateId).trim();
+  if (channel !== "whatsapp" || provider !== "brevo") {
+    const error = new Error("manual_template_not_found");
+    error.code = "manual_template_not_found";
+    throw error;
   }
-
-  const row = await getTemplateByKey({ pgClient, templateKey, channel, provider });
-  if (row?.provider_template_id != null) {
-    return String(row.provider_template_id);
-  }
-
-  if (templateKey === "GENERIC_TEST") {
-    const id =
-      process.env.BREVO_WHATSAPP_GENERIC_TEST_TEMPLATE_ID ||
-      process.env.BREVO_WHATSAPP_TEMPLATE_ID;
-    return id ? String(id).trim() : null;
-  }
-  if (templateKey === "CAPTIVE_AUTHORIZATION_REQUESTED") {
-    const id = process.env.BREVO_WHATSAPP_CAPTIVE_AUTH_TEMPLATE_ID;
-    return id ? String(id).trim() : null;
-  }
-
-  return null;
+  const template = await resolveManualBrevoWhatsAppTemplate({
+    pgClient,
+    templateKey,
+  });
+  return template.provider_template_id;
 }
 
 async function lookupUserPhone(pgClient, userId) {
@@ -523,6 +513,14 @@ export async function sendTestWhatsApp({
   adminUserId = null,
   useCustomRecipient = false,
 }) {
+  const resolvedTemplateId = await resolveTemplateId({
+    pgClient,
+    templateKey,
+    channel: "whatsapp",
+    provider: "brevo",
+    explicitTemplateId: templateId,
+  });
+
   let requestedPhone = phone ? String(phone).trim() : null;
 
   if (!requestedPhone && userId) {
@@ -549,14 +547,6 @@ export async function sendTestWhatsApp({
       warning: TEST_MODE_WARNING,
     };
   }
-
-  const resolvedTemplateId = await resolveTemplateId({
-    pgClient,
-    templateKey,
-    channel: "whatsapp",
-    provider: "brevo",
-    explicitTemplateId: templateId,
-  });
 
   const normalizedOriginal =
     normalizePhoneBR(originalRecipient) || originalRecipient;
@@ -783,6 +773,14 @@ export async function manualSendNotification({
     };
   }
 
+  const resolvedTemplateId = await resolveTemplateId({
+    pgClient,
+    templateKey,
+    channel: "whatsapp",
+    provider: "brevo",
+    explicitTemplateId: templateId,
+  });
+
   const testRecipient = getTestRecipient();
   if (!testRecipient) {
     return {
@@ -797,14 +795,6 @@ export async function manualSendNotification({
   const testMode = isTestModeActive();
   const allowRealRecipients = isAllowRealRecipients();
   const forced = shouldForceTestRecipient();
-
-  const resolvedTemplateId = await resolveTemplateId({
-    pgClient,
-    templateKey,
-    channel: "whatsapp",
-    provider: "brevo",
-    explicitTemplateId: templateId,
-  });
 
   let campaign = null;
   let estimatedCount = null;
@@ -1049,6 +1039,14 @@ export async function manualSendSelected({
     };
   }
 
+  const resolvedTemplateId = await resolveTemplateId({
+    pgClient,
+    templateKey,
+    channel,
+    provider,
+    explicitTemplateId: templateId,
+  });
+
   const maxRecipients = getManualSendMaxRecipients();
   const normalizedRecipients = normalizeManualRecipients(recipients);
 
@@ -1077,14 +1075,6 @@ export async function manualSendSelected({
     recipientCount: normalizedRecipients.length,
     useCustomRecipient,
     dryRun,
-  });
-
-  const resolvedTemplateId = await resolveTemplateId({
-    pgClient,
-    templateKey,
-    channel,
-    provider,
-    explicitTemplateId: templateId,
   });
 
   const sendParams = { ...(params || {}) };
