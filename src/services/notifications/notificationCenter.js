@@ -32,6 +32,8 @@ import {
   getCaptivePreauthTemplateMode,
   resolveCaptiveConfirmationPublicUrl,
 } from "../autopay/captivePreauthService.js";
+import { getPushVapidConfigStatus } from "./pushNotifications.js";
+import { getSmtpConfigStatus } from "./manualEmailNotifications.js";
 
 export const DELIVERY_NOTE_ACCEPTED =
   "accepted_by_brevo_not_delivery_confirmed";
@@ -104,6 +106,8 @@ export async function getNotificationHealth() {
   const captiveTemplate = await resolveCaptivePreauthTemplateHealth();
   const captiveConfirmationPublicUrl = resolveCaptiveConfirmationPublicUrl();
   const captivePreauthTemplateMode = getCaptivePreauthTemplateMode();
+  const pushConfig = getPushVapidConfigStatus();
+  const smtpConfig = getSmtpConfigStatus();
   return {
     ok: true,
     notificationCenterEnabled: isTruthy(process.env.NOTIFICATION_CENTER_ENABLED),
@@ -136,6 +140,28 @@ export async function getNotificationHealth() {
     ),
     whatsappConsentRequired: isWhatsAppConsentRequired(),
     whatsappAllowUnlinkedPhone: isUnlinkedWhatsAppPhoneAllowed(),
+    manual_channels: {
+      whatsapp: {
+        enabled: isWhatsAppEnabled(),
+        brevo_configured: Boolean(
+          String(process.env.BREVO_API_KEY || "").trim() &&
+          String(process.env.BREVO_WHATSAPP_SENDER_NUMBER || "").trim()
+        ),
+      },
+      push: {
+        enabled: pushConfig.enabled,
+        vapid_configured: Boolean(
+          pushConfig.hasPublicKey &&
+          pushConfig.hasPrivateKey &&
+          pushConfig.hasSubject &&
+          !pushConfig.error
+        ),
+      },
+      email: {
+        enabled: smtpConfig.configured,
+        smtp_configured: smtpConfig.configured,
+      },
+    },
   };
 }
 
@@ -1067,6 +1093,9 @@ export async function manualSendSelected({
   }
 
   const messageSnapshot = {
+    source: "admin_manual",
+    manual: true,
+    manual_channel: "whatsapp",
     channel,
     provider,
     template_key: templateKey,
@@ -1102,13 +1131,16 @@ export async function manualSendSelected({
       status: buildManualSendCampaignStatus(security),
       createdBy: adminUserId,
       payload: {
+        source: "admin_manual",
+        manual: true,
+        manual_channel: "whatsapp",
         admin_user_id: adminUserId || null,
         test_mode: security.testMode,
         dry_run: dryRun === true,
       },
       messageSnapshot,
       audienceSnapshot,
-      campaignType: "manual_selected",
+      campaignType: "manual_admin",
       audienceCountExpected: normalizedRecipients.length,
     });
   }
@@ -1206,7 +1238,7 @@ export async function manualSendSelected({
 
     const dispatch = await createDispatch({
       pgClient,
-      eventKey: "MANUAL_ADMIN_SELECTED_SEND",
+        eventKey: "MANUAL_ADMIN_SELECTED_SEND",
       channel,
       provider,
       userId: userRow?.id || item.user_id || null,
@@ -1217,6 +1249,9 @@ export async function manualSendSelected({
       providerTemplateId: resolvedTemplateId,
       campaignId: campaign?.id || null,
       payload: {
+        source: "admin_manual",
+        manual: true,
+        manual_channel: "whatsapp",
         params: sendParams,
         admin_user_id: adminUserId || null,
         test_mode: security.testMode,
