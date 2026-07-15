@@ -34,7 +34,7 @@ import adminCaptivesRouter from "./routes/admin_captives.js";
 import adminCaptivePreauthRouter from "./routes/admin_captive_preauth.js";
 import captivePreauthRouter from "./routes/captive_preauth.js";
 import {
-  expirePendingCaptivePreauths,
+  processPendingCaptivePreauthExpirations,
   getCaptivePreauthExpiryScanIntervalMs,
   isCaptivePreauthExpiryScanEnabled,
 } from "./services/autopay/captivePreauthService.js";
@@ -97,7 +97,7 @@ function startCaptivePreauthExpiryScanner() {
   const intervalMs = getCaptivePreauthExpiryScanIntervalMs();
   const runScan = async () => {
     try {
-      await expirePendingCaptivePreauths();
+      await processPendingCaptivePreauthExpirations();
     } catch (e) {
       console.warn("[captive-preauth] expired_pending_scan", {
         expired_count: 0,

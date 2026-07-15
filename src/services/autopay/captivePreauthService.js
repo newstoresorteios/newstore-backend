@@ -24,6 +24,8 @@ const AUTOPAY_BASE_AMOUNT_COLUMNS = [
 ];
 const NOTIFICATION_ATTEMPT_TYPES = new Set(["initial", "reissue", "manual_activation"]);
 const NOTIFICATION_ATTEMPT_STATUSES = new Set(["accepted", "sent", "delivered", "skipped", "failed"]);
+const EXPIRY_AUTO_APPROVAL_RESERVATION_HOLD_MINUTES = 10;
+const EXPIRY_AUTO_APPROVAL_ORIGIN = "expiry_auto_approve";
 
 function log(event, extra = {}) {
   console.log(`${LOG_PREFIX} ${event}`, extra);
@@ -1791,7 +1793,7 @@ export async function reissueAndResendPendingCaptivePreauths({ drawId, adminUser
     throw err;
   }
 
-  await expirePendingCaptivePreauths();
+  await processPendingCaptivePreauthExpirations();
 
   const rows = await listPendingCaptivePreauthsForReissue(id);
   const schema = await getAuthorizationTableSchema();
@@ -3485,6 +3487,638 @@ export async function expirePendingCaptivePreauths() {
   return { expired_count: rows.length, released_reservations: releasedReservations, rows };
 }
 
+function groupExpiredPendingAuthorizations(rows = []) {
+  const groups = new Map();
+  for (const row of rows) {
+    const drawId = Number(row?.draw_id);
+    const userId = Number(row?.user_id);
+    if (!Number.isInteger(drawId) || !Number.isInteger(userId)) continue;
+    const key = `${drawId}:${userId}`;
+    if (!groups.has(key)) groups.set(key, { draw_id: drawId, user_id: userId, authorizations: [] });
+    groups.get(key).authorizations.push(row);
+  }
+  return [...groups.values()].map((group) => ({
+    ...group,
+    authorizations: [...group.authorizations].sort((a, b) => String(a.id).localeCompare(String(b.id))),
+  }));
+}
+
+function expiryGroupDetails(group) {
+  const authorizations = group?.authorizations || [];
+  const authorizationIds = authorizations.map((item) => String(item.id)).sort();
+  const captiveNumbers = authorizations.map((item) => Number(item.captive_number)).sort((a, b) => a - b);
+  const totalAmountCents = authorizations.reduce((total, item) => total + Number(item.amount_cents || 0), 0);
+  return {
+    ...group,
+    anchor: authorizations[0] || null,
+    authorization_ids: authorizationIds,
+    captive_numbers: captiveNumbers,
+    quantity: authorizations.length,
+    unit_amount_cents: authorizations.length ? Number(authorizations[0].amount_cents) : null,
+    total_amount_cents: totalAmountCents,
+    idempotency_key: `captive-preauth-expiry:${Number(group.draw_id)}:${Number(group.user_id)}:${authorizationIds.join(",")}`,
+  };
+}
+
+async function insertExpiryAutoApprovalAudit(client, group, {
+  previousStatus = "pending",
+  newStatus,
+  result,
+  providerBillId = null,
+  providerChargeId = null,
+} = {}) {
+  const details = expiryGroupDetails(group);
+  if (!details.anchor?.autopay_number_id || !details.anchor?.id || !newStatus) return null;
+  const inserted = await client.query(
+    `INSERT INTO public.captive_preauth_authorization_events (
+        authorization_id, draw_id, user_id, autopay_number_id, captive_number,
+        amount_cents, previous_status, new_status, authorization_source,
+        admin_user_id, origin, authorization_ids, captive_numbers, quantity,
+        unit_amount_cents, total_amount_cents, result, provider_bill_id, provider_charge_id
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, 'system',
+        NULL, $9, $10::uuid[], $11::smallint[], $12,
+        $13, $14, $15, $16, $17
+      )
+      RETURNING id`,
+    [
+      details.anchor.id,
+      details.draw_id,
+      details.user_id,
+      details.anchor.autopay_number_id,
+      Number(details.anchor.captive_number),
+      Number(details.anchor.amount_cents),
+      previousStatus,
+      newStatus,
+      EXPIRY_AUTO_APPROVAL_ORIGIN,
+      details.authorization_ids,
+      details.captive_numbers,
+      details.quantity,
+      details.unit_amount_cents,
+      details.total_amount_cents,
+      result || null,
+      providerBillId,
+      providerChargeId,
+    ]
+  );
+  return inserted.rows?.[0]?.id ? String(inserted.rows[0].id) : null;
+}
+
+async function releaseExpiryAutoApprovalReservations(client, group) {
+  const details = expiryGroupDetails(group);
+  if (!details.captive_numbers.length) return 0;
+  const reservationResult = await client.query(
+    `SELECT n.reservation_id
+       FROM public.numbers n
+       JOIN public.reservations r ON r.id = n.reservation_id
+      WHERE n.draw_id = $1
+        AND n.n = ANY($2::smallint[])
+        AND n.status = 'reserved'
+        AND r.user_id = $3
+        AND n.n = ANY(r.numbers)
+      FOR UPDATE OF n, r`,
+    [details.draw_id, details.captive_numbers, details.user_id]
+  );
+  const reservationIds = [...new Set(
+    (reservationResult.rows || [])
+      .map((item) => item.reservation_id)
+      .filter(Boolean)
+      .map(String)
+  )];
+  if (!reservationIds.length) return 0;
+  await client.query(
+    `UPDATE public.reservations
+        SET status = 'expired',
+            expires_at = now()
+      WHERE id = ANY($1::uuid[])
+        AND lower(coalesce(status, '')) IN ('pending', 'active', 'reserved', '')`,
+    [reservationIds]
+  );
+  const released = await client.query(
+    `UPDATE public.numbers
+        SET status = 'available',
+            reservation_id = NULL
+      WHERE draw_id = $1
+        AND n = ANY($2::smallint[])
+        AND reservation_id = ANY($3::uuid[])
+        AND status = 'reserved'`,
+    [details.draw_id, details.captive_numbers, reservationIds]
+  );
+  return Number(released.rowCount || 0);
+}
+
+async function expireLockedAutoApprovalGroup(client, group, reason) {
+  const details = expiryGroupDetails(group);
+  const expired = await client.query(
+    `UPDATE public.autopay_draw_authorizations
+        SET status = 'expired',
+            expired_at = COALESCE(expired_at, now()),
+            updated_at = now()
+      WHERE id = ANY($1::uuid[])
+        AND status = 'pending'
+      RETURNING *`,
+    [details.authorization_ids]
+  );
+  const expiredRows = expired.rows || [];
+  const expiredGroup = { ...details, authorizations: expiredRows.length ? expiredRows : details.authorizations };
+  const releasedReservations = await releaseExpiryAutoApprovalReservations(client, expiredGroup);
+  if (expiredRows.length) {
+    await insertExpiryAutoApprovalAudit(client, expiredGroup, {
+      previousStatus: "pending",
+      newStatus: "expired",
+      result: reason,
+    });
+  }
+  return { expired: expiredRows.length, released_reservations: releasedReservations };
+}
+
+async function prepareExpiredPendingCaptivePreauthGroups(options = {}) {
+  const pool = options.pgPool || await getPool();
+  const client = await pool.connect();
+  const summary = {
+    checked: 0,
+    eligible: 0,
+    groups: [],
+    authorized: 0,
+    charged: 0,
+    failed: 0,
+    expired: 0,
+    skipped: 0,
+    released_reservations: 0,
+    draw_ids: [],
+  };
+
+  try {
+    await client.query("BEGIN");
+    const selected = await client.query(
+      `SELECT *
+         FROM public.autopay_draw_authorizations
+        WHERE status = 'pending'
+          AND expires_at IS NOT NULL
+          AND expires_at <= now()
+        ORDER BY draw_id, user_id, id
+        FOR UPDATE SKIP LOCKED`
+    );
+    const selectedRows = selected.rows || [];
+    summary.checked = selectedRows.length;
+
+    for (const rawGroup of groupExpiredPendingAuthorizations(selectedRows)) {
+      const group = expiryGroupDetails(rawGroup);
+      const countResult = await client.query(
+        `SELECT count(*)::integer AS count
+           FROM public.autopay_draw_authorizations
+          WHERE draw_id = $1
+            AND user_id = $2
+            AND status = 'pending'
+            AND expires_at IS NOT NULL
+            AND expires_at <= now()`,
+        [group.draw_id, group.user_id]
+      );
+      if (Number(countResult.rows?.[0]?.count || 0) !== group.quantity) {
+        summary.skipped += group.quantity;
+        warn("expiry_auto_approve_skipped", {
+          draw_id: group.draw_id,
+          user_id: group.user_id,
+          authorization_ids: group.authorization_ids,
+          reason: "group_partially_locked_or_changed",
+        });
+        continue;
+      }
+
+      const drawResult = await client.query(
+        `SELECT id, status
+           FROM public.draws
+          WHERE id = $1
+          FOR UPDATE`,
+        [group.draw_id]
+      );
+      const drawStatus = String(drawResult.rows?.[0]?.status || "").trim().toLowerCase();
+      if (drawStatus !== "open") {
+        const expired = await expireLockedAutoApprovalGroup(client, group, "draw_not_open_at_auto_approval");
+        summary.expired += expired.expired;
+        summary.released_reservations += expired.released_reservations;
+        continue;
+      }
+
+      const duplicateNumber = group.captive_numbers.some(
+        (number, index) => group.captive_numbers.indexOf(number) !== index
+      );
+      if (duplicateNumber) {
+        const expired = await expireLockedAutoApprovalGroup(client, group, "duplicate_captive_number_at_auto_approval");
+        summary.expired += expired.expired;
+        summary.released_reservations += expired.released_reservations;
+        continue;
+      }
+
+      const approvedPayment = await client.query(
+        `SELECT id
+           FROM public.payments
+          WHERE draw_id = $1
+            AND user_id = $2
+            AND numbers && $3::int[]
+            AND (
+              lower(status) IN ('approved', 'paid', 'pago')
+              OR lower(coalesce(vindi_status, '')) IN ('approved', 'paid', 'pago', 'success', 'successful')
+            )
+          LIMIT 1
+          FOR UPDATE`,
+        [group.draw_id, group.user_id, group.captive_numbers]
+      );
+      if (approvedPayment.rowCount) {
+        summary.skipped += group.quantity;
+        warn("expiry_auto_approve_skipped", {
+          draw_id: group.draw_id,
+          user_id: group.user_id,
+          authorization_ids: group.authorization_ids,
+          reason: "approved_payment_exists",
+        });
+        continue;
+      }
+
+      const completedCharge = await client.query(
+        `SELECT provider_bill_id, provider_charge_id
+           FROM public.autopay_runs
+          WHERE draw_id = $1
+            AND user_id = $2
+            AND status = 'charged_ok'
+            AND provider_request->>'idempotency_key' = ANY($3::text[])
+          ORDER BY created_at DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [
+          group.draw_id,
+          group.user_id,
+          [
+            group.idempotency_key,
+            `captive-preauth-admin:${group.draw_id}:${group.user_id}:${group.authorization_ids.join(",")}`,
+          ],
+        ]
+      );
+      if (completedCharge.rowCount) {
+        const reconciled = await client.query(
+          `UPDATE public.autopay_draw_authorizations
+              SET status = 'charged',
+                  charged_at = COALESCE(charged_at, now()),
+                  updated_at = now()
+            WHERE id = ANY($1::uuid[])
+              AND status = 'pending'
+            RETURNING *`,
+          [group.authorization_ids]
+        );
+        const completed = completedCharge.rows[0];
+        await insertExpiryAutoApprovalAudit(client, {
+          ...group,
+          authorizations: reconciled.rows || group.authorizations,
+        }, {
+          previousStatus: "pending",
+          newStatus: "charged",
+          result: "charge_already_completed",
+          providerBillId: completed.provider_bill_id || null,
+          providerChargeId: completed.provider_charge_id || null,
+        });
+        summary.charged += Number(reconciled.rowCount || 0);
+        continue;
+      }
+
+      const activeCharge = await client.query(
+        `SELECT id, status, provider_bill_id, provider_charge_id
+           FROM public.autopay_runs
+          WHERE draw_id = $1
+            AND user_id = $2
+            AND (
+              lower(coalesce(status, '')) IN (
+                'attempt', 'reserved', 'billed', 'charged', 'preflight',
+                'payment_profile_lookup', 'payment_profile_resolved',
+                'bill_request_started', 'result_unknown'
+              )
+              OR (
+                provider_bill_id IS NOT NULL
+                AND lower(coalesce(status, '')) NOT IN (
+                  'charged_ok', 'charged_fail', 'payment_method_unavailable',
+                  'preflight_failed', 'provider_unavailable'
+                )
+              )
+            )
+          LIMIT 1
+          FOR UPDATE`,
+        [group.draw_id, group.user_id]
+      );
+      if (activeCharge.rowCount) {
+        summary.skipped += group.quantity;
+        warn("expiry_auto_approve_skipped", {
+          draw_id: group.draw_id,
+          user_id: group.user_id,
+          authorization_ids: group.authorization_ids,
+          reason: "payment_in_progress_or_unknown",
+        });
+        continue;
+      }
+
+      const numberResult = await client.query(
+        `SELECT n, status AS number_status, reservation_id
+           FROM public.numbers
+          WHERE draw_id = $1
+            AND n = ANY($2::smallint[])
+          ORDER BY n
+          FOR UPDATE`,
+        [group.draw_id, group.captive_numbers]
+      );
+      const numberRows = numberResult.rows || [];
+      const reservationIds = [...new Set(numberRows.map((item) => item.reservation_id).filter(Boolean).map(String))];
+      const reservationResult = reservationIds.length
+        ? await client.query(
+            `SELECT id, user_id, numbers, status, expires_at
+               FROM public.reservations
+              WHERE id = ANY($1::uuid[])
+              ORDER BY id
+              FOR UPDATE`,
+            [reservationIds]
+          )
+        : { rows: [] };
+      const reservationsById = new Map(
+        (reservationResult.rows || []).map((item) => [String(item.id), item])
+      );
+      const rowsByNumber = new Map(numberRows.map((item) => [Number(item.n), item]));
+      const reservationsValid = numberRows.length === group.quantity && group.authorizations.every((authorization) => {
+        const numberRow = rowsByNumber.get(Number(authorization.captive_number));
+        const reservation = numberRow?.reservation_id
+          ? reservationsById.get(String(numberRow.reservation_id))
+          : null;
+        return numberRow && reservation &&
+          normalizeNumberStatus(numberRow.number_status) === "reserved" &&
+          ["pending", "active", "reserved", ""].includes(normalizeReservationStatus(reservation.status)) &&
+          Number(reservation.user_id) === group.user_id &&
+          (reservation.numbers || []).map(Number).includes(Number(authorization.captive_number));
+      });
+      if (!reservationsValid) {
+        const expired = await expireLockedAutoApprovalGroup(client, group, "reservation_invalid_at_auto_approval");
+        summary.expired += expired.expired;
+        summary.released_reservations += expired.released_reservations;
+        continue;
+      }
+
+      await client.query(
+        `UPDATE public.reservations
+            SET expires_at = GREATEST(
+                  COALESCE(expires_at, now()),
+                  now() + ($2::integer * interval '1 minute')
+                )
+          WHERE id = ANY($1::uuid[])
+            AND lower(coalesce(status, '')) IN ('pending', 'active', 'reserved', '')`,
+        [reservationIds, EXPIRY_AUTO_APPROVAL_RESERVATION_HOLD_MINUTES]
+      );
+
+      const authorized = await client.query(
+        `UPDATE public.autopay_draw_authorizations
+            SET status = 'authorized',
+                authorized_at = now(),
+                updated_at = now()
+          WHERE id = ANY($1::uuid[])
+            AND status = 'pending'
+            AND expires_at IS NOT NULL
+            AND expires_at <= now()
+          RETURNING *`,
+        [group.authorization_ids]
+      );
+      if (Number(authorized.rowCount || 0) !== group.quantity) {
+        summary.skipped += group.quantity;
+        warn("expiry_auto_approve_skipped", {
+          draw_id: group.draw_id,
+          user_id: group.user_id,
+          authorization_ids: group.authorization_ids,
+          reason: "skipped_already_decided",
+        });
+        continue;
+      }
+
+      const authorizedGroup = expiryGroupDetails({
+        ...group,
+        authorizations: authorized.rows || group.authorizations,
+        reservation_ids: reservationIds,
+      });
+      await insertExpiryAutoApprovalAudit(client, authorizedGroup, {
+        previousStatus: "pending",
+        newStatus: "authorized",
+        result: "authorized",
+      });
+      summary.eligible += authorizedGroup.quantity;
+      summary.authorized += authorizedGroup.quantity;
+      summary.groups.push(authorizedGroup);
+    }
+
+    await client.query("COMMIT");
+    summary.draw_ids = [...new Set(selectedRows.map((row) => Number(row.draw_id)).filter(Number.isFinite))];
+    return summary;
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function finalizeExpiryAutoApprovalGroup(group, chargeResult, options = {}) {
+  const pool = options.pgPool || await getPool();
+  const client = await pool.connect();
+  const details = expiryGroupDetails(group);
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(
+      `SELECT *
+         FROM public.autopay_draw_authorizations
+        WHERE id = ANY($1::uuid[])
+          AND draw_id = $2
+          AND user_id = $3
+        ORDER BY id
+        FOR UPDATE`,
+      [details.authorization_ids, details.draw_id, details.user_id]
+    );
+    const rows = locked.rows || [];
+    const actualIds = rows.map((item) => String(item.id)).sort();
+    const groupMatches = actualIds.length === details.authorization_ids.length &&
+      details.authorization_ids.every((id, index) => id === actualIds[index]);
+    if (!groupMatches) {
+      await client.query("ROLLBACK");
+      return { outcome: "skipped", count: details.quantity, released_reservations: 0 };
+    }
+
+    if (chargeResult.ok && chargeResult.charged === true) {
+      if (!rows.every((item) => safeStatus(item.status) === "charged")) {
+        await client.query("ROLLBACK");
+        return { outcome: "skipped", count: details.quantity, released_reservations: 0 };
+      }
+      await insertExpiryAutoApprovalAudit(client, { ...details, authorizations: rows }, {
+        previousStatus: "authorized",
+        newStatus: "charged",
+        result: chargeResult.code || "charged",
+        providerBillId: chargeResult.provider_bill_id || null,
+        providerChargeId: chargeResult.provider_charge_id || null,
+      });
+      await client.query("COMMIT");
+      return { outcome: "charged", count: details.quantity, released_reservations: 0 };
+    }
+
+    if (chargeResult.definitive !== true) {
+      if (!rows.every((item) => safeStatus(item.status) === "authorized")) {
+        await client.query("ROLLBACK");
+        return { outcome: "skipped", count: details.quantity, released_reservations: 0 };
+      }
+      await insertExpiryAutoApprovalAudit(client, { ...details, authorizations: rows }, {
+        previousStatus: "authorized",
+        newStatus: "authorized",
+        result: "payment_result_unknown",
+        providerBillId: chargeResult.provider_bill_id || null,
+        providerChargeId: chargeResult.provider_charge_id || null,
+      });
+      await client.query("COMMIT");
+      return { outcome: "unknown", count: details.quantity, released_reservations: 0 };
+    }
+
+    if (!rows.every((item) => safeStatus(item.status) === "authorized")) {
+      await client.query("ROLLBACK");
+      return { outcome: "skipped", count: details.quantity, released_reservations: 0 };
+    }
+    const failed = await client.query(
+      `UPDATE public.autopay_draw_authorizations
+          SET status = 'failed',
+              updated_at = now()
+        WHERE id = ANY($1::uuid[])
+          AND status = 'authorized'
+        RETURNING *`,
+      [details.authorization_ids]
+    );
+    if (Number(failed.rowCount || 0) !== details.quantity) {
+      await client.query("ROLLBACK");
+      return { outcome: "skipped", count: details.quantity, released_reservations: 0 };
+    }
+    const failedGroup = { ...details, authorizations: failed.rows || rows };
+    const releasedReservations = await releaseExpiryAutoApprovalReservations(client, failedGroup);
+    await insertExpiryAutoApprovalAudit(client, failedGroup, {
+      previousStatus: "authorized",
+      newStatus: "failed",
+      result: chargeResult.code || "payment_failed",
+      providerBillId: chargeResult.provider_bill_id || null,
+      providerChargeId: chargeResult.provider_charge_id || null,
+    });
+    await client.query("COMMIT");
+    return { outcome: "failed", count: details.quantity, released_reservations: releasedReservations };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function autoAuthorizeAndChargeExpiredPendingCaptivePreauths(options = {}) {
+  const prepareGroups = options.prepareGroups || prepareExpiredPendingCaptivePreauthGroups;
+  const chargeGroup = options.chargeGroup || chargeAuthorizedCaptivePreauthWithAutopay;
+  const finalizeGroup = options.finalizeGroup || finalizeExpiryAutoApprovalGroup;
+  const prepared = await prepareGroups(options);
+  const summary = {
+    checked: Number(prepared.checked || 0),
+    eligible: Number(prepared.eligible || 0),
+    groups: Number((prepared.groups || []).length),
+    authorized: Number(prepared.authorized || 0),
+    charged: Number(prepared.charged || 0),
+    failed: Number(prepared.failed || 0),
+    expired: Number(prepared.expired || 0),
+    skipped: Number(prepared.skipped || 0),
+    released_reservations: Number(prepared.released_reservations || 0),
+    draw_ids: prepared.draw_ids || [],
+  };
+
+  for (const rawGroup of prepared.groups || []) {
+    const group = expiryGroupDetails(rawGroup);
+    log("expiry_auto_approve_group_started", {
+      draw_id: group.draw_id,
+      user_id: group.user_id,
+      authorization_ids: group.authorization_ids,
+      captive_numbers: group.captive_numbers,
+      quantity: group.quantity,
+      total_amount_cents: group.total_amount_cents,
+      idempotency_key: group.idempotency_key,
+    });
+
+    if ((options.chargeEnabled ?? isCaptivePreauthChargeOnAuthorizeEnabled()) !== true) {
+      summary.skipped += group.quantity;
+      warn("expiry_auto_approve_skipped", {
+        draw_id: group.draw_id,
+        user_id: group.user_id,
+        authorization_ids: group.authorization_ids,
+        reason: "charge_on_authorize_disabled",
+      });
+      continue;
+    }
+
+    let chargeResult;
+    try {
+      chargeResult = await chargeGroup({
+        drawId: group.draw_id,
+        userId: group.user_id,
+        expiryGroup: true,
+        expectedAuthorizationIds: group.authorization_ids,
+        authorizationSource: "system",
+        authorizedByAdminId: null,
+      });
+    } catch (chargeError) {
+      chargeResult = {
+        ok: false,
+        charged: false,
+        definitive: false,
+        code: "payment_result_unknown",
+        reason: safeError(chargeError?.code || chargeError?.message || "runner_failed"),
+      };
+    }
+    const finalized = await finalizeGroup(group, chargeResult, options);
+    summary.released_reservations += Number(finalized.released_reservations || 0);
+    if (finalized.outcome === "charged") {
+      summary.charged += Number(finalized.count || group.quantity);
+      log("expiry_auto_approve_group_charged", {
+        draw_id: group.draw_id,
+        user_id: group.user_id,
+        authorization_ids: group.authorization_ids,
+        captive_numbers: group.captive_numbers,
+      });
+    } else if (finalized.outcome === "failed") {
+      summary.failed += Number(finalized.count || group.quantity);
+      warn("expiry_auto_approve_group_failed", {
+        draw_id: group.draw_id,
+        user_id: group.user_id,
+        authorization_ids: group.authorization_ids,
+        captive_numbers: group.captive_numbers,
+        reason: chargeResult.code || "payment_failed",
+      });
+    } else {
+      summary.skipped += finalized.outcome === "unknown" ? 0 : Number(finalized.count || group.quantity);
+      warn("expiry_auto_approve_skipped", {
+        draw_id: group.draw_id,
+        user_id: group.user_id,
+        authorization_ids: group.authorization_ids,
+        reason: finalized.outcome === "unknown" ? "payment_result_unknown" : "group_changed_after_charge",
+      });
+    }
+  }
+
+  log("expiry_auto_approve_scan", summary);
+  return summary;
+}
+
+export async function processPendingCaptivePreauthExpirations(options = {}) {
+  const autoApproveEnabled = options.autoApproveEnabled ?? isCaptivePreauthAutoApproveOnExpiryEnabled();
+  if (!autoApproveEnabled) {
+    const legacyExpirer = options.legacyExpirer || expirePendingCaptivePreauths;
+    return legacyExpirer();
+  }
+  const autoProcessor = options.autoProcessor || autoAuthorizeAndChargeExpiredPendingCaptivePreauths;
+  return autoProcessor(options);
+}
+
 async function publicAuthorization(row) {
   if (!row) return null;
   let drawTitle = `Sorteio #${row.draw_id}`;
@@ -3529,7 +4163,7 @@ function logPublicEvent(event, { email, phone, userId = null, found = false, aut
 }
 
 export async function lookupCaptivePreauthPublic({ email, phone }) {
-  await expirePendingCaptivePreauths();
+  await processPendingCaptivePreauthExpirations();
   const user = await lookupPublicUser({ email, phone });
   if (!user) {
     logPublicEvent("public_lookup", { email, phone, found: false });
@@ -3600,7 +4234,7 @@ export async function lookupCaptivePreauthForUser(userId) {
   const id = normalizeUserId(userId);
   if (!id) return { ok: true, has_captive: false, items: [] };
 
-  await expirePendingCaptivePreauths();
+  await processPendingCaptivePreauthExpirations();
 
   const hasCaptive = await userHasCaptiveNumber(id);
   if (!hasCaptive) {
@@ -3645,7 +4279,7 @@ export async function lookupCaptivePreauthForUser(userId) {
 }
 
 async function getAuthorizationForUserDecision({ userId, authorizationId }) {
-  await expirePendingCaptivePreauths();
+  await processPendingCaptivePreauthExpirations();
   const id = normalizeUserId(userId);
   const authId = String(authorizationId || "").trim();
   if (!id || !UUID_RE.test(authId)) return { row: null };
@@ -3700,7 +4334,7 @@ export async function declineCaptivePreauthForUser({ userId, authorizationId }) 
 }
 
 async function getPublicAuthorizationForDecision({ email, phone, authorizationId }) {
-  await expirePendingCaptivePreauths();
+  await processPendingCaptivePreauthExpirations();
   const user = await lookupPublicUser({ email, phone });
   if (!user) return { user: null, row: null };
   const id = String(authorizationId || "").trim();
@@ -3900,11 +4534,13 @@ async function applyAuthorizationDecision(row, decision, source = "token", optio
 }
 
 async function applyTokenDecision(token, decision) {
+  await processPendingCaptivePreauthExpirations();
   const row = await getAuthorizationByToken(token);
   return applyAuthorizationDecision(row, decision, "token");
 }
 
 export async function lookupCaptivePreauthByCode(code) {
+  await processPendingCaptivePreauthExpirations();
   const normalized = normalizeConfirmationCode(code);
   const lookup = await getAuthorizationByConfirmationCode(normalized);
   if (lookup.error || !lookup.row) {
@@ -3934,6 +4570,7 @@ export async function lookupCaptivePreauthByCode(code) {
 }
 
 export async function lookupCaptivePreauthByToken(token) {
+  await processPendingCaptivePreauthExpirations();
   const row = await getAuthorizationByToken(token);
   if (!row) {
     return { ok: false, code: "token_invalid", status: "invalid" };
@@ -4111,6 +4748,7 @@ async function recoverFailedAuthorizationForRetry(row, source = "account") {
 }
 
 export async function authorizeCaptivePreauthByCode(code) {
+  await processPendingCaptivePreauthExpirations();
   const normalized = normalizeConfirmationCode(code);
   const lookup = await getAuthorizationByConfirmationCode(normalized);
   if (lookup.error || !lookup.row) {
@@ -4121,6 +4759,7 @@ export async function authorizeCaptivePreauthByCode(code) {
 }
 
 export async function declineCaptivePreauthByCode(code) {
+  await processPendingCaptivePreauthExpirations();
   const normalized = normalizeConfirmationCode(code);
   const lookup = await getAuthorizationByConfirmationCode(normalized);
   if (lookup.error || !lookup.row) {
@@ -4155,6 +4794,10 @@ export async function chargeAuthorizedCaptivePreauth(authorizationId, options = 
 
 export function isCaptivePreauthExpiryScanEnabled() {
   return envBool("CAPTIVE_PREAUTH_EXPIRY_SCAN_ENABLED", true);
+}
+
+export function isCaptivePreauthAutoApproveOnExpiryEnabled() {
+  return envBool("CAPTIVE_PREAUTH_AUTO_APPROVE_ON_EXPIRY_ENABLED", false);
 }
 
 export function getCaptivePreauthExpiryScanIntervalMs() {
@@ -4202,10 +4845,13 @@ export default {
   reissueAndResendPendingCaptivePreauths,
   chargeAuthorizedCaptivePreauth,
   expirePendingCaptivePreauths,
+  processPendingCaptivePreauthExpirations,
+  autoAuthorizeAndChargeExpiredPendingCaptivePreauths,
   isCaptivePreauthEnabled,
   resolveCaptivePreauthDrawRequirement,
   isCaptivePreauthChargeOnAuthorizeEnabled,
   isCaptivePreauthWhatsAppEnabled,
   isCaptivePreauthExpiryScanEnabled,
+  isCaptivePreauthAutoApproveOnExpiryEnabled,
   getCaptivePreauthExpiryScanIntervalMs,
 };

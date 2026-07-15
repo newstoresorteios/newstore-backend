@@ -42,6 +42,35 @@ Este documento lista as variáveis de ambiente necessárias para configurar o ba
 - **Padrão**: `pagarme`
 - **Exemplo**: `VINDI_DEFAULT_GATEWAY=pagarme`
 
+## Pré-autorização de números cativos
+
+### CAPTIVE_PREAUTH_AUTO_APPROVE_ON_EXPIRY_ENABLED
+- **Descrição**: Controla a decisão aplicada a pré-autorizações `pending` quando a janela expira.
+- **Padrão**: `false`
+- **Com `false`**: Preserva o comportamento legado; a autorização vira `expired`, a reserva é liberada e não há cobrança.
+- **Com `true`**: Autoriza automaticamente apenas registros ainda `pending`, agrupa por sorteio e usuário e chama o runner financeiro para cobrar o cartão cadastrado.
+- **Exemplo**: `CAPTIVE_PREAUTH_AUTO_APPROVE_ON_EXPIRY_ENABLED=true`
+
+### CAPTIVE_PREAUTH_EXPIRY_SCAN_ENABLED
+- **Descrição**: Liga ou desliga somente a execução periódica do scanner de vencimentos.
+- **Padrão**: `true`
+- **Exemplo**: `CAPTIVE_PREAUTH_EXPIRY_SCAN_ENABLED=true`
+
+### CAPTIVE_PREAUTH_EXPIRY_SCAN_INTERVAL_MS
+- **Descrição**: Intervalo entre execuções do scanner, em milissegundos.
+- **Padrão**: `300000`
+- **Exemplo**: `CAPTIVE_PREAUTH_EXPIRY_SCAN_INTERVAL_MS=300000`
+
+### CAPTIVE_PREAUTH_EXPIRES_HOURS
+- **Descrição**: Janela para o cliente aprovar ou recusar a pré-autorização.
+- **Padrão**: `12`
+- **Exemplo**: `CAPTIVE_PREAUTH_EXPIRES_HOURS=12`
+
+### CAPTIVE_PREAUTH_CHARGE_ON_AUTHORIZE_ENABLED
+- **Descrição**: Permite que uma autorização confirmada siga imediatamente para o runner financeiro.
+- **Padrão**: `false` no código; deve permanecer `true` no ambiente que usa cobrança imediata.
+- **Exemplo**: `CAPTIVE_PREAUTH_CHARGE_ON_AUTHORIZE_ENABLED=true`
+
 ## Outras Variáveis Importantes
 
 ### PORT

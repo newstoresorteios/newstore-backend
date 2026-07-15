@@ -1010,13 +1010,15 @@ async function chargeAuthorizedCaptivePreauthGroup({
       contractError.missingFields = missingFields;
       throw contractError;
     }
-    if (authorizationSource !== "admin" || !toPositiveInt(authorizedByAdminId)) {
+    const isAdminAuthorization = authorizationSource === "admin" && Boolean(toPositiveInt(authorizedByAdminId));
+    const isExpiryAutoAuthorization = authorizationSource === "system" && !authorizedByAdminId;
+    if (!isAdminAuthorization && !isExpiryAutoAuthorization) {
       const contractError = new Error("runner_context_invalid");
       contractError.code = "payment_preflight_contract_invalid";
       contractError.reason = "runner_context_invalid";
       contractError.missingFields = [
-        ...(authorizationSource === "admin" ? [] : ["authorizationSource"]),
-        ...(toPositiveInt(authorizedByAdminId) ? [] : ["authorizedByAdminId"]),
+        ...(["admin", "system"].includes(authorizationSource) ? [] : ["authorizationSource"]),
+        ...(authorizationSource !== "admin" || toPositiveInt(authorizedByAdminId) ? [] : ["authorizedByAdminId"]),
       ];
       throw contractError;
     }
@@ -1026,7 +1028,10 @@ async function chargeAuthorizedCaptivePreauthGroup({
     const draw_id = context.drawId;
     const user_id = context.userId;
     const expectedIds = context.authorizationIds;
-    lockKey = `captive-preauth-admin:${draw_id}:${user_id}:${expectedIds.join(",")}`;
+    const idempotencyPrefix = isExpiryAutoAuthorization
+      ? "captive-preauth-expiry"
+      : "captive-preauth-admin";
+    lockKey = `${idempotencyPrefix}:${draw_id}:${user_id}:${expectedIds.join(",")}`;
     await client.query("SELECT pg_advisory_lock(hashtext($1))", [lockKey]);
 
     await client.query("BEGIN");
@@ -1778,7 +1783,7 @@ export async function chargeAuthorizedCaptivePreauth(authorizationOrOptions, leg
     authorizationOrOptions && typeof authorizationOrOptions === "object" && !Array.isArray(authorizationOrOptions)
       ? authorizationOrOptions
       : legacyOptions;
-  if (namedOptions.adminGroup === true) {
+  if (namedOptions.adminGroup === true || namedOptions.expiryGroup === true) {
     return chargeAuthorizedCaptivePreauthGroup({
       drawId: namedOptions.drawId,
       userId: namedOptions.userId,
