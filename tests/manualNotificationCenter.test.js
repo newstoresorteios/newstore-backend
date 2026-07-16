@@ -138,9 +138,19 @@ test("catalog returns whatsapp, push and database email templates without Brevo 
   assert.equal(catalog.channels.email.templates[0].template_key, "EMAIL_DB");
   assert.deepEqual(catalog.channels.whatsapp.audiences, ["selected", "all_consented"]);
   assert.deepEqual(catalog.channels.push.audiences, ["selected", "all_active_push", "all_consented"]);
-  assert.deepEqual(catalog.channels.email.audiences, ["selected"]);
-  assert.equal(catalog.channels.email.email_all_consented_supported, false);
-  assert.equal(catalog.channels.email.reason, "email_consent_not_available");
+  assert.deepEqual(catalog.channels.email.audiences, ["selected", "all_with_email"]);
+  for (const remaining of [75, 50, 30, 15]) {
+    const template = catalog.channels.email.templates.find(
+      (item) => item.template_key === `EMAIL_DRAW_REMAINING_${remaining}`
+    );
+    assert.equal(template.name, `Restam ${remaining} números`);
+    assert.equal(template.channel, "email");
+    assert.equal(template.provider, "brevo_smtp");
+    assert.equal(template.source, "builtin");
+    assert.equal(template.editable, false);
+    assert.equal(template.manual_send_allowed, true);
+    assert.equal(template.default_params.remaining_numbers, remaining);
+  }
   assert.equal(pgClient.calls.some((call) => /https?:\/\//i.test(call.sql)), false);
 });
 
@@ -236,7 +246,18 @@ test("database template wins over env and is deduplicated by key and provider id
 test("catalog returns builtin email templates when database has none", async () => {
   const catalog = await getManualNotificationCatalog({ pgClient: catalogPg({ emailRows: [] }) });
   assert.equal(catalog.channels.email.templates[0].source, "builtin");
-  assert(catalog.channels.email.templates.some((item) => item.template_key === "GENERIC_ADMIN_EMAIL"));
+  for (const templateKey of [
+    "GENERIC_ADMIN_EMAIL",
+    "NEW_DRAW_EMAIL",
+    "RESULT_AVAILABLE_EMAIL",
+    "BALANCE_NOTICE_EMAIL",
+    "EMAIL_DRAW_REMAINING_75",
+    "EMAIL_DRAW_REMAINING_50",
+    "EMAIL_DRAW_REMAINING_30",
+    "EMAIL_DRAW_REMAINING_15",
+  ]) {
+    assert(catalog.channels.email.templates.some((item) => item.template_key === templateKey));
+  }
 });
 
 function previewPg() {
@@ -267,6 +288,41 @@ function previewPg() {
     }
     if (sql.includes("notification_templates") && sql.includes("channel = 'whatsapp'")) {
       return rowResult([{ template_key: "GENERIC_TEST", provider_template_id: "3", default_message: "Teste" }]);
+    }
+    return rowResult([]);
+  });
+}
+
+function emailPg(users) {
+  let campaignId = 200;
+  let dispatchId = 2000;
+  return fakePg((sql, params) => {
+    if (sql.includes("FROM public.users")) {
+      if (Array.isArray(params[0])) {
+        return rowResult(users.filter((user) => params[0].includes(user.id)));
+      }
+      return rowResult(users);
+    }
+    if (sql.includes("notification_templates") && sql.includes("channel = 'email'")) {
+      return rowResult([]);
+    }
+    if (sql.includes("INSERT INTO public.notification_campaigns")) {
+      return rowResult([{ id: campaignId++, status: "created" }]);
+    }
+    if (sql.includes("INSERT INTO public.notification_dispatches")) {
+      return rowResult([{ id: dispatchId++, status: "pending" }]);
+    }
+    if (sql.includes("UPDATE public.notification_dispatches")) {
+      return rowResult([{
+        id: params[0],
+        status: sql.includes("status = 'accepted'") ? "accepted" : "failed",
+      }]);
+    }
+    if (sql.includes("UPDATE public.notification_campaigns")) {
+      return rowResult([{ id: params[0], status: "created" }]);
+    }
+    if (sql.includes("SELECT * FROM public.notification_campaigns WHERE id")) {
+      return rowResult([{ id: params[0], status: "created" }]);
     }
     return rowResult([]);
   });
@@ -454,44 +510,111 @@ test("preview email validates email addresses and removes invalid contacts", asy
     payload: { channel: "email", template_key: "GENERIC_ADMIN_EMAIL", audience: "selected", user_ids: [1, 2] },
   });
   assert.equal(preview.valid_emails, 1);
-  assert.equal(preview.missing_contact, 1);
+  assert.equal(preview.invalid_emails, 1);
+  assert.equal(preview.missing_contact, 0);
 });
 
-test("email all_consented stays unavailable without explicit email consent", async () => {
-  const pgClient = bulkPg({ userCount: 3 });
+test("preview email all_with_email recalculates users, ignores invalid contacts and deduplicates", async () => {
+  const pgClient = emailPg([
+    { id: 1, name: "Ana", email: " Ana@Example.com " },
+    { id: 2, name: "Ana duplicada", email: "ana@example.com" },
+    { id: 3, name: "Sem email", email: " " },
+    { id: 4, name: "Inválido", email: "invalid" },
+  ]);
   const preview = await buildManualNotificationPreview({
     pgClient,
     payload: {
       channel: "email",
-      template_key: "GENERIC_ADMIN_EMAIL",
-      audience: "all_consented",
+      template_key: "EMAIL_DRAW_REMAINING_75",
+      audience: "all_with_email",
+      user_ids: [999],
+      params: { draw_name: "Sorteio New Store", draw_url: "/" },
     },
   });
-  assert.equal(preview.can_send, false);
-  assert.equal(preview.email_all_consented_supported, false);
-  assert.equal(preview.reason, "email_consent_not_available");
-  assert.equal(preview.valid_emails, 0);
-  assert.equal(preview.requires_bulk_confirmation, true);
 
+  assert.equal(preview.requested_users, 4);
+  assert.equal(preview.eligible_users, 1);
+  assert.equal(preview.valid_emails, 1);
+  assert.equal(preview.missing_contact, 1);
+  assert.equal(preview.invalid_emails, 1);
+  assert.equal(preview.duplicate_emails_removed, 1);
+  assert.equal(preview.estimated_batches, 1);
+  assert.equal(preview.requires_bulk_confirmation, true);
+  assert.equal(preview.can_send, true);
+  assert.deepEqual(preview.normalized.userIds, []);
+  assert.deepEqual(preview.normalized.eligibleUserIds, [1]);
+  assert.equal(pgClient.calls.some((call) => call.sql.includes("communication_consents")), false);
+  assert.equal(pgClient.calls.some((call) => call.sql.includes("INSERT INTO")), false);
+});
+
+test("email all_with_email requires confirmation before campaign or SMTP", async () => {
+  const pgClient = emailPg([{ id: 1, name: "Ana", email: "ana@example.com" }]);
   let smtpCalls = 0;
   const result = await sendManualEmailNotification({
     pgClient,
     payload: {
       channel: "email",
-      template_key: "GENERIC_ADMIN_EMAIL",
-      audience: "all_consented",
-      confirm_bulk_send: true,
+      template_key: "EMAIL_DRAW_REMAINING_75",
+      audience: "all_with_email",
     },
     transporter: {
       async sendMail() {
         smtpCalls += 1;
-        throw new Error("should_not_send");
+        return { accepted: ["ana@example.com"] };
       },
     },
   });
-  assert.equal(result.error, "email_consent_not_available");
+  assert.equal(result.error, "manual_bulk_confirmation_required");
   assert.equal(smtpCalls, 0);
   assert.equal(pgClient.calls.some((call) => call.sql.includes("INSERT INTO")), false);
+});
+
+test("remaining-number email templates enforce their own number and render allowed params", async () => {
+  for (const remaining of [75, 50, 30, 15]) {
+    const preview = await buildManualNotificationPreview({
+      pgClient: emailPg([{ id: 1, name: "Ana", email: "ana@example.com" }]),
+      payload: {
+        channel: "email",
+        template_key: `EMAIL_DRAW_REMAINING_${remaining}`,
+        audience: "selected",
+        user_ids: [1],
+        subject: "Restam {{remaining_numbers}} em {{draw_name}}",
+        text: "Olá, {{name}}! Restam {{remaining_numbers}}. {{draw_url}}",
+        html: "<p>{{name}}: {{remaining_numbers}} - {{draw_url}}</p>",
+        params: {
+          name: "Ana",
+          draw_name: "Sorteio Especial",
+          draw_url: "https://newstorerj.com.br/sorteio",
+          remaining_numbers: 999,
+          ignored: "não usar",
+        },
+      },
+    });
+
+    assert.equal(preview.normalized.params.remaining_numbers, remaining);
+    assert.equal("ignored" in preview.normalized.params, false);
+    assert.match(preview.subject_preview, new RegExp(`Restam ${remaining} em Sorteio Especial`));
+    assert.match(preview.text_preview, new RegExp(`Restam ${remaining}`));
+    assert.match(preview.html_preview, new RegExp(`Ana: ${remaining}`));
+  }
+});
+
+test("remaining-number email rejects unsafe draw URLs", async () => {
+  for (const drawUrl of ["javascript:alert(1)", "data:text/html,oi", "http://example.com"] ) {
+    await assert.rejects(
+      buildManualNotificationPreview({
+        pgClient: emailPg([{ id: 1, name: "Ana", email: "ana@example.com" }]),
+        payload: {
+          channel: "email",
+          template_key: "EMAIL_DRAW_REMAINING_75",
+          audience: "selected",
+          user_ids: [1],
+          params: { draw_url: drawUrl },
+        },
+      }),
+      (error) => error?.code === "manual_email_url_invalid"
+    );
+  }
 });
 
 function dispatchPg() {
@@ -847,6 +970,108 @@ test("all_consented rejects campaigns above the 500 unique user safety limit", a
     }),
     (error) => error?.code === "manual_audience_too_large" && error?.max === 500
   );
+});
+
+test("email all_with_email rejects campaigns above the 500 unique email safety limit", async () => {
+  const users = Array.from({ length: 501 }, (_value, index) => ({
+    id: index + 1,
+    name: `User ${index + 1}`,
+    email: `user${index + 1}@example.com`,
+  }));
+  await assert.rejects(
+    buildManualNotificationPreview({
+      pgClient: emailPg(users),
+      payload: {
+        channel: "email",
+        audience: "all_with_email",
+        template_key: "EMAIL_DRAW_REMAINING_75",
+      },
+    }),
+    (error) => error?.code === "manual_audience_too_large" && error?.max === 500
+  );
+});
+
+test("manual email all_with_email processes 120 recipients in three batches and continues after failure", async () => {
+  const users = Array.from({ length: 120 }, (_value, index) => ({
+    id: index + 1,
+    name: `User ${index + 1}`,
+    email: `user${index + 1}@example.com`,
+  }));
+  const pgClient = emailPg(users);
+  const sentMessages = [];
+  const result = await sendManualEmailNotification({
+    pgClient,
+    adminUserId: 99,
+    payload: {
+      channel: "email",
+      audience: "all_with_email",
+      user_ids: [999],
+      template_key: "EMAIL_DRAW_REMAINING_50",
+      confirm_bulk_send: true,
+      params: { draw_name: "Sorteio Especial", draw_url: "/sorteio" },
+    },
+    transporter: {
+      async sendMail(message) {
+        sentMessages.push(message);
+        if (sentMessages.length === 51) throw new Error("individual_failure");
+        return { messageId: `smtp-${sentMessages.length}`, accepted: [message.to] };
+      },
+    },
+  });
+
+  assert.equal(result.requested_users, 120);
+  assert.equal(result.eligible_users, 120);
+  assert.equal(result.valid_emails, 120);
+  assert.equal(result.estimated_batches, 3);
+  assert.equal(result.batches_processed, 3);
+  assert.equal(result.sent, 119);
+  assert.equal(result.accepted, 119);
+  assert.equal(result.failed, 1);
+  assert.equal(sentMessages.length, 120);
+  assert.match(sentMessages[0].text, /Olá, User 1!/);
+  assert.match(sentMessages[0].text, /Restam 50 números/);
+  assert.equal(
+    pgClient.calls.filter((call) => call.sql.includes("INSERT INTO public.notification_campaigns")).length,
+    1
+  );
+  assert.equal(
+    pgClient.calls.filter((call) => call.sql.includes("INSERT INTO public.notification_dispatches")).length,
+    120
+  );
+  const history = JSON.stringify(pgClient.calls.map((call) => call.params));
+  assert.match(history, /admin_manual/);
+  assert.match(history, /MANUAL_ADMIN_EMAIL/);
+  assert.match(history, /all_with_email/);
+  assert.match(history, /batch_number/);
+  assert.match(history, /total_batches/);
+  assert.equal(history.includes("notification_event_ledger"), false);
+});
+
+test("manual email all_with_email sends once per normalized unique address", async () => {
+  const pgClient = emailPg([
+    { id: 1, name: "Ana", email: " Ana@Example.com " },
+    { id: 2, name: "Duplicada", email: "ana@example.com" },
+  ]);
+  const recipients = [];
+  const result = await sendManualEmailNotification({
+    pgClient,
+    payload: {
+      channel: "email",
+      audience: "all_with_email",
+      template_key: "EMAIL_DRAW_REMAINING_15",
+      confirm_bulk_send: true,
+    },
+    transporter: {
+      async sendMail(message) {
+        recipients.push(message.to);
+        return { messageId: "smtp-unique", accepted: [message.to] };
+      },
+    },
+  });
+
+  assert.deepEqual(recipients, ["ana@example.com"]);
+  assert.equal(result.duplicate_emails_removed, 1);
+  assert.equal(result.dispatches.length, 1);
 });
 
 test("manual email sends individually, dedupes duplicated email and uses no real smtp", async () => {

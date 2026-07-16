@@ -36,8 +36,6 @@ import { getPushVapidConfigStatus } from "./pushNotifications.js";
 import { getSmtpConfigStatus } from "./manualEmailNotifications.js";
 import { resolveManualBrevoWhatsAppTemplate } from "./manualWhatsAppTemplates.js";
 import {
-  EMAIL_ALL_CONSENTED_SUPPORTED,
-  EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
   MANUAL_BATCH_SIZE,
   MANUAL_MAX_CAMPAIGN_USERS,
   assertManualCampaignAudienceSize,
@@ -171,13 +169,7 @@ export async function getNotificationHealth() {
       email: {
         enabled: smtpConfig.configured,
         smtp_configured: smtpConfig.configured,
-        audiences: EMAIL_ALL_CONSENTED_SUPPORTED
-          ? ["selected", "all_consented"]
-          : ["selected"],
-        email_all_consented_supported: EMAIL_ALL_CONSENTED_SUPPORTED,
-        ...(!EMAIL_ALL_CONSENTED_SUPPORTED && {
-          reason: EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
-        }),
+        audiences: ["selected", "all_with_email"],
       },
     },
   };

@@ -53,6 +53,7 @@ function manualErrorStatus(code) {
   if (
     code === "unsupported_manual_channel" ||
     code === "manual_recipients_required" ||
+    code === "manual_email_url_invalid" ||
     code === "manual_too_many_recipients" ||
     code === "manual_audience_too_large" ||
     code === "manual_bulk_confirmation_required" ||

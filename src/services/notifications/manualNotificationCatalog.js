@@ -1,12 +1,35 @@
 import { query } from "../../db.js";
 import { getConnectedBrevoWhatsAppTemplates } from "./manualWhatsAppTemplates.js";
-import {
-  EMAIL_ALL_CONSENTED_SUPPORTED,
-  EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
-} from "./manualAudience.js";
+
+function builtinEmailTemplate(template) {
+  return {
+    channel: "email",
+    provider: "brevo_smtp",
+    source: "builtin",
+    editable: false,
+    manual_send_allowed: true,
+    ...template,
+  };
+}
+
+function remainingNumbersEmailTemplate(remainingNumbers) {
+  return builtinEmailTemplate({
+    template_key: `EMAIL_DRAW_REMAINING_${remainingNumbers}`,
+    name: `Restam ${remainingNumbers} números`,
+    description: `Aviso por e-mail para divulgar que ainda existem ${remainingNumbers} números disponíveis.`,
+    subject_template: `Restam ${remainingNumbers} números no sorteio {{draw_name}}`,
+    html_template: `<p>Olá, {{name}}!</p><p>Restam ${remainingNumbers} números disponíveis no sorteio {{draw_name}}.</p><p><a href="{{draw_url}}">Acesse o site para escolher seus números</a></p>`,
+    text_template: `Olá, {{name}}!\n\nRestam ${remainingNumbers} números disponíveis no sorteio {{draw_name}}.\n\nAcesse o site para escolher seus números:\n{{draw_url}}`,
+    default_params: {
+      remaining_numbers: remainingNumbers,
+      draw_name: "New Store",
+      draw_url: "/",
+    },
+  });
+}
 
 const EMAIL_BUILTIN_TEMPLATES = [
-  {
+  builtinEmailTemplate({
     template_key: "GENERIC_ADMIN_EMAIL",
     name: "E-mail administrativo",
     description: "Mensagem administrativa manual.",
@@ -14,10 +37,8 @@ const EMAIL_BUILTIN_TEMPLATES = [
     html_template: "<p>{{message}}</p>",
     text_template: "{{message}}",
     default_params: { message: "Digite a mensagem." },
-    source: "builtin",
-    editable: false,
-  },
-  {
+  }),
+  builtinEmailTemplate({
     template_key: "NEW_DRAW_EMAIL",
     name: "Novo sorteio",
     description: "Aviso manual sobre novo sorteio.",
@@ -25,10 +46,8 @@ const EMAIL_BUILTIN_TEMPLATES = [
     html_template: "<p>{{message}}</p><p><a href=\"{{draw_url}}\">Acessar sorteio</a></p>",
     text_template: "{{message}}\n{{draw_url}}",
     default_params: { message: "Tem sorteio novo disponivel.", draw_url: "/" },
-    source: "builtin",
-    editable: false,
-  },
-  {
+  }),
+  builtinEmailTemplate({
     template_key: "RESULT_AVAILABLE_EMAIL",
     name: "Resultado disponivel",
     description: "Aviso manual de resultado disponivel.",
@@ -36,10 +55,8 @@ const EMAIL_BUILTIN_TEMPLATES = [
     html_template: "<p>{{message}}</p>",
     text_template: "{{message}}",
     default_params: { message: "O resultado ja esta disponivel." },
-    source: "builtin",
-    editable: false,
-  },
-  {
+  }),
+  builtinEmailTemplate({
     template_key: "BALANCE_NOTICE_EMAIL",
     name: "Aviso de saldo",
     description: "Aviso manual relacionado a saldo.",
@@ -47,10 +64,18 @@ const EMAIL_BUILTIN_TEMPLATES = [
     html_template: "<p>{{message}}</p>",
     text_template: "{{message}}",
     default_params: { message: "Voce tem um aviso sobre seu saldo." },
-    source: "builtin",
-    editable: false,
-  },
+  }),
+  remainingNumbersEmailTemplate(75),
+  remainingNumbersEmailTemplate(50),
+  remainingNumbersEmailTemplate(30),
+  remainingNumbersEmailTemplate(15),
 ];
+const REQUIRED_REMAINING_EMAIL_KEYS = new Set([
+  "EMAIL_DRAW_REMAINING_75",
+  "EMAIL_DRAW_REMAINING_50",
+  "EMAIL_DRAW_REMAINING_30",
+  "EMAIL_DRAW_REMAINING_15",
+]);
 
 function runQuery(pgClient, text, params) {
   if (pgClient) return pgClient.query(text, params);
@@ -186,9 +211,16 @@ export async function getManualNotificationCatalog({ pgClient } = {}) {
       editable: true,
     }));
   }
-  if (!emailTemplates.length) {
-    emailTemplates = EMAIL_BUILTIN_TEMPLATES;
-  }
+  emailTemplates = emailTemplates.filter(
+    (template) => !REQUIRED_REMAINING_EMAIL_KEYS.has(template.template_key)
+  );
+  const databaseEmailKeys = new Set(emailTemplates.map((template) => template.template_key));
+  emailTemplates = [
+    ...emailTemplates,
+    ...EMAIL_BUILTIN_TEMPLATES.filter(
+      (template) => !databaseEmailKeys.has(template.template_key)
+    ),
+  ];
 
   return {
     ok: true,
@@ -212,13 +244,7 @@ export async function getManualNotificationCatalog({ pgClient } = {}) {
       email: {
         enabled: Boolean(String(process.env.SMTP_HOST || "").trim()),
         provider: "brevo_smtp",
-        audiences: EMAIL_ALL_CONSENTED_SUPPORTED
-          ? ["selected", "all_consented"]
-          : ["selected"],
-        email_all_consented_supported: EMAIL_ALL_CONSENTED_SUPPORTED,
-        ...(!EMAIL_ALL_CONSENTED_SUPPORTED && {
-          reason: EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
-        }),
+        audiences: ["selected", "all_with_email"],
         templates: emailTemplates,
       },
     },

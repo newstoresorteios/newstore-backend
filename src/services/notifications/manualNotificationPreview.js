@@ -4,8 +4,6 @@ import { getWhatsappConsentStatusForUser } from "./communicationConsent.js";
 import { getBuiltinEmailTemplates } from "./manualNotificationCatalog.js";
 import { resolveManualBrevoWhatsAppTemplate } from "./manualWhatsAppTemplates.js";
 import {
-  EMAIL_ALL_CONSENTED_SUPPORTED,
-  EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
   MANUAL_MAX_CAMPAIGN_USERS,
   assertManualCampaignAudienceSize,
   estimatedManualBatches,
@@ -13,7 +11,19 @@ import {
 
 export const MANUAL_MAX_UNIQUE_USERS = 50;
 const CHANNELS = new Set(["whatsapp", "push", "email"]);
-const AUDIENCES = new Set(["selected", "all_active_push", "all_consented"]);
+const AUDIENCES = new Set(["selected", "all_active_push", "all_consented", "all_with_email"]);
+const FIXED_REMAINING_NUMBERS = new Map([
+  ["EMAIL_DRAW_REMAINING_75", 75],
+  ["EMAIL_DRAW_REMAINING_50", 50],
+  ["EMAIL_DRAW_REMAINING_30", 30],
+  ["EMAIL_DRAW_REMAINING_15", 15],
+]);
+const REMAINING_EMAIL_PARAM_KEYS = new Set([
+  "name",
+  "draw_name",
+  "draw_url",
+  "remaining_numbers",
+]);
 
 function runQuery(pgClient, text, params) {
   if (pgClient) return pgClient.query(text, params);
@@ -51,6 +61,32 @@ function normalizeUrl(url) {
   return clean.slice(0, 500);
 }
 
+function normalizeEmailDrawUrl(url) {
+  const clean = String(url || "/").trim() || "/";
+  const relative = clean.startsWith("/") && !clean.startsWith("//");
+  const secureAbsolute = clean.startsWith("https://");
+  if (!relative && !secureAbsolute) {
+    const error = new Error("manual_email_url_invalid");
+    error.code = "manual_email_url_invalid";
+    throw error;
+  }
+  return clean.slice(0, 1000);
+}
+
+function normalizeParams(channel, templateKey, value) {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const fixedRemaining = FIXED_REMAINING_NUMBERS.get(templateKey);
+  if (channel !== "email" || fixedRemaining == null) return raw;
+
+  const params = {};
+  for (const key of REMAINING_EMAIL_PARAM_KEYS) {
+    if (raw[key] != null) params[key] = raw[key];
+  }
+  params.remaining_numbers = fixedRemaining;
+  params.draw_url = normalizeEmailDrawUrl(params.draw_url || "/");
+  return params;
+}
+
 function normalizeManualInput(payload = {}) {
   const channel = String(payload.channel || "").trim().toLowerCase();
   const audience = String(payload.audience || "selected").trim().toLowerCase();
@@ -64,7 +100,7 @@ function normalizeManualInput(payload = {}) {
     error.code = "manual_recipients_required";
     throw error;
   }
-  if (channel === "email" && !["selected", "all_consented"].includes(audience)) {
+  if (channel === "email" && !["selected", "all_with_email"].includes(audience)) {
     const error = new Error("manual_recipients_required");
     error.code = "manual_recipients_required";
     throw error;
@@ -75,13 +111,14 @@ function normalizeManualInput(payload = {}) {
     throw error;
   }
 
-  const userIds = uniquePositiveIds(payload.user_ids || []);
+  let userIds = uniquePositiveIds(payload.user_ids || []);
+  if (channel === "email" && audience === "all_with_email") userIds = [];
   if (audience === "selected" && !userIds.length) {
     const error = new Error("manual_recipients_required");
     error.code = "manual_recipients_required";
     throw error;
   }
-  if (userIds.length > MANUAL_MAX_UNIQUE_USERS) {
+  if (audience === "selected" && userIds.length > MANUAL_MAX_UNIQUE_USERS) {
     const error = new Error("manual_too_many_recipients");
     error.code = "manual_too_many_recipients";
     error.max = MANUAL_MAX_UNIQUE_USERS;
@@ -100,9 +137,7 @@ function normalizeManualInput(payload = {}) {
     html: payload.html == null ? null : String(payload.html),
     text: payload.text == null ? null : String(payload.text),
     url: normalizeUrl(payload.url || "/"),
-    params: payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)
-      ? payload.params
-      : {},
+    params: normalizeParams(channel, String(payload.template_key || "").trim(), payload.params),
   };
 }
 
@@ -128,6 +163,39 @@ async function loadAllUsers(pgClient) {
     []
   );
   return result.rows || [];
+}
+
+export function resolveManualEmailRecipients(users) {
+  const seen = new Set();
+  const recipients = [];
+  let missingContact = 0;
+  let invalidEmails = 0;
+  let duplicateEmailsRemoved = 0;
+
+  for (const user of Array.isArray(users) ? users : []) {
+    const email = String(user?.email || "").trim().toLowerCase();
+    if (!email) {
+      missingContact += 1;
+      continue;
+    }
+    if (!isValidEmail(email)) {
+      invalidEmails += 1;
+      continue;
+    }
+    if (seen.has(email)) {
+      duplicateEmailsRemoved += 1;
+      continue;
+    }
+    seen.add(email);
+    recipients.push({ ...user, email });
+  }
+
+  return {
+    recipients,
+    missingContact,
+    invalidEmails,
+    duplicateEmailsRemoved,
+  };
 }
 
 async function loadPushSubscriptions(pgClient, { audience, userIds }) {
@@ -205,6 +273,10 @@ async function resolveTemplate(pgClient, normalized) {
     return result.rows?.[0] || null;
   }
   if (normalized.channel === "email") {
+    const builtin = getBuiltinEmailTemplates().find(
+      (item) => item.template_key === normalized.templateKey
+    );
+    if (FIXED_REMAINING_NUMBERS.has(normalized.templateKey)) return builtin || null;
     const result = await runQuery(
       pgClient,
       `SELECT *
@@ -217,7 +289,7 @@ async function resolveTemplate(pgClient, normalized) {
       if (error?.code === "42P01" || error?.code === "42703") return { rows: [] };
       throw error;
     });
-    return result.rows?.[0] || getBuiltinEmailTemplates().find((item) => item.template_key === normalized.templateKey) || null;
+    return result.rows?.[0] || builtin || null;
   }
   return resolveManualBrevoWhatsAppTemplate({
     pgClient,
@@ -225,8 +297,30 @@ async function resolveTemplate(pgClient, normalized) {
   });
 }
 
+export function renderManualEmailContent(normalized, template, extraParams = {}) {
+  const params = {
+    ...(template?.default_params || {}),
+    ...(normalized.params || {}),
+    ...extraParams,
+  };
+  return {
+    subject: renderTemplate(
+      normalized.subject || template?.subject_template || template?.name || "Mensagem da New Store",
+      params
+    ),
+    text: renderTemplate(
+      normalized.text || template?.text_template || template?.default_message || normalized.message || "",
+      params
+    ),
+    html: renderTemplate(
+      normalized.html || template?.html_template || template?.default_message || normalized.message || "",
+      params
+    ),
+  };
+}
+
 function buildPreviewText(normalized, template) {
-  const params = normalized.params || {};
+  const params = { ...(template?.default_params || {}), ...(normalized.params || {}) };
   if (normalized.channel === "push") {
     const title = normalized.title || renderTemplate(template?.title_template || template?.name || "", params);
     const message = normalized.message || renderTemplate(template?.body_template || template?.description || "", params);
@@ -239,9 +333,7 @@ function buildPreviewText(normalized, template) {
     };
   }
   if (normalized.channel === "email") {
-    const subject = normalized.subject || renderTemplate(template?.subject_template || template?.name || "Mensagem da New Store", params);
-    const text = normalized.text || renderTemplate(template?.text_template || template?.default_message || normalized.message || "", params);
-    const html = normalized.html || renderTemplate(template?.html_template || template?.default_message || normalized.message || "", params);
+    const { subject, text, html } = renderManualEmailContent(normalized, template);
     return {
       title_preview: null,
       message_preview: normalized.message || null,
@@ -271,6 +363,8 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
   if (normalized.audience === "selected") {
     users = await loadSelectedUsers(pgClient, normalized.userIds);
   } else if (normalized.channel === "whatsapp" && normalized.audience === "all_consented") {
+    users = await loadAllUsers(pgClient);
+  } else if (normalized.channel === "email" && normalized.audience === "all_with_email") {
     users = await loadAllUsers(pgClient);
   }
 
@@ -326,22 +420,26 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
   }
 
   let validEmails = 0;
-  if (normalized.channel === "email" && normalized.audience === "selected") {
-    const seen = new Set();
-    for (const user of users) {
-      const email = String(user.email || "").trim().toLowerCase();
-      if (!email || !isValidEmail(email)) {
-        missingContact += 1;
-        continue;
-      }
-      if (seen.has(email)) continue;
-      seen.add(email);
-      validEmails += 1;
-      eligibleUserIds.push(Number(user.id));
+  let invalidEmails = 0;
+  let duplicateEmailsRemoved = 0;
+  if (normalized.channel === "email") {
+    const emailAudience = resolveManualEmailRecipients(users);
+    validEmails = emailAudience.recipients.length;
+    missingContact = emailAudience.missingContact;
+    invalidEmails = emailAudience.invalidEmails;
+    duplicateEmailsRemoved = emailAudience.duplicateEmailsRemoved;
+    eligibleUserIds = emailAudience.recipients.map((user) => Number(user.id));
+    if (normalized.audience === "all_with_email") {
+      assertManualCampaignAudienceSize(validEmails);
     }
   }
 
   const template = await resolveTemplate(pgClient, normalized);
+  if (normalized.templateKey && !template) {
+    const error = new Error("manual_template_not_found");
+    error.code = "manual_template_not_found";
+    throw error;
+  }
   const text = buildPreviewText(normalized, template);
   const eligibleUsers = normalized.channel === "push"
     ? new Set(subscriptions.map((row) => Number(row.user_id))).size
@@ -351,14 +449,11 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
   const requiresBulkConfirmation =
     normalized.audience === "all_active_push" ||
     normalized.audience === "all_consented" ||
+    normalized.audience === "all_with_email" ||
     eligibleUsers > 1;
-  const emailAllConsentedUnavailable =
-    normalized.channel === "email" &&
-    normalized.audience === "all_consented" &&
-    !EMAIL_ALL_CONSENTED_SUPPORTED;
   const requestedUsers = normalized.audience === "selected"
     ? normalized.userIds.length
-    : normalized.channel === "whatsapp"
+    : normalized.channel === "whatsapp" || normalized.channel === "email"
       ? users.length
       : eligibleUsers;
 
@@ -366,7 +461,7 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
 
   return {
     ok: true,
-    can_send: !emailAllConsentedUnavailable && eligibleUsers > 0 &&
+    can_send: eligibleUsers > 0 &&
       (normalized.channel !== "push" || Boolean(text.title_preview && text.message_preview)),
     channel: normalized.channel,
     provider: normalized.channel === "push" ? "web_push" : normalized.channel === "email" ? "brevo_smtp" : "brevo",
@@ -376,6 +471,8 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
     eligible_users: eligibleUsers,
     eligible_devices: subscriptions.length,
     valid_emails: validEmails,
+    invalid_emails: invalidEmails,
+    duplicate_emails_removed: duplicateEmailsRemoved,
     valid_phones: validPhones,
     blocked_by_consent: blockedByConsent,
     missing_contact: missingContact,
@@ -383,10 +480,6 @@ export async function buildManualNotificationPreview({ pgClient, payload = {} } 
     estimated_batches: estimatedManualBatches(eligibleUsers),
     warnings,
     requires_bulk_confirmation: requiresBulkConfirmation,
-    email_all_consented_supported: EMAIL_ALL_CONSENTED_SUPPORTED,
-    ...(emailAllConsentedUnavailable && {
-      reason: EMAIL_ALL_CONSENTED_UNAVAILABLE_REASON,
-    }),
     manual_audience_max_users: MANUAL_MAX_CAMPAIGN_USERS,
     normalized,
   };
