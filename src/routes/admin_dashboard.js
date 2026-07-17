@@ -416,14 +416,23 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
   let transactionOpen = false;
   try {
     log("POST /new");
-    const numberCount = Number(req.body?.number_count ?? 100);
-    if (!Number.isInteger(numberCount) || numberCount <= 0 || numberCount > 10000) {
-      return res.status(400).json({ error: "invalid_number_count" });
+    const body = req.body || {};
+    const normalizedConfig = normalizePrincipalConfigPayload(body);
+    const numberCount = Number(body.number_count);
+    if (
+      normalizedConfig.error ||
+      !normalizedConfig.value?.banner_title ||
+      body.number_count === undefined ||
+      !Number.isInteger(numberCount) ||
+      numberCount <= 0 ||
+      numberCount > 10000
+    ) {
+      return res.status(422).json({
+        error: "principal_draw_config_required",
+        message: "Informe o valor, a frase promocional e o limite do novo sorteio.",
+      });
     }
-    const ticketPriceCents = Number(req.body?.ticket_price_cents);
-    if (!Number.isInteger(ticketPriceCents) || ticketPriceCents <= 0) {
-      return res.status(400).json({ error: "invalid_ticket_price" });
-    }
+    const config = normalizedConfig.value;
     const pool = await getPool();
     client = await pool.connect();
     await client.query("BEGIN");
@@ -459,7 +468,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
       });
     }
 
-    const principalTicketPriceCents = await setTicketPriceCents(ticketPriceCents);
+    const principalTicketPriceCents = config.ticket_price_cents;
 
     // cria draw novo
     const ins = await client.query(
@@ -470,6 +479,29 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     const newId = ins.rows[0].id;
     log("novo draw id =", newId);
 
+    await client.query(
+      `INSERT INTO public.app_config (key, value, updated_at)
+       SELECT entry.key, entry.value, NOW()
+         FROM unnest($1::text[], $2::text[]) AS entry(key, value)
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value,
+             updated_at = NOW()`,
+      [
+        ["ticket_price_cents", "banner_title", "max_numbers_per_selection"],
+        [String(config.ticket_price_cents), config.banner_title, String(config.max_numbers_per_selection)],
+      ]
+    );
+    await client.query(
+      `INSERT INTO public.app_config_new AS cfg
+         (id, banner_title, ticket_price_cents, max_numbers_per_selection)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (id) DO UPDATE
+         SET banner_title = EXCLUDED.banner_title,
+             ticket_price_cents = EXCLUDED.ticket_price_cents,
+             max_numbers_per_selection = EXCLUDED.max_numbers_per_selection`,
+      [String(newId), config.banner_title, config.ticket_price_cents, config.max_numbers_per_selection]
+    );
+
     // popula numeros do sorteio principal
     await client.query(
       `insert into numbers(draw_id, n, status, reservation_id)
@@ -477,6 +509,34 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
          from generate_series(0, $2::int - 1) as gs`,
       [newId, numberCount]
     );
+
+    const [globalResult, individualResult] = await Promise.all([
+      client.query(
+        `SELECT key, value
+           FROM public.app_config
+          WHERE key = ANY($1::text[])`,
+        [["ticket_price_cents", "banner_title", "max_numbers_per_selection"]]
+      ),
+      client.query(
+        `SELECT banner_title, ticket_price_cents, max_numbers_per_selection
+           FROM public.app_config_new
+          WHERE id = $1
+          LIMIT 1`,
+        [String(newId)]
+      ),
+    ]);
+    const persisted = normalizePersistedPrincipalConfig(
+      globalResult.rows,
+      individualResult.rows?.[0]
+    );
+    if (
+      !samePrincipalConfig(persisted.global, config) ||
+      !samePrincipalConfig(persisted.draw, config)
+    ) {
+      const error = new Error("draw_config_sync_failed");
+      error.code = "draw_config_sync_failed";
+      throw error;
+    }
 
     await client.query("COMMIT");
     transactionOpen = false;
@@ -525,12 +585,25 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
       remaining: numberCount,
       captive_preauth: captivePreauth,
       autopay,
+      draw: {
+        id: Number(newId),
+        status: "open",
+        draw_type: "principal",
+      },
+      config,
+      sync: { global: true, draw: true },
     });
   } catch (e) {
     if (transactionOpen && client) {
       try { await client.query("ROLLBACK"); } catch {}
     }
     console.error("[admin/dashboard] /new error:", e);
+    if (e?.code === "draw_config_sync_failed") {
+      return res.status(500).json({
+        error: "draw_config_sync_failed",
+        message: "Não foi possível salvar a configuração do novo sorteio.",
+      });
+    }
     return res.status(500).json({ error: "new_draw_failed" });
   } finally {
     if (client) client.release();
