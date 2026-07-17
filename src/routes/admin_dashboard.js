@@ -408,10 +408,12 @@ router.patch(
 
 /**
  * POST /api/admin/dashboard/new
- * Fecha sorteios principais 'open', cria um novo principal e popula os numeros.
+ * Cria um novo principal somente quando nenhum principal esta aberto e popula os numeros.
  * e DISPARA o Autopay oficial (services/autopayRunner.js).
  */
 router.post("/new", requireAuth, requireAdmin, async (req, res) => {
+  let client;
+  let transactionOpen = false;
   try {
     log("POST /new");
     const numberCount = Number(req.body?.number_count ?? 100);
@@ -422,18 +424,45 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     if (!Number.isInteger(ticketPriceCents) || ticketPriceCents <= 0) {
       return res.status(400).json({ error: "invalid_ticket_price" });
     }
-    const principalTicketPriceCents = await setTicketPriceCents(ticketPriceCents);
-
-    // fecha os abertos anteriores
-    await query(
-      `update draws
-          set status = 'closed', closed_at = now()
-        where status = 'open'
-          and COALESCE(draw_type, 'principal') = 'principal'`
+    const pool = await getPool();
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('newstore_principal_creation'))`
     );
 
+    const currentPrincipalResult = await client.query(
+      `SELECT id, status, draw_type, opened_at
+         FROM public.draws
+        WHERE status = 'open'
+          AND COALESCE(draw_type, 'principal') = 'principal'
+        ORDER BY id DESC
+        LIMIT 1`
+    );
+    const currentPrincipal = currentPrincipalResult.rows?.[0] || null;
+    if (currentPrincipal) {
+      await client.query("ROLLBACK");
+      transactionOpen = false;
+      console.warn("[admin-dashboard] principal_creation_blocked", {
+        current_draw_id: Number(currentPrincipal.id),
+        current_status: currentPrincipal.status,
+        admin_user_id: req.user?.id ?? null,
+      });
+      return res.status(409).json({
+        error: "principal_draw_already_open",
+        message: "Já existe um sorteio principal em andamento. Ele não foi alterado.",
+        current_draw: {
+          id: Number(currentPrincipal.id),
+          status: currentPrincipal.status,
+        },
+      });
+    }
+
+    const principalTicketPriceCents = await setTicketPriceCents(ticketPriceCents);
+
     // cria draw novo
-    const ins = await query(
+    const ins = await client.query(
       `insert into draws(status, draw_type, opened_at, autopay_ran_at)
        values('open', 'principal', now(), null)
        returning id`
@@ -442,12 +471,15 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     log("novo draw id =", newId);
 
     // popula numeros do sorteio principal
-    await query(
+    await client.query(
       `insert into numbers(draw_id, n, status, reservation_id)
        select $1, gs::int, 'available', null
          from generate_series(0, $2::int - 1) as gs`,
       [newId, numberCount]
     );
+
+    await client.query("COMMIT");
+    transactionOpen = false;
 
     // dispara o AUTOPAY oficial — gera logs [autopayRunner]
     const captivePreauth = await createCaptivePreauthIfEnabled(
@@ -495,8 +527,13 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
       autopay,
     });
   } catch (e) {
+    if (transactionOpen && client) {
+      try { await client.query("ROLLBACK"); } catch {}
+    }
     console.error("[admin/dashboard] /new error:", e);
     return res.status(500).json({ error: "new_draw_failed" });
+  } finally {
+    if (client) client.release();
   }
 });
 
