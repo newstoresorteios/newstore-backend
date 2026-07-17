@@ -4,6 +4,13 @@ import { getPool, query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
 import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
+import {
+  assertCanOpenAdditionalDraw,
+  getOpenDrawLimitResponse,
+  isDrawTypeConstraintViolation,
+  isOneOpenPerTypeConstraint,
+  lockOpenDrawSlots,
+} from "../services/openDrawLimits.js";
 
 const router = Router();
 const VALID_STATUSES = new Set(["draft", "open", "closed", "cancelled"]);
@@ -173,6 +180,7 @@ router.patch("/:id", async (req, res) => {
 
   const updates = [];
   const params = [];
+  let requestedStatus;
   const addUpdate = (column, value) => {
     params.push(value);
     updates.push(`${column} = $${params.length}`);
@@ -205,10 +213,10 @@ router.patch("/:id", async (req, res) => {
   }
 
   if (req.body?.status !== undefined) {
-    const status = String(req.body.status).trim();
-    if (!VALID_STATUSES.has(status)) return res.status(400).json({ error: "invalid_status" });
-    addUpdate("status", status);
-    if (status === "open") updates.push("opened_at = COALESCE(opened_at, NOW())");
+    requestedStatus = String(req.body.status).trim();
+    if (!VALID_STATUSES.has(requestedStatus)) return res.status(400).json({ error: "invalid_status" });
+    addUpdate("status", requestedStatus);
+    if (requestedStatus === "closed") updates.push("closed_at = COALESCE(closed_at, NOW())");
   }
 
   const configValues = {
@@ -223,11 +231,38 @@ router.patch("/:id", async (req, res) => {
 
   if (!updates.length && !hasConfigUpdate) return res.status(400).json({ error: "no_fields_to_update" });
 
+  const pool = await getPool();
+  const client = await pool.connect();
   try {
+    await client.query("BEGIN");
+
+    if (requestedStatus === "open") {
+      await lockOpenDrawSlots(client);
+    }
+
+    const current = await client.query(
+      `SELECT id, status, product_name
+         FROM draws
+        WHERE id = $1
+          AND draw_type IN ('adicional', 'secundario')
+        FOR UPDATE`,
+      [drawId]
+    );
+    if (!current.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "draw_not_found" });
+    }
+    const previousStatus = current.rows[0].status;
+
+    if (previousStatus !== "open" && requestedStatus === "open") {
+      await assertCanOpenAdditionalDraw(client);
+      updates.push("opened_at = COALESCE(opened_at, NOW())");
+    }
+
     let updated;
     if (updates.length) {
       params.push(drawId);
-      updated = await query(
+      updated = await client.query(
         `UPDATE draws
             SET ${updates.join(", ")}
           WHERE id = $${params.length}
@@ -237,7 +272,7 @@ router.patch("/:id", async (req, res) => {
         params
       );
     } else {
-      updated = await query(
+      updated = await client.query(
         `SELECT id, status, draw_type, product_name, product_link, opened_at,
                 closed_at, realized_at, winner_user_id, winner_name, winner_number
            FROM draws
@@ -247,15 +282,26 @@ router.patch("/:id", async (req, res) => {
       );
     }
 
-    if (!updated.rowCount) return res.status(404).json({ error: "draw_not_found" });
     if (hasConfigUpdate) {
-      await upsertConfig({ query }, drawId, configValues, updated.rows[0]?.product_name || productName);
+      await upsertConfig(client, drawId, configValues, updated.rows[0]?.product_name || current.rows[0].product_name);
     }
+    await client.query("COMMIT");
     return res.json({ draw: await drawResponse(updated.rows[0]) });
   } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("[admin_secondary_draws/update] error:", e?.code || e?.message || e);
+    const limitResponse = getOpenDrawLimitResponse(e);
+    if (limitResponse) return res.status(409).json(limitResponse);
+    if (isOneOpenPerTypeConstraint(e)) {
+      return res.status(409).json({
+        error: "additional_draw_database_limit",
+        message: "O banco ainda está configurado para permitir apenas um sorteio aberto por tipo.",
+      });
+    }
     if (e?.status === 400) return res.status(400).json({ error: e.message });
     return res.status(500).json({ error: "secondary_draw_update_failed" });
+  } finally {
+    client.release();
   }
 });
 
@@ -270,6 +316,11 @@ router.post("/", async (req, res) => {
 
   try {
     await client.query("BEGIN");
+
+    if (status === "open") {
+      await lockOpenDrawSlots(client);
+      await assertCanOpenAdditionalDraw(client);
+    }
 
     const productName = toOptionalString(
       req.body?.product_name ?? req.body?.promo_phrase ?? req.body?.banner_title ?? "Sorteio Adicional",
@@ -303,8 +354,18 @@ router.post("/", async (req, res) => {
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[admin_secondary_draws/create] error:", e?.code || e?.message || e);
-    if (e?.code === "23514") {
+    const limitResponse = getOpenDrawLimitResponse(e);
+    if (limitResponse) {
+      return res.status(409).json(limitResponse);
+    }
+    if (isDrawTypeConstraintViolation(e)) {
       return res.status(409).json({ error: "draw_type_adicional_not_allowed" });
+    }
+    if (isOneOpenPerTypeConstraint(e)) {
+      return res.status(409).json({
+        error: "additional_draw_database_limit",
+        message: "O banco ainda está configurado para permitir apenas um sorteio aberto por tipo.",
+      });
     }
     return res.status(500).json({ error: "secondary_draw_create_failed" });
   } finally {

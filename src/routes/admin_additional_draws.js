@@ -5,6 +5,13 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
 import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
 import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
+import {
+  assertCanOpenAdditionalDraw,
+  getOpenDrawLimitResponse,
+  isDrawTypeConstraintViolation,
+  isOneOpenPerTypeConstraint,
+  lockOpenDrawSlots,
+} from "../services/openDrawLimits.js";
 import { formatAdditionalDraw, loadDrawConfigs } from "./additional_draws.js";
 
 const router = Router();
@@ -294,14 +301,8 @@ router.post("/", async (req, res) => {
     await client.query("BEGIN");
 
     if (status === "open") {
-      await client.query(
-        `UPDATE public.draws
-            SET status = 'closed',
-                closed_at = COALESCE(closed_at, NOW())
-          WHERE status = 'open'
-            AND draw_type = $1`,
-        [drawType]
-      );
+      await lockOpenDrawSlots(client);
+      await assertCanOpenAdditionalDraw(client);
     }
 
     const inserted = await client.query(
@@ -341,8 +342,18 @@ router.post("/", async (req, res) => {
       table: e?.table,
       detail: e?.detail,
     });
-    if (e?.code === "23514") {
+    const limitResponse = getOpenDrawLimitResponse(e);
+    if (limitResponse) {
+      return res.status(409).json(limitResponse);
+    }
+    if (isDrawTypeConstraintViolation(e)) {
       return res.status(409).json({ error: "draw_type_adicional_not_allowed" });
+    }
+    if (isOneOpenPerTypeConstraint(e)) {
+      return res.status(409).json({
+        error: "additional_draw_database_limit",
+        message: "O banco ainda está configurado para permitir apenas um sorteio aberto por tipo.",
+      });
     }
     if (e?.code === "23505") {
       return res.status(409).json({ error: "additional_draw_duplicate" });
@@ -361,6 +372,7 @@ router.patch("/:id", async (req, res) => {
 
   const updates = [];
   const params = [];
+  let requestedStatus;
   const addUpdate = (column, value) => {
     params.push(value);
     updates.push(`${column} = $${params.length}`);
@@ -393,10 +405,10 @@ router.patch("/:id", async (req, res) => {
   }
 
   if (req.body?.status !== undefined) {
-    const status = String(req.body.status).trim();
-    if (!VALID_STATUSES.has(status)) return res.status(400).json({ error: "invalid_status" });
-    addUpdate("status", status);
-    if (status === "open") updates.push("opened_at = COALESCE(opened_at, NOW())");
+    requestedStatus = String(req.body.status).trim();
+    if (!VALID_STATUSES.has(requestedStatus)) return res.status(400).json({ error: "invalid_status" });
+    addUpdate("status", requestedStatus);
+    if (requestedStatus === "closed") updates.push("closed_at = COALESCE(closed_at, NOW())");
   }
 
   const configValues = {
@@ -409,6 +421,10 @@ router.patch("/:id", async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    if (requestedStatus === "open") {
+      await lockOpenDrawSlots(client);
+    }
 
     const current = await client.query(
       `SELECT id, status, product_name
@@ -423,6 +439,11 @@ router.patch("/:id", async (req, res) => {
       return res.status(404).json({ error: "draw_not_found" });
     }
     const previousStatus = current.rows[0].status;
+
+    if (previousStatus !== "open" && requestedStatus === "open") {
+      await assertCanOpenAdditionalDraw(client);
+      updates.push("opened_at = COALESCE(opened_at, NOW())");
+    }
 
     let updatedRow;
     if (updates.length) {
@@ -462,6 +483,14 @@ router.patch("/:id", async (req, res) => {
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[admin_additional_draws/update] error:", e?.code || e?.message || e);
+    const limitResponse = getOpenDrawLimitResponse(e);
+    if (limitResponse) return res.status(409).json(limitResponse);
+    if (isOneOpenPerTypeConstraint(e)) {
+      return res.status(409).json({
+        error: "additional_draw_database_limit",
+        message: "O banco ainda está configurado para permitir apenas um sorteio aberto por tipo.",
+      });
+    }
     if (e?.status === 400) return res.status(400).json({ error: e.message });
     return res.status(500).json({ error: "additional_draw_update_failed" });
   } finally {
