@@ -41,19 +41,6 @@ export async function assertCanOpenAdditionalDraw(client) {
       "Existe mais de um sorteio principal em andamento."
     );
   }
-  if (counts.additional >= 2) {
-    throw createLimitError(
-      "additional_draw_limit_reached",
-      "Já existem dois sorteios adicionais em andamento."
-    );
-  }
-  if (counts.total >= 3) {
-    throw createLimitError(
-      "open_draw_limit_reached",
-      "O limite de três sorteios em andamento foi atingido."
-    );
-  }
-
   return counts;
 }
 
