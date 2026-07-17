@@ -1,6 +1,6 @@
 // backend/src/routes/admin_dashboard.js
 import { Router } from "express";
-import { query } from "../db.js";
+import { getPool, query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents, setTicketPriceCents } from "../services/config.js";
 import { runAutopayForDraw } from "../services/autopayRunner.js";
@@ -15,6 +15,231 @@ const router = Router();
 
 function log(...a) {
   console.log("[admin/dashboard]", ...a);
+}
+
+function normalizePrincipalConfigPayload(body = {}) {
+  if (
+    body.ticket_price_cents === undefined ||
+    body.banner_title === undefined ||
+    body.max_numbers_per_selection === undefined
+  ) {
+    return { error: "principal_config_fields_required" };
+  }
+
+  const ticketPriceCents = Number(body.ticket_price_cents);
+  if (!Number.isInteger(ticketPriceCents) || ticketPriceCents <= 0) {
+    return { error: "invalid_ticket_price_cents" };
+  }
+  if (typeof body.banner_title !== "string") {
+    return { error: "invalid_banner_title" };
+  }
+  const bannerTitle = body.banner_title.trim();
+  if (bannerTitle.length > 255) {
+    return { error: "invalid_banner_title" };
+  }
+  const maxNumbersPerSelection = Number(body.max_numbers_per_selection);
+  if (!Number.isInteger(maxNumbersPerSelection) || maxNumbersPerSelection <= 0) {
+    return { error: "invalid_max_numbers_per_selection" };
+  }
+  return {
+    value: {
+      ticket_price_cents: ticketPriceCents,
+      banner_title: bannerTitle,
+      max_numbers_per_selection: maxNumbersPerSelection,
+    },
+  };
+}
+
+function normalizePersistedPrincipalConfig(globalRows, drawRow) {
+  const global = new Map((globalRows || []).map((row) => [String(row.key), row.value]));
+  return {
+    global: {
+      ticket_price_cents: Number(global.get("ticket_price_cents")),
+      banner_title: String(global.get("banner_title") ?? "").trim(),
+      max_numbers_per_selection: Number(global.get("max_numbers_per_selection")),
+    },
+    draw: {
+      ticket_price_cents: Number(drawRow?.ticket_price_cents),
+      banner_title: String(drawRow?.banner_title ?? "").trim(),
+      max_numbers_per_selection: Number(drawRow?.max_numbers_per_selection),
+    },
+  };
+}
+
+function samePrincipalConfig(left, right) {
+  return (
+    left.ticket_price_cents === right.ticket_price_cents &&
+    left.banner_title === right.banner_title &&
+    left.max_numbers_per_selection === right.max_numbers_per_selection
+  );
+}
+
+export function createPrincipalDrawConfigHandler(options = {}) {
+  const getPoolFn = options.getPoolFn || getPool;
+  return async function savePrincipalDrawConfig(req, res) {
+    const drawId = Number(req.params.drawId);
+    if (!Number.isInteger(drawId) || drawId <= 0) {
+      return res.status(400).json({ error: "invalid_draw_id" });
+    }
+    const normalized = normalizePrincipalConfigPayload(req.body || {});
+    if (normalized.error) return res.status(400).json({ error: normalized.error });
+
+    const fields = ["ticket_price_cents", "banner_title", "max_numbers_per_selection"];
+    console.log("[admin-draw-config] update_started", { draw_id: drawId, fields });
+
+    let client;
+    let transactionOpen = false;
+    try {
+      const pool = await getPoolFn();
+      client = await pool.connect();
+      await client.query("BEGIN");
+      transactionOpen = true;
+
+      const drawResult = await client.query(
+        `SELECT id, status, draw_type
+           FROM public.draws
+          WHERE id = $1
+          FOR UPDATE`,
+        [drawId]
+      );
+      const draw = drawResult.rows?.[0] || null;
+      if (!draw) {
+        await client.query("ROLLBACK");
+        transactionOpen = false;
+        console.warn("[admin-draw-config] update_rolled_back", { draw_id: drawId, reason: "draw_not_found" });
+        return res.status(404).json({ error: "draw_not_found" });
+      }
+      if (String(draw.draw_type || "principal").trim().toLowerCase() !== "principal") {
+        await client.query("ROLLBACK");
+        transactionOpen = false;
+        console.warn("[admin-draw-config] update_rolled_back", { draw_id: drawId, reason: "principal_draw_required" });
+        return res.status(400).json({ error: "principal_draw_required" });
+      }
+
+      const currentPriceResult = await client.query(
+        `SELECT value
+           FROM public.app_config
+          WHERE key = 'ticket_price_cents'
+          LIMIT 1`
+      );
+      const currentPrice = Number(
+        currentPriceResult.rows?.[0]?.value ?? process.env.PRICE_CENTS ?? 5500
+      );
+      if (normalized.value.ticket_price_cents !== currentPrice) {
+        const activityResult = await client.query(
+          `SELECT
+             EXISTS (SELECT 1 FROM public.payments WHERE draw_id = $1) AS has_payment,
+             EXISTS (
+               SELECT 1 FROM public.reservations
+                WHERE draw_id = $1
+                  AND lower(coalesce(status, '')) IN ('active', 'pending', 'reserved', 'paid')
+             ) AS has_active_reservation,
+             EXISTS (
+               SELECT 1 FROM public.numbers
+                WHERE draw_id = $1
+                  AND lower(coalesce(status, 'available')) IN ('sold', 'reserved')
+             ) AS has_sold_or_reserved_number,
+             EXISTS (SELECT 1 FROM public.autopay_draw_authorizations WHERE draw_id = $1) AS has_preauthorization,
+             EXISTS (SELECT 1 FROM public.autopay_runs WHERE draw_id = $1) AS has_autopay_run`,
+          [drawId]
+        );
+        const activity = activityResult.rows?.[0] || {};
+        if (Object.values(activity).some(Boolean)) {
+          console.warn("[admin-draw-config] ticket_price_locked", { draw_id: drawId });
+          await client.query("ROLLBACK");
+          transactionOpen = false;
+          console.warn("[admin-draw-config] update_rolled_back", { draw_id: drawId, reason: "draw_ticket_price_locked" });
+          return res.status(409).json({
+            error: "draw_ticket_price_locked",
+            message: "O valor da cota não pode ser alterado após o início das vendas.",
+          });
+        }
+      }
+
+      const config = normalized.value;
+      await client.query(
+        `INSERT INTO public.app_config (key, value, updated_at)
+         SELECT entry.key, entry.value, NOW()
+           FROM unnest($1::text[], $2::text[]) AS entry(key, value)
+         ON CONFLICT (key) DO UPDATE
+           SET value = EXCLUDED.value,
+               updated_at = NOW()`,
+        [
+          ["ticket_price_cents", "banner_title", "max_numbers_per_selection"],
+          [String(config.ticket_price_cents), config.banner_title, String(config.max_numbers_per_selection)],
+        ]
+      );
+      await client.query(
+        `INSERT INTO public.app_config_new AS cfg
+           (id, banner_title, ticket_price_cents, max_numbers_per_selection)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE
+           SET banner_title = EXCLUDED.banner_title,
+               ticket_price_cents = EXCLUDED.ticket_price_cents,
+               max_numbers_per_selection = EXCLUDED.max_numbers_per_selection`,
+        [String(drawId), config.banner_title, config.ticket_price_cents, config.max_numbers_per_selection]
+      );
+
+      const [globalResult, individualResult] = await Promise.all([
+        client.query(
+          `SELECT key, value
+             FROM public.app_config
+            WHERE key = ANY($1::text[])`,
+          [["ticket_price_cents", "banner_title", "max_numbers_per_selection"]]
+        ),
+        client.query(
+          `SELECT banner_title, ticket_price_cents, max_numbers_per_selection
+             FROM public.app_config_new
+            WHERE id = $1
+            LIMIT 1`,
+          [String(drawId)]
+        ),
+      ]);
+      const persisted = normalizePersistedPrincipalConfig(
+        globalResult.rows,
+        individualResult.rows?.[0]
+      );
+      if (
+        !samePrincipalConfig(persisted.global, config) ||
+        !samePrincipalConfig(persisted.draw, config)
+      ) {
+        const error = new Error("draw_config_sync_failed");
+        error.code = "draw_config_sync_failed";
+        throw error;
+      }
+
+      await client.query("COMMIT");
+      transactionOpen = false;
+      console.log("[admin-draw-config] update_committed", {
+        draw_id: drawId,
+        sync: { global: true, draw: true },
+      });
+      return res.json({
+        ok: true,
+        draw: {
+          id: Number(draw.id),
+          status: draw.status,
+          draw_type: draw.draw_type || "principal",
+        },
+        config,
+        sync: { global: true, draw: true },
+      });
+    } catch (error) {
+      if (transactionOpen && client) {
+        try { await client.query("ROLLBACK"); } catch {}
+      }
+      console.warn("[admin-draw-config] update_rolled_back", {
+        draw_id: drawId,
+        reason: error?.code || error?.message || "principal_config_update_failed",
+      });
+      const syncFailed = error?.code === "draw_config_sync_failed";
+      return res.status(500).json({
+        error: syncFailed ? "draw_config_sync_failed" : "principal_config_update_failed",
+      });
+    } finally {
+      if (client) client.release();
+    }
+  };
 }
 
 async function createCaptivePreauthIfEnabled(drawId, adminUserId, context, amountCents) {
@@ -172,6 +397,13 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
     return res.status(500).json({ error: "summary_failed" });
   }
 });
+
+router.patch(
+  "/draws/:drawId/config",
+  requireAuth,
+  requireAdmin,
+  createPrincipalDrawConfigHandler()
+);
 
 
 /**
