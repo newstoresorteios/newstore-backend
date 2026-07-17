@@ -211,6 +211,47 @@ router.get("/open", async (_req, res) => {
   }
 });
 
+router.get("/landing", async (_req, res) => {
+  try {
+    const draws = await query(
+      `WITH open_draws AS (
+         SELECT id, status, draw_type, product_name, product_link, opened_at,
+                closed_at, realized_at, winner_user_id, winner_name, winner_number
+           FROM public.draws
+          WHERE status = 'open'
+            AND draw_type IN ('adicional', 'secundario')
+       ),
+       latest_closed AS (
+         SELECT id, status, draw_type, product_name, product_link, opened_at,
+                closed_at, realized_at, winner_user_id, winner_name, winner_number
+           FROM public.draws
+          WHERE status = 'closed'
+            AND draw_type IN ('adicional', 'secundario')
+          ORDER BY id DESC
+          LIMIT 1
+       )
+       SELECT *
+         FROM (
+           SELECT * FROM open_draws
+           UNION ALL
+           SELECT * FROM latest_closed
+         ) AS landing_draws
+        ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, id ASC`
+    );
+
+    const configMap = await loadDrawConfigs((draws.rows || []).map((row) => row.id));
+    const formatted = [];
+    for (const draw of draws.rows || []) {
+      formatted.push(await formatAdditionalDraw(draw, configMap.get(String(draw.id))));
+    }
+
+    return res.json({ draws: formatted });
+  } catch (e) {
+    console.error("[additional_draws/landing] error:", e?.code || e?.message || e);
+    return res.status(500).json({ error: "additional_draws_landing_failed" });
+  }
+});
+
 router.get("/:id/numbers", async (req, res) => {
   const drawId = Number(req.params.id);
   if (!Number.isInteger(drawId) || drawId <= 0) {
