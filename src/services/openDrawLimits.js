@@ -20,19 +20,13 @@ export async function assertCanOpenAdditionalDraw(client) {
     `SELECT
        COUNT(*) FILTER (
          WHERE COALESCE(draw_type, 'principal') = 'principal'
-       ) AS principal_count,
-       COUNT(*) FILTER (
-         WHERE draw_type IN ('adicional', 'secundario')
-       ) AS additional_count,
-       COUNT(*) AS total_count
+       ) AS principal_count
        FROM public.draws
       WHERE status = 'open'`
   );
 
   const counts = {
     principal: Number(result.rows[0]?.principal_count || 0),
-    additional: Number(result.rows[0]?.additional_count || 0),
-    total: Number(result.rows[0]?.total_count || 0),
   };
 
   if (counts.principal > 1) {
