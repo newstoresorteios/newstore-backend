@@ -34,7 +34,7 @@ export function getSmtpConfigStatus() {
   };
 }
 
-function smtpConfig() {
+export function getSmtpConfig() {
   const host = String(process.env.SMTP_HOST || "").trim();
   const port = Number(process.env.SMTP_PORT || 587);
   const user = String(process.env.SMTP_USER || "").trim();
@@ -69,7 +69,7 @@ async function loadAllUsers(pgClient) {
   return result.rows || [];
 }
 
-function createTransporter(config) {
+export function createSmtpTransporter(config) {
   return nodemailer.createTransport({
     host: config.host,
     port: config.port,
@@ -143,8 +143,8 @@ export async function sendManualEmailNotification({
         fromName: String(process.env.SMTP_FROM_NAME || "New Store Sorteios").trim(),
         replyTo: String(process.env.SMTP_REPLY_TO || process.env.SMTP_FROM || "contato@newstorerj.com.br").trim(),
       }
-    : smtpConfig();
-  const mailer = transporter || createTransporter(config);
+    : getSmtpConfig();
+  const mailer = transporter || createSmtpTransporter(config);
   const subject = preview.subject_preview || payload.subject || "Mensagem da New Store";
   const html = preview.html_preview || payload.html || `<p>${preview.text_preview || ""}</p>`;
   const text = preview.text_preview || payload.text || "";

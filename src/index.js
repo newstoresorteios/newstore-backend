@@ -68,6 +68,7 @@ import brevoWebhooksRouter from "./routes/brevoWebhooks.js";
 import pushRouter from "./routes/push.js";
 import internalNotificationsRouter from "./routes/internalNotifications.js";
 import internalPushEventsRouter from "./routes/internal_push_events.js";
+import internalEmailEventsRouter from "./routes/internal_email_events.js";
 
 import { autoReconcile } from './middleware/autoReconcile.js';
 
@@ -152,6 +153,7 @@ app.use((req, res, next) => {
   if (
     path.startsWith("/api/push") ||
     path.startsWith("/api/internal/push") ||
+    path.startsWith("/api/internal/email") ||
     path.startsWith("/api/internal/notifications") ||
     path.startsWith("/api/admin/push") ||
     path.startsWith("/api/admin/notifications/push") ||
@@ -168,6 +170,7 @@ app.use((req, res, next) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/push", pushRouter);
 app.use("/api/internal/push", internalPushEventsRouter);
+app.use("/api/internal/email", internalEmailEventsRouter);
 app.use("/api/internal/notifications", internalNotificationsRouter);
 app.use("/api/numbers", numbersRoutes);
 app.use("/api/reservations", reservationsRoutes);

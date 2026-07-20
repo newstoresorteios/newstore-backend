@@ -9,6 +9,7 @@ import {
   resolveCaptivePreauthDrawRequirement,
 } from "../services/autopay/captivePreauthService.js";
 import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
+import { handleAutomaticEmailEvent } from "../services/notifications/automaticEmailNotifications.js";
 
 const router = Router();
 
@@ -32,6 +33,25 @@ async function emitAdminNewDrawPublished(drawId) {
       draw_id: drawId,
       code: error?.code || null,
       message: error?.message || null,
+    });
+  }
+}
+
+async function emitAdminNewDrawEmail(draw) {
+  try {
+    await handleAutomaticEmailEvent({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      referenceType: "draw",
+      referenceKey: `draw:${draw.id}:published_email`,
+      metadata: { draw_id: Number(draw.id), draw_type: "principal", product_name: draw.product_name || null },
+      occurredAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn("[admin/draws] email automation skipped", {
+      event_key: "NEW_DRAW_PUBLISHED",
+      reference_key: `draw:${draw.id}:published_email`,
+      draw_id: Number(draw.id),
+      code: error?.code || null,
     });
   }
 }
@@ -147,6 +167,7 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
       });
     }
     await emitAdminNewDrawPublished(draw.id);
+    await emitAdminNewDrawEmail(draw);
     return res.json({ ok: true, draw_id: draw.id, draw, captive_preauth: captivePreauth, autopay: result });
   } catch (e) {
     console.error("[admin/draws/new] error", e);
@@ -300,6 +321,7 @@ router.post("/:id/open", requireAuth, requireAdmin, async (req, res) => {
   const result = await runAutopayForDraw(drawId);
   if (!result?.ok) return res.status(500).json({ ...result, captive_preauth: captivePreauth });
   await emitAdminNewDrawPublished(drawId);
+  await emitAdminNewDrawEmail({ id: drawId });
   return res.json({ ...result, captive_preauth: captivePreauth });
 });
 

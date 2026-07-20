@@ -11,9 +11,29 @@ import {
   isOneOpenPerTypeConstraint,
   lockOpenDrawSlots,
 } from "../services/openDrawLimits.js";
+import { handleAutomaticEmailEvent } from "../services/notifications/automaticEmailNotifications.js";
 
 const router = Router();
 const VALID_STATUSES = new Set(["draft", "open", "closed", "cancelled"]);
+
+async function emitSecondaryDrawEmail(draw) {
+  if (!draw?.id || draw.status !== "open") return;
+  try {
+    await handleAutomaticEmailEvent({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      referenceType: "additional_draw",
+      referenceKey: `additional_draw:${draw.id}:published_email`,
+      metadata: { draw_id: Number(draw.id), draw_type: "secundario", product_name: draw.product_name || null },
+      occurredAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn("[admin_secondary_draws] email automation skipped", {
+      event_key: "NEW_DRAW_PUBLISHED",
+      draw_id: Number(draw.id),
+      code: error?.code || null,
+    });
+  }
+}
 
 router.use(requireAuth, requireAdmin);
 
@@ -286,6 +306,9 @@ router.patch("/:id", async (req, res) => {
       await upsertConfig(client, drawId, configValues, updated.rows[0]?.product_name || current.rows[0].product_name);
     }
     await client.query("COMMIT");
+    if (previousStatus !== "open" && updated.rows[0]?.status === "open") {
+      await emitSecondaryDrawEmail(updated.rows[0]);
+    }
     return res.json({ draw: await drawResponse(updated.rows[0]) });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
@@ -350,6 +373,7 @@ router.post("/", async (req, res) => {
     );
 
     await client.query("COMMIT");
+    await emitSecondaryDrawEmail(draw);
     return res.status(201).json({ draw: await drawResponse(draw), stats: await loadStats(draw.id) });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}

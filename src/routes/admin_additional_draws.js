@@ -5,6 +5,7 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
 import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
 import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
+import { handleAutomaticEmailEvent } from "../services/notifications/automaticEmailNotifications.js";
 import {
   assertCanOpenAdditionalDraw,
   getOpenDrawLimitResponse,
@@ -51,6 +52,26 @@ export async function emitAdminAdditionalDrawPublished(draw, handler = handlePus
       draw_id: Number(draw.id),
       code: error?.code || null,
       message: error?.message || null,
+    });
+  }
+}
+
+async function emitAdminAdditionalDrawEmail(draw) {
+  if (!draw?.id) return;
+  const drawType = draw.draw_type === "principal" ? "principal" : "adicional";
+  try {
+    await handleAutomaticEmailEvent({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      referenceType: drawType === "principal" ? "draw" : "additional_draw",
+      referenceKey: `${drawType === "principal" ? "draw" : "additional_draw"}:${draw.id}:published_email`,
+      metadata: { draw_id: Number(draw.id), draw_type: drawType, product_name: draw.product_name || null },
+      occurredAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn("[admin_additional_draws] email automation skipped", {
+      event_key: "NEW_DRAW_PUBLISHED",
+      draw_id: Number(draw.id),
+      code: error?.code || null,
     });
   }
 }
@@ -325,6 +346,7 @@ router.post("/", async (req, res) => {
     await client.query("COMMIT");
     if (draw.status === "open") {
       await emitAdminAdditionalDrawPublished(draw);
+      await emitAdminAdditionalDrawEmail(draw);
     }
     const configMap = await loadDrawConfigs([draw.id]);
     return res.status(201).json({
@@ -474,6 +496,7 @@ router.patch("/:id", async (req, res) => {
     await client.query("COMMIT");
     if (previousStatus !== "open" && updatedRow.status === "open") {
       await emitAdminAdditionalDrawPublished(updatedRow);
+      await emitAdminAdditionalDrawEmail(updatedRow);
     }
     const configMap = await loadDrawConfigs([drawId]);
     return res.json({
