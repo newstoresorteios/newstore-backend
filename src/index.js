@@ -50,6 +50,7 @@ import adminRoutes from "./routes/admin.js";
 import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
 import trayRouter from "./routes/tray.js";
+import integrationsTrayRouter from "./routes/integrations_tray.js";
 
 import adminUsersRouter from "./routes/adminUsers.js";
 
@@ -154,6 +155,7 @@ app.use((req, res, next) => {
     path.startsWith("/api/push") ||
     path.startsWith("/api/internal/push") ||
     path.startsWith("/api/internal/email") ||
+    path.startsWith("/api/integrations/tray") ||
     path.startsWith("/api/internal/notifications") ||
     path.startsWith("/api/admin/push") ||
     path.startsWith("/api/admin/notifications/push") ||
@@ -171,6 +173,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/push", pushRouter);
 app.use("/api/internal/push", internalPushEventsRouter);
 app.use("/api/internal/email", internalEmailEventsRouter);
+app.use("/api/integrations/tray", integrationsTrayRouter);
 app.use("/api/internal/notifications", internalNotificationsRouter);
 app.use("/api/numbers", numbersRoutes);
 app.use("/api/reservations", reservationsRoutes);
