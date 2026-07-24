@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { getPool } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
+import { pendingCaptivePreauthReservationGuardSql } from "../services/reservationExpiry.js";
 
 const router = Router();
 
@@ -69,6 +70,7 @@ async function expireDrawReservations(client, drawId = null) {
         SET status = 'expired'
       WHERE r.status = 'active'
         AND r.expires_at < NOW()
+        AND ${pendingCaptivePreauthReservationGuardSql("r")}
         ${drawFilter}
       RETURNING r.id, r.draw_id`,
     params

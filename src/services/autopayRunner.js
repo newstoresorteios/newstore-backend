@@ -5,6 +5,7 @@ import { getPool } from "../db.js";
 import { createBill, chargeBill, refundCharge, getBill, getPaymentProfile, getCustomerPaymentProfiles, cancelBill } from "./vindi.js";
 import { creditCouponOnApprovedPayment } from "./couponBalance.js";
 import { closeDrawIfSoldOut } from "./drawLifecycle.js";
+import { pendingCaptivePreauthReservationGuardSql } from "./reservationExpiry.js";
 import crypto from "node:crypto";
 
 /* ------------------------------------------------------- *
@@ -443,15 +444,27 @@ async function reserveNumbersForProfile(client, { draw_id, user_id, wants, ttlMi
           const isBlocking = ["active", "pending", "reserved", ""].includes(st);
           const isExpired = r.expires_at && new Date(r.expires_at).getTime() <= Date.now();
           if (isBlocking && isExpired) {
-            await client.query(`update public.reservations set status='expired' where id=$1`, [rid]);
-            await client.query(
-              `update public.numbers
-                  set status='available',
-                      reservation_id=null
-                where draw_id=$1
-                  and reservation_id=$2`,
-              [draw_id, rid]
+            const expired = await client.query(
+              `update public.reservations reservation
+                  set status='expired'
+                where reservation.id=$1
+                  and reservation.expires_at is not null
+                  and reservation.expires_at <= now()
+                  and lower(coalesce(reservation.status, '')) in ('active', 'pending', 'reserved', '')
+                  and ${pendingCaptivePreauthReservationGuardSql("reservation")}
+                returning reservation.id`,
+              [rid]
             );
+            if (expired.rowCount > 0) {
+              await client.query(
+                `update public.numbers
+                    set status='available',
+                        reservation_id=null
+                  where draw_id=$1
+                    and reservation_id=$2`,
+                [draw_id, rid]
+              );
+            }
           }
         }
       }

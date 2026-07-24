@@ -2,6 +2,7 @@ import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { getPool, query } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
+import { pendingCaptivePreauthReservationGuardSql } from "../services/reservationExpiry.js";
 
 const router = Router();
 
@@ -124,6 +125,7 @@ async function expireDrawReservations(client, drawId = null) {
         SET status = 'expired'
       WHERE r.status = 'active'
         AND r.expires_at < NOW()
+        AND ${pendingCaptivePreauthReservationGuardSql("r")}
         ${drawFilter}
       RETURNING r.id, r.draw_id, r.numbers`,
     params

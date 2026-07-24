@@ -1,6 +1,7 @@
 // backend/src/routes/numbers.js
 import { Router } from 'express';
 import { query } from '../db.js';
+import { expireReservationForNumbersCleanup } from '../services/reservationExpiry.js';
 
 const router = Router();
 
@@ -114,10 +115,10 @@ router.get('/', async (req, res) => {
       const isExpired = exp && !Number.isNaN(exp) && exp < now;
 
       if (isExpired) {
-        // best-effort: não bloqueia a resposta
-        query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [r.id])
-          .catch(() => {});
-        continue;
+        // Revalida no UPDATE para fechar a corrida com o scanner de preauth.
+        // Se nada mudar, a reserva segue bloqueando (preauth pending ou hold estendido).
+        const expired = await expireReservationForNumbersCleanup(r.id, query);
+        if (expired.rowCount > 0) continue;
       }
 
       // reserva só se ainda não foi vendida

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { getPool, query } from "../../db.js";
 import { getTicketPriceCents as getGlobalTicketPriceCents } from "../config.js";
 import { chargeAuthorizedCaptivePreauth as chargeAuthorizedCaptivePreauthWithAutopay } from "../autopayRunner.js";
+import { resolveCaptivePreauthAutoApproveEffectiveFrom } from "../reservationExpiry.js";
 import {
   getWhatsAppProviderReadiness,
   resolveRecipientForCurrentMode,
@@ -3634,8 +3635,6 @@ async function expireLockedAutoApprovalGroup(client, group, reason) {
 }
 
 async function prepareExpiredPendingCaptivePreauthGroups(options = {}) {
-  const pool = options.pgPool || await getPool();
-  const client = await pool.connect();
   const summary = {
     checked: 0,
     eligible: 0,
@@ -3648,6 +3647,16 @@ async function prepareExpiredPendingCaptivePreauthGroups(options = {}) {
     released_reservations: 0,
     draw_ids: [],
   };
+  const effectiveFrom = resolveCaptivePreauthAutoApproveEffectiveFrom(options.effectiveFrom);
+  if (!effectiveFrom.ok) {
+    return {
+      ...summary,
+      disabled: true,
+      reason: effectiveFrom.code,
+    };
+  }
+  const pool = options.pgPool || await getPool();
+  const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
@@ -3657,8 +3666,10 @@ async function prepareExpiredPendingCaptivePreauthGroups(options = {}) {
         WHERE status = 'pending'
           AND expires_at IS NOT NULL
           AND expires_at <= now()
+          AND created_at >= $1::timestamptz
         ORDER BY draw_id, user_id, id
-        FOR UPDATE SKIP LOCKED`
+        FOR UPDATE SKIP LOCKED`,
+      [effectiveFrom.iso]
     );
     const selectedRows = selected.rows || [];
     summary.checked = selectedRows.length;
@@ -3672,8 +3683,9 @@ async function prepareExpiredPendingCaptivePreauthGroups(options = {}) {
             AND user_id = $2
             AND status = 'pending'
             AND expires_at IS NOT NULL
-            AND expires_at <= now()`,
-        [group.draw_id, group.user_id]
+            AND expires_at <= now()
+            AND created_at >= $3::timestamptz`,
+        [group.draw_id, group.user_id, effectiveFrom.iso]
       );
       if (Number(countResult.rows?.[0]?.count || 0) !== group.quantity) {
         summary.skipped += group.quantity;
@@ -3878,8 +3890,9 @@ async function prepareExpiredPendingCaptivePreauthGroups(options = {}) {
             AND status = 'pending'
             AND expires_at IS NOT NULL
             AND expires_at <= now()
+            AND created_at >= $2::timestamptz
           RETURNING *`,
-        [group.authorization_ids]
+        [group.authorization_ids, effectiveFrom.iso]
       );
       if (Number(authorized.rowCount || 0) !== group.quantity) {
         summary.skipped += group.quantity;
@@ -4019,7 +4032,48 @@ export async function autoAuthorizeAndChargeExpiredPendingCaptivePreauths(option
   const prepareGroups = options.prepareGroups || prepareExpiredPendingCaptivePreauthGroups;
   const chargeGroup = options.chargeGroup || chargeAuthorizedCaptivePreauthWithAutopay;
   const finalizeGroup = options.finalizeGroup || finalizeExpiryAutoApprovalGroup;
-  const prepared = await prepareGroups(options);
+  const chargeEnabled = options.chargeEnabled ?? isCaptivePreauthChargeOnAuthorizeEnabled();
+  if (chargeEnabled !== true) {
+    const disabledSummary = {
+      checked: 0,
+      eligible: 0,
+      groups: 0,
+      authorized: 0,
+      charged: 0,
+      failed: 0,
+      expired: 0,
+      skipped: 0,
+      released_reservations: 0,
+      draw_ids: [],
+      disabled: true,
+      reason: "charge_on_authorize_disabled",
+    };
+    warn("expiry_auto_approve_scan_disabled", disabledSummary);
+    return disabledSummary;
+  }
+  const effectiveFrom = resolveCaptivePreauthAutoApproveEffectiveFrom(options.effectiveFrom);
+  if (!effectiveFrom.ok) {
+    const disabledSummary = {
+      checked: 0,
+      eligible: 0,
+      groups: 0,
+      authorized: 0,
+      charged: 0,
+      failed: 0,
+      expired: 0,
+      skipped: 0,
+      released_reservations: 0,
+      draw_ids: [],
+      disabled: true,
+      reason: effectiveFrom.code,
+    };
+    warn("expiry_auto_approve_scan_disabled", disabledSummary);
+    return disabledSummary;
+  }
+  const prepared = await prepareGroups({
+    ...options,
+    effectiveFrom: effectiveFrom.iso,
+  });
   const summary = {
     checked: Number(prepared.checked || 0),
     eligible: Number(prepared.eligible || 0),
@@ -4032,6 +4086,12 @@ export async function autoAuthorizeAndChargeExpiredPendingCaptivePreauths(option
     released_reservations: Number(prepared.released_reservations || 0),
     draw_ids: prepared.draw_ids || [],
   };
+  if (prepared.disabled === true) {
+    summary.disabled = true;
+    summary.reason = prepared.reason || "auto_approve_effective_from_invalid";
+    warn("expiry_auto_approve_scan_disabled", summary);
+    return summary;
+  }
 
   for (const rawGroup of prepared.groups || []) {
     const group = expiryGroupDetails(rawGroup);
@@ -4044,17 +4104,6 @@ export async function autoAuthorizeAndChargeExpiredPendingCaptivePreauths(option
       total_amount_cents: group.total_amount_cents,
       idempotency_key: group.idempotency_key,
     });
-
-    if ((options.chargeEnabled ?? isCaptivePreauthChargeOnAuthorizeEnabled()) !== true) {
-      summary.skipped += group.quantity;
-      warn("expiry_auto_approve_skipped", {
-        draw_id: group.draw_id,
-        user_id: group.user_id,
-        authorization_ids: group.authorization_ids,
-        reason: "charge_on_authorize_disabled",
-      });
-      continue;
-    }
 
     let chargeResult;
     try {
@@ -4785,7 +4834,7 @@ export async function resolveCaptivePreauthDrawRequirement(drawId, options = {})
 }
 
 export function isCaptivePreauthChargeOnAuthorizeEnabled() {
-  return envBool("CAPTIVE_PREAUTH_CHARGE_ON_AUTHORIZE_ENABLED", false);
+  return envBool("CAPTIVE_PREAUTH_CHARGE_ON_AUTHORIZE_ENABLED", true);
 }
 
 export async function chargeAuthorizedCaptivePreauth(authorizationId, options = {}) {
@@ -4797,7 +4846,7 @@ export function isCaptivePreauthExpiryScanEnabled() {
 }
 
 export function isCaptivePreauthAutoApproveOnExpiryEnabled() {
-  return envBool("CAPTIVE_PREAUTH_AUTO_APPROVE_ON_EXPIRY_ENABLED", false);
+  return envBool("CAPTIVE_PREAUTH_AUTO_APPROVE_ON_EXPIRY_ENABLED", true);
 }
 
 export function getCaptivePreauthExpiryScanIntervalMs() {
