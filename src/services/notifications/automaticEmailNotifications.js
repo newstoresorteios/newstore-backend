@@ -35,6 +35,10 @@ function isEnabled() {
   return cleanText(process.env.NOTIFICATION_EMAIL_AUTOMATION_ENABLED).toLowerCase() === "true";
 }
 
+export function isDrawClosedForEmail(draw) {
+  return Boolean(draw?.closed_at);
+}
+
 function validEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanText(value));
 }
@@ -205,7 +209,18 @@ export async function handleAutomaticEmailEvent({
   referenceKey,
   metadata = {},
   occurredAt = null,
-} = {}) {
+} = {}, dependencies = {}) {
+  const loadContext = dependencies.loadDrawContext || loadDrawContext;
+  const loadEventRecipients = dependencies.loadRecipients || loadRecipients;
+  const loadEventRemaining = dependencies.loadRemaining || loadRemaining;
+  const wasAlreadyDispatched = dependencies.alreadyDispatched || alreadyDispatched;
+  const resolveSmtpConfig = dependencies.getSmtpConfig || getSmtpConfig;
+  const createMailer = dependencies.createSmtpTransporter || createSmtpTransporter;
+  const createCampaignRecord = dependencies.createCampaign || createCampaign;
+  const createDispatchRecord = dependencies.createDispatch || createDispatch;
+  const acceptDispatch = dependencies.markDispatchAccepted || markDispatchAccepted;
+  const failDispatch = dependencies.markDispatchFailed || markDispatchFailed;
+  const updateCampaign = dependencies.updateCampaignAudienceCounts || updateCampaignAudienceCounts;
   const key = cleanText(eventKey);
   const drawId = Number(metadata?.draw_id);
   if (!AUTOMATIC_EMAIL_EVENT_KEYS.includes(key)) throw eventError("email_event_not_allowed");
@@ -214,26 +229,118 @@ export async function handleAutomaticEmailEvent({
   console.log("[email-automation] event_received", { event_key: key, reference_key: referenceKey, draw_id: drawId });
   if (!isEnabled()) {
     console.log("[email-automation] skipped", { event_key: key, reference_key: referenceKey, draw_id: drawId, reason: "disabled" });
-    return { ok: true, status: "skipped", reason: "disabled", event_key: key, reference_key: referenceKey, draw_id: drawId };
+    return {
+      ok: true,
+      status: "disabled",
+      reason: "disabled",
+      event_key: key,
+      reference_key: referenceKey,
+      draw_id: drawId,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      deduped: 0,
+    };
   }
 
-  const context = await loadDrawContext(drawId);
-  if (key === "DRAW_CLOSED" && context.draw.status !== "closed") {
-    return { ok: true, status: "skipped", reason: "draw_not_closed", event_key: key, reference_key: referenceKey, draw_id: drawId };
+  const context = await loadContext(drawId);
+  if (key === "DRAW_CLOSED" && !isDrawClosedForEmail(context.draw)) {
+    return {
+      ok: true,
+      status: "skipped",
+      reason: "draw_not_closed",
+      event_key: key,
+      reference_key: referenceKey,
+      draw_id: drawId,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      deduped: 0,
+    };
   }
   if (REMAINING_THRESHOLDS.has(key) && context.draw.status !== "open") {
-    return { ok: true, status: "skipped", reason: "draw_not_open", event_key: key, reference_key: referenceKey, draw_id: drawId };
+    return {
+      ok: true,
+      status: "skipped",
+      reason: "draw_not_open",
+      event_key: key,
+      reference_key: referenceKey,
+      draw_id: drawId,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      deduped: 0,
+    };
   }
-  const remainingNumbers = REMAINING_THRESHOLDS.has(key) ? await loadRemaining(drawId) : null;
-  const recipients = await loadRecipients(drawId, key);
+  const remainingNumbers = REMAINING_THRESHOLDS.has(key) ? await loadEventRemaining(drawId) : null;
+  const recipients = await loadEventRecipients(drawId, key);
   console.log("[email-automation] recipients_resolved", { event_key: key, reference_key: referenceKey, draw_id: drawId, count: recipients.length });
-  if (!recipients.length) return { ok: true, status: "no_recipients", event_key: key, reference_key: referenceKey, draw_id: drawId, sent: 0 };
+  if (!recipients.length) {
+    return {
+      ok: true,
+      status: "no_recipients",
+      event_key: key,
+      reference_key: referenceKey,
+      draw_id: drawId,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      deduped: 0,
+    };
+  }
 
-  const smtp = getSmtpConfig();
-  const mailer = createSmtpTransporter(smtp);
+  const pendingRecipients = [];
+  let deduped = 0;
+  for (const user of recipients) {
+    if (await wasAlreadyDispatched({ eventKey: key, referenceKey, drawId, userId: user.id })) {
+      deduped += 1;
+      console.log("[email-automation] dispatch_deduped", { event_key: key, reference_key: referenceKey, draw_id: drawId, user_id: user.id });
+    } else {
+      pendingRecipients.push(user);
+    }
+  }
+  if (!pendingRecipients.length) {
+    return {
+      ok: true,
+      status: "deduped",
+      event_key: key,
+      reference_key: referenceKey,
+      draw_id: drawId,
+      sent: 0,
+      failed: 0,
+      skipped: deduped,
+      deduped,
+    };
+  }
+
+  let smtp;
+  try {
+    smtp = resolveSmtpConfig();
+  } catch (error) {
+    if (error?.code !== "manual_email_smtp_not_configured") throw error;
+    console.error("[email-automation] configuration_error", {
+      event_key: key,
+      reference_key: referenceKey,
+      draw_id: drawId,
+      code: error.code,
+    });
+    return {
+      ok: false,
+      status: "configuration_error",
+      reason: error.code,
+      event_key: key,
+      reference_key: referenceKey,
+      draw_id: drawId,
+      sent: 0,
+      failed: 0,
+      skipped: pendingRecipients.length + deduped,
+      deduped,
+    };
+  }
+  const mailer = createMailer(smtp);
   const renderedByUser = (user) => renderAutomaticTemplate(key, user, context, remainingNumbers);
-  const firstRendered = renderedByUser(recipients[0]);
-  const campaign = await createCampaign({
+  const firstRendered = renderedByUser(pendingRecipients[0]);
+  const campaign = await createCampaignRecord({
     name: `Automatic email - ${firstRendered.subject}`.slice(0, 255),
     channel: "email",
     provider: "brevo_smtp",
@@ -249,15 +356,9 @@ export async function handleAutomaticEmailEvent({
 
   let sent = 0;
   let failed = 0;
-  let deduped = 0;
-  for (const user of recipients) {
-    if (await alreadyDispatched({ eventKey: key, referenceKey, drawId, userId: user.id })) {
-      deduped += 1;
-      console.log("[email-automation] dispatch_deduped", { event_key: key, reference_key: referenceKey, draw_id: drawId, user_id: user.id });
-      continue;
-    }
+  for (const user of pendingRecipients) {
     const rendered = renderedByUser(user);
-    const dispatch = await createDispatch({
+    const dispatch = await createDispatchRecord({
       eventKey: key,
       channel: "email",
       provider: "brevo_smtp",
@@ -280,15 +381,30 @@ export async function handleAutomaticEmailEvent({
         html: rendered.html,
         text: rendered.text,
       });
-      await markDispatchAccepted({ dispatchId: dispatch.id, result: { ok: true, provider_status: "accepted", delivery_status: "unknown", messageId: info?.messageId || null, response: { accepted: info?.accepted?.length || 0 } } });
+      await acceptDispatch({ dispatchId: dispatch.id, result: { ok: true, provider_status: "accepted", delivery_status: "unknown", messageId: info?.messageId || null, response: { accepted: info?.accepted?.length || 0 } } });
       sent += 1;
       console.log("[email-automation] dispatch_sent", { event_key: key, reference_key: referenceKey, draw_id: drawId, user_id: user.id });
     } catch (error) {
       failed += 1;
-      await markDispatchFailed({ dispatchId: dispatch.id, result: { ok: false, error: "automatic_email_send_failed", reason: error?.code || error?.message || null } });
+      await failDispatch({ dispatchId: dispatch.id, result: { ok: false, error: "automatic_email_send_failed", reason: error?.code || error?.message || null } });
       console.error("[email-automation] dispatch_failed", { event_key: key, reference_key: referenceKey, draw_id: drawId, user_id: user.id, code: error?.code || null });
     }
   }
-  await updateCampaignAudienceCounts(null, campaign.id, { created: sent + failed, sent, failed, skipped: deduped });
-  return { ok: true, status: "processed", event_key: key, reference_key: referenceKey, draw_id: drawId, sent, failed, deduped };
+  await updateCampaign(null, campaign.id, { created: sent + failed, sent, failed, skipped: deduped });
+  const status = failed === 0
+    ? "processed"
+    : sent === 0
+      ? "failed"
+      : "partial_failure";
+  return {
+    ok: true,
+    status,
+    event_key: key,
+    reference_key: referenceKey,
+    draw_id: drawId,
+    sent,
+    failed,
+    skipped: deduped,
+    deduped,
+  };
 }

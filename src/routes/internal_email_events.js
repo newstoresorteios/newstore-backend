@@ -3,13 +3,17 @@ import { AUTOMATIC_EMAIL_EVENT_KEYS, handleAutomaticEmailEvent } from "../servic
 
 const router = express.Router();
 
-function internalTokenAllowed(req) {
+export function internalTokenAllowed(req) {
   const expected = String(process.env.PUSH_INTERNAL_EVENTS_TOKEN || "").trim();
   const received = String(req.get("x-internal-token") || "").trim();
   return Boolean(expected && received && expected === received);
 }
 
-router.post("/events", async (req, res) => {
+export async function handleInternalEmailEventRequest(
+  req,
+  res,
+  eventHandler = handleAutomaticEmailEvent
+) {
   if (!internalTokenAllowed(req)) {
     return res.status(401).json({ ok: false, error: "internal_email_event_unauthorized" });
   }
@@ -18,7 +22,7 @@ router.post("/events", async (req, res) => {
     return res.status(400).json({ ok: false, error: "email_event_not_allowed" });
   }
   try {
-    const result = await handleAutomaticEmailEvent({
+    const result = await eventHandler({
       eventKey: body.event_key,
       referenceType: body.reference_type,
       referenceKey: body.reference_key,
@@ -37,6 +41,10 @@ router.post("/events", async (req, res) => {
       error: error?.code || "email_event_failed",
     });
   }
+}
+
+router.post("/events", async (req, res) => {
+  return handleInternalEmailEventRequest(req, res);
 });
 
 export default router;
