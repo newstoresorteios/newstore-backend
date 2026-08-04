@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   handleAutomaticEmailEvent,
   isDrawClosedForEmail,
+  loadRecipients,
 } from "../src/services/notifications/automaticEmailNotifications.js";
 import { handleInternalEmailEventRequest } from "../src/routes/internal_email_events.js";
 
@@ -14,6 +15,55 @@ const DRAW_CLOSED_EVENT = {
   metadata: { draw_id: 42 },
   occurredAt: "2026-07-24T21:00:00.000Z",
 };
+
+test("NEW_DRAW_PUBLISHED consulta todos os usuários sem parâmetros SQL extras", async () => {
+  let capturedSql = null;
+  let capturedParams = null;
+
+  const recipients = await loadRecipients(42, "NEW_DRAW_PUBLISHED", async (sql, params) => {
+    capturedSql = sql;
+    capturedParams = params;
+    return { rows: [{ id: 1, name: "Cliente", email: "cliente@example.test" }] };
+  });
+
+  assert.deepEqual(capturedParams, []);
+  assert.doesNotMatch(capturedSql, /\$1/);
+  assert.match(capturedSql, /FROM public\.users/);
+  assert.equal(recipients.length, 1);
+});
+
+test("EMAIL_DRAW_REMAINING_75 consulta todos os usuários sem parâmetros SQL extras", async () => {
+  let capturedParams = null;
+
+  await loadRecipients(42, "EMAIL_DRAW_REMAINING_75", async (_sql, params) => {
+    capturedParams = params;
+    return { rows: [] };
+  });
+
+  assert.deepEqual(capturedParams, []);
+});
+
+test("DRAW_CLOSED consulta participantes com drawId e preserva os dois filtros SQL", async () => {
+  let capturedSql = null;
+  let capturedParams = null;
+
+  const recipients = await loadRecipients(42, "DRAW_CLOSED", async (sql, params) => {
+    capturedSql = sql;
+    capturedParams = params;
+    return {
+      rows: [
+        { id: 1, name: "Cliente", email: "cliente@example.test" },
+        { id: 2, name: "Duplicado", email: "CLIENTE@example.test" },
+        { id: 3, name: "Inválido", email: "email-invalido" },
+      ],
+    };
+  });
+
+  assert.deepEqual(capturedParams, [42]);
+  assert.match(capturedSql, /r\.draw_id = \$1/);
+  assert.match(capturedSql, /p\.draw_id = \$1/);
+  assert.deepEqual(recipients.map((recipient) => recipient.id), [1]);
+});
 
 async function withEnv(name, value, run) {
   const previous = process.env[name];
@@ -321,6 +371,55 @@ function fakeResponse() {
     },
   };
 }
+
+async function requestWithServiceError(code, message = code) {
+  const error = new Error(message);
+  error.code = code;
+  const req = {
+    body: {
+      event_key: "DRAW_CLOSED",
+      reference_key: "draw:42:closed_email",
+      metadata: { draw_id: 42 },
+    },
+    get() {
+      return "expected-token";
+    },
+  };
+  const res = fakeResponse();
+
+  await handleInternalEmailEventRequest(req, res, async () => {
+    throw error;
+  });
+
+  return res;
+}
+
+test("email_draw_id_invalid retorna HTTP 400", async () => {
+  await withEnv("PUSH_INTERNAL_EVENTS_TOKEN", "expected-token", async () => {
+    const res = await requestWithServiceError("email_draw_id_invalid");
+
+    assert.equal(res.statusCode, 400);
+    assert.deepEqual(res.body, { ok: false, error: "email_draw_id_invalid" });
+  });
+});
+
+test("email_draw_not_found retorna HTTP 404", async () => {
+  await withEnv("PUSH_INTERNAL_EVENTS_TOKEN", "expected-token", async () => {
+    const res = await requestWithServiceError("email_draw_not_found");
+
+    assert.equal(res.statusCode, 404);
+    assert.deepEqual(res.body, { ok: false, error: "email_draw_not_found" });
+  });
+});
+
+test("erro SQL desconhecido retorna HTTP 500", async () => {
+  await withEnv("PUSH_INTERNAL_EVENTS_TOKEN", "expected-token", async () => {
+    const res = await requestWithServiceError("08P01", "database failure");
+
+    assert.equal(res.statusCode, 500);
+    assert.deepEqual(res.body, { ok: false, error: "08P01" });
+  });
+});
 
 test("token interno inválido recusa evento antes de campanha ou SMTP", async () => {
   await withEnv("PUSH_INTERNAL_EVENTS_TOKEN", "expected-token", async () => {

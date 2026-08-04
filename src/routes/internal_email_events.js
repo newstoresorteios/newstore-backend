@@ -3,6 +3,19 @@ import { AUTOMATIC_EMAIL_EVENT_KEYS, handleAutomaticEmailEvent } from "../servic
 
 const router = express.Router();
 
+const CLIENT_ERROR_CODES = new Set([
+  "email_event_not_allowed",
+  "email_draw_id_invalid",
+  "email_reference_key_invalid",
+  "email_draw_type_not_allowed",
+]);
+
+export function statusForEmailEventError(error) {
+  if (error?.code === "email_draw_not_found") return 404;
+  if (CLIENT_ERROR_CODES.has(error?.code)) return 400;
+  return 500;
+}
+
 export function internalTokenAllowed(req) {
   const expected = String(process.env.PUSH_INTERNAL_EVENTS_TOKEN || "").trim();
   const received = String(req.get("x-internal-token") || "").trim();
@@ -35,8 +48,11 @@ export async function handleInternalEmailEventRequest(
     console.error("[internal/email/events] error", {
       code: error?.code || "email_event_failed",
       message: error?.message || null,
+      event_key: body.event_key ?? null,
+      reference_key: body.reference_key ?? null,
+      draw_id: body.metadata?.draw_id ?? null,
     });
-    return res.status(error?.code === "email_draw_not_found" ? 404 : 400).json({
+    return res.status(statusForEmailEventError(error)).json({
       ok: false,
       error: error?.code || "email_event_failed",
     });

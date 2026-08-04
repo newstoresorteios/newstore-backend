@@ -112,7 +112,7 @@ async function loadDrawContext(drawId) {
   };
 }
 
-async function loadRecipients(drawId, eventKey) {
+export async function loadRecipients(drawId, eventKey, runQuery = query) {
   const sql = eventKey === "DRAW_CLOSED"
     ? `SELECT DISTINCT u.id, u.name, u.email
          FROM public.users u
@@ -133,7 +133,8 @@ async function loadRecipients(drawId, eventKey) {
          FROM public.users
         WHERE email IS NOT NULL
         ORDER BY id`;
-  const result = await query(sql, [drawId]);
+  const params = eventKey === "DRAW_CLOSED" ? [drawId] : [];
+  const result = await runQuery(sql, params);
   const seen = new Set();
   return (result.rows || []).filter((user) => {
     const email = cleanText(user.email).toLowerCase();
