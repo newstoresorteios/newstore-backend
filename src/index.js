@@ -16,6 +16,7 @@ import additionalDrawsRoutes from "./routes/additional_draws.js";
 import additionalPaymentsRoutes from "./routes/additional_payments.js";
 import secondaryDrawsRoutes from "./routes/secondary_draws.js";
 import secondaryPaymentsRoutes from "./routes/secondary_payments.js";
+import checkoutBatchRoutes from "./routes/checkout_batches.js";
 import meRoutes from "./routes/me.js";
 import communicationConsentsRoutes from "./routes/communication_consents.js";
 import drawsRoutes from "./routes/draws.js";
@@ -185,6 +186,7 @@ app.use("/api/additional-draws", additionalDrawsRoutes);
 app.use("/api/additional-payments", additionalPaymentsRoutes);
 app.use("/api/secondary-draws", secondaryDrawsRoutes);
 app.use("/api/secondary-payments", secondaryPaymentsRoutes);
+app.use("/api/checkout-batches", checkoutBatchRoutes);
 app.use("/api/orders", paymentsRoutes); // aliases
 app.use("/api/participations", paymentsRoutes); // aliases
 

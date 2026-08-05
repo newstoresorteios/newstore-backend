@@ -1,5 +1,6 @@
 // backend/src/middleware/autoReconcile.js
 import { kickReconcilePendingPayments } from '../routes/payments.js';
+import { reconcilePendingCheckoutBatches } from '../services/checkoutBatchPaymentService.js';
 
 let _inFlight = false;
 
@@ -11,7 +12,10 @@ export function autoReconcile(req, res, next) {
   if (!_inFlight) {
     _inFlight = true;
     // roda sem await para não atrasar a resposta
-    kickReconcilePendingPayments()
+    Promise.all([
+      kickReconcilePendingPayments(),
+      reconcilePendingCheckoutBatches(),
+    ])
       .catch((e) => console.warn('[autoReconcile] error:', e?.message || e))
       .finally(() => { _inFlight = false; });
   }

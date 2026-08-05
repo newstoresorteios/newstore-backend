@@ -330,4 +330,10 @@ export async function mpCreatePixPayment({
   );
 }
 
-export default { mpEnsureCustomer, mpSaveCard, mpChargeCard, mpCreatePixPayment };
+export async function mpGetPayment(paymentId) {
+  const id = String(paymentId || "").trim();
+  if (!id) throw new Error("mercadopago_payment_id_required");
+  return mpRequest("GET", `/v1/payments/${encodeURIComponent(id)}`);
+}
+
+export default { mpEnsureCustomer, mpSaveCard, mpChargeCard, mpCreatePixPayment, mpGetPayment };

@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getTicketPriceCents } from '../services/config.js';
 import { creditCouponOnApprovedPayment } from '../services/couponBalance.js';
 import { closeDrawIfSoldOut } from '../services/drawLifecycle.js';
+import { syncCheckoutBatchFromProviderPayment } from '../services/checkoutBatchPaymentService.js';
 
 const router = Router();
 
@@ -376,6 +377,12 @@ router.post('/webhook', async (req, res) => {
 
     const id = String(body.id);
     const status = body.status;
+
+    const checkoutBatch = await syncCheckoutBatchFromProviderPayment(body, {
+      creditCoupon: creditCouponOnApprovedPayment,
+      closeDrawIfSoldOut,
+    });
+    if (checkoutBatch.handled) return res.sendStatus(200);
 
     await query(
       `UPDATE public.payments
