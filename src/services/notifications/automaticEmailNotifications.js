@@ -31,6 +31,53 @@ function cleanText(value) {
   return String(value ?? "").trim();
 }
 
+function cleanDisplayText(value) {
+  return cleanText(value).replace(/\s+/gu, " ");
+}
+
+export function resolveDrawDisplayName({
+  drawId,
+  drawType,
+  payloadDrawName,
+  databaseDrawName,
+} = {}) {
+  const currentDatabaseName = cleanDisplayText(databaseDrawName);
+  if (currentDatabaseName) return currentDatabaseName;
+
+  const receivedName = cleanDisplayText(payloadDrawName);
+  if (receivedName) return receivedName;
+
+  const normalizedType = cleanText(drawType).toLowerCase() || "principal";
+  const numericDrawId = Number(drawId);
+  const idSuffix = Number.isInteger(numericDrawId) && numericDrawId > 0
+    ? ` #${numericDrawId}`
+    : "";
+  if (normalizedType === "adicional") return `Sorteio adicional${idSuffix}`;
+  if (normalizedType === "secundario") return `Sorteio secundário${idSuffix}`;
+  return "Sorteio principal";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function subjectDrawName(value) {
+  const name = cleanDisplayText(value);
+  if (name.length <= 180) return name;
+  return `${name.slice(0, 179).trimEnd()}…`;
+}
+
+function drawClosurePrefix(drawDisplayName) {
+  return /^sorteio(?:\s|$)/iu.test(cleanDisplayText(drawDisplayName))
+    ? "O"
+    : "O sorteio";
+}
+
 function isEnabled() {
   return cleanText(process.env.NOTIFICATION_EMAIL_AUTOMATION_ENABLED).toLowerCase() === "true";
 }
@@ -60,12 +107,12 @@ function referencePrefix(drawType) {
   return drawType === "principal" ? "draw" : "additional_draw";
 }
 
-function drawName(draw, config, principalConfig) {
+function databaseDrawName(draw, config, principalConfig) {
   return (
     cleanText(draw?.product_name) ||
     cleanText(config?.banner_title) ||
     (draw?.draw_type === "principal" ? cleanText(principalConfig?.value) : "") ||
-    `Sorteio #${draw.id}`
+    null
   );
 }
 
@@ -103,11 +150,21 @@ async function loadDrawContext(drawId) {
   if (!["principal", "adicional", "secundario"].includes(resolvedType)) {
     throw eventError("email_draw_type_not_allowed", { drawId });
   }
+  const currentDatabaseDrawName = databaseDrawName(
+    { ...draw, draw_type: resolvedType },
+    configResult.rows?.[0],
+    principalConfig
+  );
   return {
     draw: { ...draw, draw_type: resolvedType },
     config: configResult.rows?.[0] || null,
     principalConfig,
-    drawName: drawName({ ...draw, draw_type: resolvedType }, configResult.rows?.[0], principalConfig),
+    databaseDrawName: currentDatabaseDrawName,
+    drawName: resolveDrawDisplayName({
+      drawId,
+      drawType: resolvedType,
+      databaseDrawName: currentDatabaseDrawName,
+    }),
     drawUrl: absoluteDrawUrl(drawId),
   };
 }
@@ -161,27 +218,39 @@ function renderAutomaticTemplate(eventKey, user, context, remainingNumbers) {
     draw_url: context.drawUrl,
     remaining_numbers: remainingNumbers,
   };
+  const subjectParams = {
+    ...params,
+    draw_name: subjectDrawName(params.draw_name),
+  };
+  const htmlParams = {
+    ...params,
+    name: escapeHtml(params.name),
+    draw_name: escapeHtml(params.draw_name),
+    draw_url: escapeHtml(params.draw_url),
+  };
   if (eventKey === "NEW_DRAW_PUBLISHED") {
     return {
-      subject: renderTemplate("Novo sorteio disponível — {{draw_name}}", params),
-      html: `<p>Olá, {{name}}!</p><p>Um novo sorteio está disponível:</p><p><strong>{{draw_name}}</strong></p><p>Acesse para participar:</p><p><a href="{{draw_url}}">{{draw_url}}</a></p><p>Boa sorte!</p><p>Equipe NewStore</p>`.replace(/\{\{(\w+)\}\}/g, (_m, key) => params[key] ?? ""),
+      subject: renderTemplate("Novo sorteio disponível — {{draw_name}}", subjectParams),
+      html: renderTemplate(`<p>Olá, {{name}}!</p><p>Um novo sorteio está disponível:</p><p><strong>{{draw_name}}</strong></p><p>Acesse para participar:</p><p><a href="{{draw_url}}">{{draw_url}}</a></p><p>Boa sorte!</p><p>Equipe NewStore</p>`, htmlParams),
       text: renderTemplate("Olá, {{name}}!\n\nUm novo sorteio está disponível:\n\n{{draw_name}}\n\nAcesse para participar:\n{{draw_url}}\n\nBoa sorte!\n\nEquipe NewStore", params),
       templateKey: "NEW_DRAW_EMAIL",
     };
   }
   if (eventKey === "DRAW_CLOSED") {
+    const closurePrefix = drawClosurePrefix(params.draw_name);
     return {
-      subject: renderTemplate("Sorteio {{draw_name}} encerrado — acompanhe o resultado", params),
-      html: renderTemplate(`<p>Olá, {{name}}!</p><p>O sorteio <strong>{{draw_name}}</strong> foi encerrado.</p><p>O resultado será acompanhado pelo canal oficial da CAIXA no YouTube:</p><p><a href="${CAIXA_URL}">${CAIXA_URL}</a></p><p>O vencedor será o participante que possuir o <strong>último número sorteado da Lotomania</strong>.</p><p>Boa sorte!</p><p>Equipe NewStore</p>`, params),
-      text: renderTemplate(`Olá, {{name}}!\n\nO sorteio {{draw_name}} foi encerrado.\n\nAcompanhe o resultado pelo canal oficial da CAIXA:\n\n${CAIXA_URL}\n\nO vencedor será o participante que possuir o último número sorteado da Lotomania.\n\nBoa sorte!\n\nEquipe NewStore`, params),
+      subject: renderTemplate(`${closurePrefix} {{draw_name}} foi encerrado`, subjectParams),
+      html: renderTemplate(`<p>Olá, {{name}}!</p><p>${closurePrefix} <strong>{{draw_name}}</strong> foi encerrado.</p><p>O resultado será acompanhado pelo canal oficial da CAIXA no YouTube:</p><p><a href="${CAIXA_URL}">${CAIXA_URL}</a></p><p>O vencedor será o participante que possuir o <strong>último número sorteado da Lotomania</strong>.</p><p>Boa sorte!</p><p>Equipe NewStore</p>`, htmlParams),
+      text: renderTemplate(`Olá, {{name}}!\n\n${closurePrefix} {{draw_name}} foi encerrado.\n\nAcompanhe o resultado pelo canal oficial da CAIXA:\n\n${CAIXA_URL}\n\nO vencedor será o participante que possuir o último número sorteado da Lotomania.\n\nBoa sorte!\n\nEquipe NewStore`, params),
       templateKey: "DRAW_CLOSED_EMAIL",
     };
   }
   const threshold = REMAINING_THRESHOLDS.get(eventKey);
+  const emphasis = threshold === 15 ? "apenas " : "";
   return {
-    subject: renderTemplate(`Restam ${threshold} números disponíveis no sorteio {{draw_name}}`, params),
-    html: renderTemplate(`<p>Olá, {{name}}!</p><p>Restam ${threshold} números disponíveis no sorteio {{draw_name}}.</p><p><a href="{{draw_url}}">Acesse o site para escolher seus números</a></p>`, params),
-    text: renderTemplate(`Olá, {{name}}!\n\nRestam ${threshold} números disponíveis no sorteio {{draw_name}}.\n\nAcesse o site para escolher seus números:\n{{draw_url}}`, params),
+    subject: renderTemplate(`Restam ${emphasis}${threshold} números no {{draw_name}}`, subjectParams),
+    html: renderTemplate(`<p>Olá, {{name}}!</p><p>Faltam ${emphasis}${threshold} números para completar o {{draw_name}}.</p><p><a href="{{draw_url}}">Acesse o site para escolher seus números</a></p>`, htmlParams),
+    text: renderTemplate(`Olá, {{name}}!\n\nFaltam ${emphasis}${threshold} números para completar o {{draw_name}}.\n\nAcesse o site para escolher seus números:\n{{draw_url}}`, params),
     templateKey: eventKey,
   };
 }
@@ -244,7 +313,31 @@ export async function handleAutomaticEmailEvent({
     };
   }
 
-  const context = await loadContext(drawId);
+  const loadedContext = await loadContext(drawId);
+  const drawType = cleanText(loadedContext?.draw?.draw_type || metadata?.draw_type).toLowerCase() || "principal";
+  const payloadDrawName = metadata?.draw_name ?? metadata?.product_name ?? null;
+  const databaseNameWasProvided = Object.prototype.hasOwnProperty.call(
+    loadedContext || {},
+    "databaseDrawName"
+  );
+  const currentDatabaseDrawName = databaseNameWasProvided
+    ? loadedContext.databaseDrawName
+    : loadedContext?.drawName;
+  const resolvedDrawName = resolveDrawDisplayName({
+    drawId,
+    drawType,
+    payloadDrawName,
+    databaseDrawName: currentDatabaseDrawName,
+  });
+  const context = { ...loadedContext, drawName: resolvedDrawName };
+  console.log("[email-automation] draw_name_resolved", {
+    draw_id: drawId,
+    draw_type: drawType,
+    payload_draw_name: cleanDisplayText(payloadDrawName) || null,
+    database_draw_name: cleanDisplayText(currentDatabaseDrawName) || null,
+    resolved_draw_name: resolvedDrawName,
+    reference_key: referenceKey,
+  });
   if (key === "DRAW_CLOSED" && !isDrawClosedForEmail(context.draw)) {
     return {
       ok: true,

@@ -22,6 +22,16 @@ export function internalTokenAllowed(req) {
   return Boolean(expected && received && expected === received);
 }
 
+function eventMetadata(body = {}) {
+  const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+    ? { ...body.metadata }
+    : {};
+  for (const key of ["draw_id", "draw_type", "draw_name"]) {
+    if (metadata[key] == null && body[key] != null) metadata[key] = body[key];
+  }
+  return metadata;
+}
+
 export async function handleInternalEmailEventRequest(
   req,
   res,
@@ -34,6 +44,7 @@ export async function handleInternalEmailEventRequest(
   if (!AUTOMATIC_EMAIL_EVENT_KEYS.includes(String(body.event_key || "").trim())) {
     return res.status(400).json({ ok: false, error: "email_event_not_allowed" });
   }
+  const metadata = eventMetadata(body);
   try {
     const result = await eventHandler({
       eventKey: body.event_key,
@@ -41,7 +52,7 @@ export async function handleInternalEmailEventRequest(
       referenceKey: body.reference_key,
       scanId: body.scan_id,
       occurredAt: body.occurred_at,
-      metadata: body.metadata,
+      metadata,
     });
     return res.json(result);
   } catch (error) {
@@ -50,7 +61,7 @@ export async function handleInternalEmailEventRequest(
       message: error?.message || null,
       event_key: body.event_key ?? null,
       reference_key: body.reference_key ?? null,
-      draw_id: body.metadata?.draw_id ?? null,
+      draw_id: metadata.draw_id ?? null,
     });
     return res.status(statusForEmailEventError(error)).json({
       ok: false,

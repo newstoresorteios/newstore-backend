@@ -5,6 +5,7 @@ import {
   handleAutomaticEmailEvent,
   isDrawClosedForEmail,
   loadRecipients,
+  resolveDrawDisplayName,
 } from "../src/services/notifications/automaticEmailNotifications.js";
 import { handleInternalEmailEventRequest } from "../src/routes/internal_email_events.js";
 
@@ -99,26 +100,35 @@ function automaticEmailHarness({
   recipients = users(10),
   drawStatus = "closed",
   closedAt = "2026-07-24T21:00:00.000Z",
+  context = null,
+  remainingNumbers = 15,
   shouldFail = () => false,
   smtpConfigurationError = false,
 } = {}) {
   const acceptedUsers = new Set();
+  const acceptedDispatchKeys = new Set();
   const dispatchUserById = new Map();
+  const dispatchKeyById = new Map();
   const dispatchStatuses = new Map();
   const campaignUpdates = [];
+  const sentMessages = [];
   let smtpCalls = 0;
   let campaignCalls = 0;
   let dispatchSequence = 0;
 
   const dependencies = {
-    async loadDrawContext() {
-      return drawContext(drawStatus, closedAt);
+    async loadDrawContext(drawId) {
+      if (typeof context === "function") return context(drawId);
+      return context || drawContext(drawStatus, closedAt);
     },
     async loadRecipients() {
       return recipients;
     },
-    async alreadyDispatched({ userId }) {
-      return acceptedUsers.has(userId);
+    async loadRemaining() {
+      return remainingNumbers;
+    },
+    async alreadyDispatched({ eventKey, referenceKey, drawId, userId }) {
+      return acceptedDispatchKeys.has(`${eventKey}:${referenceKey}:${drawId}:${userId}`);
     },
     getSmtpConfig() {
       if (smtpConfigurationError) {
@@ -140,6 +150,7 @@ function automaticEmailHarness({
       return {
         async sendMail(message) {
           smtpCalls += 1;
+          sentMessages.push(message);
           if (shouldFail({ attempt: smtpCalls, message })) {
             const error = new Error("mock_smtp_failure");
             error.code = "MOCK_SMTP_FAILURE";
@@ -153,16 +164,21 @@ function automaticEmailHarness({
       campaignCalls += 1;
       return { id: `campaign-${campaignCalls}` };
     },
-    async createDispatch({ userId }) {
+    async createDispatch({ eventKey, userId, drawId, payload }) {
       dispatchSequence += 1;
       const id = `dispatch-${dispatchSequence}`;
       dispatchUserById.set(id, userId);
+      dispatchKeyById.set(
+        id,
+        `${eventKey}:${payload?.reference_key}:${drawId}:${userId}`
+      );
       dispatchStatuses.set(id, "pending");
       return { id };
     },
     async markDispatchAccepted({ dispatchId }) {
       dispatchStatuses.set(dispatchId, "accepted");
       acceptedUsers.add(dispatchUserById.get(dispatchId));
+      acceptedDispatchKeys.add(dispatchKeyById.get(dispatchId));
       return { id: dispatchId, status: "accepted" };
     },
     async markDispatchFailed({ dispatchId }) {
@@ -180,6 +196,7 @@ function automaticEmailHarness({
     acceptedUsers,
     dispatchStatuses,
     campaignUpdates,
+    sentMessages,
     get smtpCalls() {
       return smtpCalls;
     },
@@ -188,6 +205,232 @@ function automaticEmailHarness({
     },
   };
 }
+
+function namedDrawContext({
+  drawId = 145,
+  drawType = "adicional",
+  databaseDrawName = null,
+  status = "open",
+  closedAt = null,
+} = {}) {
+  return {
+    draw: {
+      id: drawId,
+      status,
+      draw_type: drawType,
+      product_name: databaseDrawName,
+      closed_at: closedAt,
+    },
+    databaseDrawName,
+    drawUrl: `https://example.test/?draw_id=${drawId}`,
+  };
+}
+
+function automaticEvent({
+  eventKey = "EMAIL_DRAW_REMAINING_15",
+  drawId = 145,
+  drawType = "adicional",
+  drawName,
+  referenceKey = `additional_draw:${drawId}:email_remaining:15`,
+} = {}) {
+  return {
+    eventKey,
+    referenceType: drawType === "principal" ? "draw" : "additional_draw",
+    referenceKey,
+    metadata: {
+      draw_id: drawId,
+      draw_type: drawType,
+      ...(drawName === undefined ? {} : { draw_name: drawName }),
+    },
+  };
+}
+
+test("nome atual do banco prevalece sobre o nome recebido do engine", () => {
+  assert.equal(
+    resolveDrawDisplayName({
+      drawId: 145,
+      drawType: "adicional",
+      databaseDrawName: "  Sorteio adicional   de créditos  ",
+      payloadDrawName: "Nome antigo",
+    }),
+    "Sorteio adicional de créditos"
+  );
+});
+
+test("banco sem nome usa draw_name recebido do engine", () => {
+  assert.equal(
+    resolveDrawDisplayName({
+      drawId: 145,
+      drawType: "adicional",
+      databaseDrawName: " ",
+      payloadDrawName: "  Vale-compras   New Store ",
+    }),
+    "Vale-compras New Store"
+  );
+});
+
+test("banco e engine sem nome usam fallback por tipo e ID", () => {
+  assert.equal(resolveDrawDisplayName({ drawId: 140, drawType: "principal" }), "Sorteio principal");
+  assert.equal(resolveDrawDisplayName({ drawId: 145, drawType: "adicional" }), "Sorteio adicional #145");
+  assert.equal(resolveDrawDisplayName({ drawId: 146, drawType: "secundario" }), "Sorteio secundário #146");
+});
+
+test("principal, adicional e secundário preservam seus nomes reais", () => {
+  assert.equal(resolveDrawDisplayName({ drawId: 140, drawType: "principal", databaseDrawName: "Relógio Rolex Submariner" }), "Relógio Rolex Submariner");
+  assert.equal(resolveDrawDisplayName({ drawId: 145, drawType: "adicional", databaseDrawName: "Sorteio adicional de créditos" }), "Sorteio adicional de créditos");
+  assert.equal(resolveDrawDisplayName({ drawId: 146, drawType: "secundario", databaseDrawName: "Vale-compras New Store" }), "Vale-compras New Store");
+});
+
+test("assunto e conteúdo usam o nome atual do banco", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: namedDrawContext({ databaseDrawName: "Sorteio adicional de créditos" }),
+      remainingNumbers: 15,
+    });
+    const result = await handleAutomaticEmailEvent(
+      automaticEvent({ drawName: "Nome antigo do engine" }),
+      harness.dependencies
+    );
+
+    assert.equal(result.sent, 1);
+    assert.equal(
+      harness.sentMessages[0].subject,
+      "Restam apenas 15 números no Sorteio adicional de créditos"
+    );
+    assert.match(
+      harness.sentMessages[0].html,
+      /Faltam apenas 15 números para completar o Sorteio adicional de créditos\./
+    );
+    assert.doesNotMatch(harness.sentMessages[0].subject, /Nome antigo/);
+  });
+});
+
+test("evento de 50 números usa o nome real no assunto", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: namedDrawContext({ databaseDrawName: "Relógio Rolex Submariner" }),
+      remainingNumbers: 50,
+    });
+    await handleAutomaticEmailEvent(automaticEvent({
+      eventKey: "EMAIL_DRAW_REMAINING_50",
+      referenceKey: "additional_draw:145:email_remaining:50",
+    }), harness.dependencies);
+
+    assert.equal(
+      harness.sentMessages[0].subject,
+      "Restam 50 números no Relógio Rolex Submariner"
+    );
+  });
+});
+
+test("nome recebido do engine é usado quando o banco não possui nome", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: namedDrawContext({ databaseDrawName: null }),
+    });
+    await handleAutomaticEmailEvent(
+      automaticEvent({ drawName: "Vale-compras New Store" }),
+      harness.dependencies
+    );
+
+    assert.match(harness.sentMessages[0].subject, /Vale-compras New Store/);
+    assert.match(harness.sentMessages[0].text, /Vale-compras New Store/);
+  });
+});
+
+test("evento antigo sem draw_name continua funcionando com fallback", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: namedDrawContext({ databaseDrawName: null }),
+    });
+    const result = await handleAutomaticEmailEvent(
+      automaticEvent({ drawName: undefined }),
+      harness.dependencies
+    );
+
+    assert.equal(result.sent, 1);
+    assert.match(harness.sentMessages[0].subject, /Sorteio adicional #145/);
+  });
+});
+
+test("assunto de encerramento usa o nome real sem duplicar a palavra sorteio", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: namedDrawContext({
+        drawId: 140,
+        drawType: "principal",
+        databaseDrawName: "Relógio Rolex Submariner",
+        status: "closed",
+        closedAt: "2026-07-24T21:00:00.000Z",
+      }),
+    });
+    await handleAutomaticEmailEvent({
+      ...DRAW_CLOSED_EVENT,
+      metadata: { draw_id: 140, draw_type: "principal" },
+      referenceKey: "draw:140:closed_email",
+    }, harness.dependencies);
+
+    assert.equal(harness.sentMessages[0].subject, "O sorteio Relógio Rolex Submariner foi encerrado");
+    assert.match(harness.sentMessages[0].html, /O sorteio <strong>Relógio Rolex Submariner<\/strong> foi encerrado\./);
+  });
+});
+
+test("acentos e caracteres especiais são preservados e HTML do nome é escapado", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const unsafeName = `<script>alert("x")</script> Créditos & Prêmios`;
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: namedDrawContext({ databaseDrawName: unsafeName }),
+    });
+    await handleAutomaticEmailEvent(automaticEvent(), harness.dependencies);
+
+    assert.match(harness.sentMessages[0].subject, /Créditos & Prêmios/);
+    assert.doesNotMatch(harness.sentMessages[0].html, /<script>/i);
+    assert.match(harness.sentMessages[0].html, /&lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt; Créditos &amp; Prêmios/);
+  });
+});
+
+test("renomear sorteio não altera a deduplicação do mesmo evento", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    let contextCalls = 0;
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: () => namedDrawContext({
+        databaseDrawName: contextCalls++ === 0 ? "Nome anterior" : "Nome atualizado",
+      }),
+    });
+    const event = automaticEvent();
+    const first = await handleAutomaticEmailEvent(event, harness.dependencies);
+    const second = await handleAutomaticEmailEvent(event, harness.dependencies);
+
+    assert.equal(first.sent, 1);
+    assert.equal(second.status, "deduped");
+    assert.equal(harness.smtpCalls, 1);
+  });
+});
+
+test("dois sorteios com o mesmo nome não se confundem na deduplicação", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: (drawId) => namedDrawContext({
+        drawId,
+        databaseDrawName: "Vale-compras New Store",
+      }),
+    });
+    const first = await handleAutomaticEmailEvent(automaticEvent({ drawId: 145 }), harness.dependencies);
+    const second = await handleAutomaticEmailEvent(automaticEvent({ drawId: 146 }), harness.dependencies);
+
+    assert.equal(first.sent, 1);
+    assert.equal(second.sent, 1);
+    assert.equal(harness.smtpCalls, 2);
+  });
+});
 
 test("DRAW_CLOSED usa closed_at mesmo depois de o draw virar sorteado", () => {
   assert.equal(
@@ -462,5 +705,37 @@ test("payload interno inválido não inicia campanha nem SMTP", async () => {
     assert.equal(res.statusCode, 400);
     assert.deepEqual(res.body, { ok: false, error: "email_event_not_allowed" });
     assert.equal(handlerCalls, 0);
+  });
+});
+
+test("rota interna aceita draw_name opcional no payload sem alterar os identificadores", async () => {
+  await withEnv("PUSH_INTERNAL_EVENTS_TOKEN", "expected-token", async () => {
+    let receivedEvent = null;
+    const req = {
+      body: {
+        event_key: "EMAIL_DRAW_REMAINING_15",
+        reference_key: "additional_draw:145:email_remaining:15",
+        draw_id: 145,
+        draw_type: "adicional",
+        draw_name: "Sorteio adicional de créditos",
+      },
+      get() {
+        return "expected-token";
+      },
+    };
+    const res = fakeResponse();
+
+    await handleInternalEmailEventRequest(req, res, async (event) => {
+      receivedEvent = event;
+      return { ok: true, status: "processed" };
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(receivedEvent.referenceKey, "additional_draw:145:email_remaining:15");
+    assert.deepEqual(receivedEvent.metadata, {
+      draw_id: 145,
+      draw_type: "adicional",
+      draw_name: "Sorteio adicional de créditos",
+    });
   });
 });
