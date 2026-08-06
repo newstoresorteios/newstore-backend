@@ -118,8 +118,14 @@ export function buildBalanceReferenceKey({ userId, expiresOn, eventKey }) {
 
 export async function loadBalanceExpiryContext(userId, runQuery = query) {
   const result = await runQuery(
+    // expires_on é cast para texto no próprio SQL: a coluna é DATE (sem
+    // fuso), e o driver pg parseia DATE como objeto Date ancorado no fuso
+    // local do processo Node. Em produção isso vira meia-noite UTC, que a
+    // conversão via Intl "America/Sao_Paulo" mais adiante recua um dia.
+    // Trazer como texto evita que a data civil passe por qualquer
+    // conversão de fuso.
     `SELECT user_id, name, email, balance_cents, balance_reference_at,
-            expires_at, expires_on, days_to_expire, expiry_source
+            expires_at, expires_on::text AS expires_on, days_to_expire, expiry_source
        FROM public.user_coupon_balance_expiry
       WHERE user_id = $1
       LIMIT 1`,
@@ -128,7 +134,28 @@ export async function loadBalanceExpiryContext(userId, runQuery = query) {
   return result.rows?.[0] || null;
 }
 
-async function alreadyBalanceDispatched({ eventKey, referenceKey, userId }, runQuery = query) {
+// Aritmética de calendário pura em UTC, usada só para deduplicar contra a
+// chave legada (um dia a menos) de envios já aceitos antes desta correção.
+// Nunca interpreta expires_on como instante/fuso — apenas desloca o rótulo
+// de data em um dia dentro do calendário proléptico.
+export function previousCalendarDateKey(dateKey) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(cleanText(dateKey));
+  if (!match) return null;
+  const [, yearStr, monthStr, dayStr] = match;
+  const previous = new Date(Date.UTC(Number(yearStr), Number(monthStr) - 1, Number(dayStr) - 1));
+  const yyyy = previous.getUTCFullYear();
+  const mm = String(previous.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(previous.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+async function alreadyBalanceDispatched(
+  { eventKey, referenceKey, legacyReferenceKey, userId },
+  runQuery = query
+) {
+  const candidateKeys = legacyReferenceKey && legacyReferenceKey !== referenceKey
+    ? [referenceKey, legacyReferenceKey]
+    : [referenceKey];
   const result = await runQuery(
     `SELECT 1
        FROM public.notification_dispatches
@@ -138,10 +165,10 @@ async function alreadyBalanceDispatched({ eventKey, referenceKey, userId }, runQ
         AND draw_id IS NULL
         AND payload->>'source' = 'automation'
         AND payload->>'automation' = 'true'
-        AND payload->>'reference_key' = $3
+        AND payload->>'reference_key' = ANY($3::text[])
         AND status NOT IN ('failed', 'skipped')
       LIMIT 1`,
-    [eventKey, userId, referenceKey]
+    [eventKey, userId, candidateKeys]
   );
   return Boolean(result.rowCount);
 }
@@ -325,6 +352,14 @@ export async function handleAutomaticBalanceEmailEvent({
   }
 
   const referenceKey = buildBalanceReferenceKey({ userId, expiresOn: context.expires_on, eventKey: key });
+  // Compatibilidade temporária: dispatches aceitos antes da correção do
+  // parsing de expires_on foram gravados com a chave um dia anterior. Não
+  // reenviar esses três e-mails só porque a chave histórica ficou errada.
+  const legacyReferenceKey = buildBalanceReferenceKey({
+    userId,
+    expiresOn: previousCalendarDateKey(context.expires_on),
+    eventKey: key,
+  });
   if (!referenceKey) {
     return skippedResult({
       eventKey: key,
@@ -364,7 +399,7 @@ export async function handleAutomaticBalanceEmailEvent({
     stage,
   };
   console.log("[email-balance-automation] validated", logContext);
-  if (await wasAlreadyDispatched({ eventKey: key, referenceKey, drawId: null, userId })) {
+  if (await wasAlreadyDispatched({ eventKey: key, referenceKey, legacyReferenceKey, drawId: null, userId })) {
     console.log("[email-balance-automation] deduped", {
       ...logContext,
       status: "deduped",

@@ -17,6 +17,7 @@ import {
   formatBalanceExpiryDate,
   formatBalanceValue,
   loadBalanceExpiryContext,
+  previousCalendarDateKey,
 } from "../src/services/notifications/automaticBalanceEmailNotifications.js";
 import { handleInternalEmailEventRequest } from "../src/routes/internal_email_events.js";
 
@@ -145,8 +146,12 @@ function automaticEmailHarness({
     async loadBalanceContext() {
       return typeof balanceContext === "function" ? balanceContext() : balanceContext;
     },
-    async alreadyDispatched({ eventKey, referenceKey, drawId, userId }) {
-      return acceptedDispatchKeys.has(`${eventKey}:${referenceKey}:${drawId}:${userId}`);
+    async alreadyDispatched({ eventKey, referenceKey, legacyReferenceKey, drawId, userId }) {
+      if (acceptedDispatchKeys.has(`${eventKey}:${referenceKey}:${drawId}:${userId}`)) return true;
+      if (legacyReferenceKey && acceptedDispatchKeys.has(`${eventKey}:${legacyReferenceKey}:${drawId}:${userId}`)) {
+        return true;
+      }
+      return false;
     },
     getSmtpConfig() {
       if (smtpConfigurationError) {
@@ -728,6 +733,121 @@ test("view canônica é consultada por user_id e não por e-mail", async () => {
   assert.match(capturedSql, /WHERE user_id = \$1/);
   assert.doesNotMatch(capturedSql, /WHERE email/);
   assert.deepEqual(capturedParams, [123]);
+});
+
+test("expires_on é trazido como texto pelo SQL (sem virar objeto Date sujeito a fuso)", async () => {
+  let capturedSql = null;
+  await loadBalanceExpiryContext(326, async (sql) => {
+    capturedSql = sql;
+    return { rows: [] };
+  });
+  assert.match(capturedSql, /expires_on::text/);
+});
+
+test("expires_on = 2026-08-09 permanece 2026-08-09", () => {
+  assert.equal(formatBalanceExpiryDate("2026-08-09").split("/").reverse().join("-"), "2026-08-09");
+});
+
+test("reference key não recua um dia (caso real user 326)", () => {
+  const referenceKey = buildBalanceReferenceKey({
+    userId: 326,
+    expiresOn: "2026-08-09",
+    eventKey: "EMAIL_BALANCE_EXPIRING_3_DAYS",
+  });
+  assert.equal(referenceKey, "user_balance:326:expires:2026-08-09:email:3_days");
+  assert.notEqual(referenceKey, "user_balance:326:expires:2026-08-08:email:3_days");
+});
+
+test("data brasileira aparece como 09/08/2026", () => {
+  assert.equal(formatBalanceExpiryDate("2026-08-09"), "09/08/2026");
+});
+
+test("expires_at em UTC não substitui expires_on quando ambos estão presentes", () => {
+  // 2026-08-09T02:00:00Z equivale a 2026-08-08 23:00 em America/Sao_Paulo:
+  // se o texto do e-mail usasse expires_at como fonte, sairia 08/08/2026.
+  const context = { expires_on: "2026-08-09", expires_at: "2026-08-09T02:00:00.000Z" };
+  assert.equal(formatBalanceExpiryDate(context.expires_on || context.expires_at), "09/08/2026");
+});
+
+test("previousCalendarDateKey desloca um dia por aritmética de calendário pura, sem fuso", () => {
+  assert.equal(previousCalendarDateKey("2026-08-09"), "2026-08-08");
+  assert.equal(previousCalendarDateKey("2026-08-01"), "2026-07-31");
+  assert.equal(previousCalendarDateKey("2027-01-01"), "2026-12-31");
+});
+
+for (const [userId, expiresOn, daysToExpire, eventKey, referenceStage] of [
+  [326, "2026-08-09", 3, "EMAIL_BALANCE_EXPIRING_3_DAYS", "3_days"],
+  [284, "2026-08-26", 20, "EMAIL_BALANCE_EXPIRING_20_DAYS", "20_days"],
+  [315, "2026-09-05", 30, "EMAIL_BALANCE_EXPIRING_30_DAYS", "30_days"],
+]) {
+  test(`usuário ${userId} permanece no estágio ${referenceStage} com a data canônica correta`, async () => {
+    const harness = automaticEmailHarness({
+      balanceContext: currentBalanceContext({ userId, expiresOn, daysToExpire }),
+    });
+    await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+      const result = await handleAutomaticEmailEvent(balanceEvent({ userId, eventKey }), harness.dependencies);
+      assert.equal(result.status, "processed");
+      assert.equal(result.reference_key, `user_balance:${userId}:expires:${expiresOn}:email:${referenceStage}`);
+    });
+  });
+}
+
+test("dispatch histórico com a chave anterior (um dia a menos) é deduplicado e não reenvia", async () => {
+  const harness = automaticEmailHarness({
+    balanceContext: currentBalanceContext({ userId: 326, expiresOn: "2026-08-09", daysToExpire: 3, balanceCents: 22000 }),
+  });
+  const legacyReferenceKey = "user_balance:326:expires:2026-08-08:email:3_days";
+  const seeded = await harness.dependencies.createDispatch({
+    eventKey: "EMAIL_BALANCE_EXPIRING_3_DAYS",
+    userId: 326,
+    drawId: null,
+    payload: { reference_key: legacyReferenceKey },
+  });
+  await harness.dependencies.markDispatchAccepted({ dispatchId: seeded.id, result: { ok: true } });
+
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const result = await handleAutomaticEmailEvent(
+      balanceEvent({ userId: 326, eventKey: "EMAIL_BALANCE_EXPIRING_3_DAYS" }),
+      harness.dependencies
+    );
+    assert.equal(result.status, "deduped");
+  });
+  assert.equal(harness.smtpCalls, 0);
+});
+
+test("retry após a correção não gera novo envio para dispatch histórico legado", async () => {
+  const harness = automaticEmailHarness({
+    balanceContext: currentBalanceContext({ userId: 284, expiresOn: "2026-08-26", daysToExpire: 20, balanceCents: 38500 }),
+  });
+  const legacyReferenceKey = "user_balance:284:expires:2026-08-25:email:20_days";
+  const seeded = await harness.dependencies.createDispatch({
+    eventKey: "EMAIL_BALANCE_EXPIRING_20_DAYS",
+    userId: 284,
+    drawId: null,
+    payload: { reference_key: legacyReferenceKey },
+  });
+  await harness.dependencies.markDispatchAccepted({ dispatchId: seeded.id, result: { ok: true } });
+
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await handleAutomaticEmailEvent(
+        balanceEvent({ userId: 284, eventKey: "EMAIL_BALANCE_EXPIRING_20_DAYS" }),
+        harness.dependencies
+      );
+      assert.equal(result.status, "deduped");
+    }
+  });
+  assert.equal(harness.smtpCalls, 0);
+});
+
+test("eventos de sorteio permanecem intactos após a correção da data de saldo", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness();
+    const result = await handleAutomaticEmailEvent(DRAW_CLOSED_EVENT, harness.dependencies);
+    assert.equal(result.status, "processed");
+    assert.equal(result.sent, 10);
+    assert.equal(result.failed, 0);
+  });
 });
 
 test("migration centraliza seis meses e não usa fallback móvel com NOW", async () => {
