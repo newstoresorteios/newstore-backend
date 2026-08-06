@@ -1,12 +1,23 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   handleAutomaticEmailEvent,
   isDrawClosedForEmail,
+  loadDrawContext,
   loadRecipients,
   resolveDrawDisplayName,
+  resolveDrawTypeLabel,
 } from "../src/services/notifications/automaticEmailNotifications.js";
+import {
+  balanceStageMatches,
+  buildBalanceReferenceKey,
+  expiredBalanceIsEligible,
+  formatBalanceExpiryDate,
+  formatBalanceValue,
+  loadBalanceExpiryContext,
+} from "../src/services/notifications/automaticBalanceEmailNotifications.js";
 import { handleInternalEmailEventRequest } from "../src/routes/internal_email_events.js";
 
 const DRAW_CLOSED_EVENT = {
@@ -102,6 +113,7 @@ function automaticEmailHarness({
   closedAt = "2026-07-24T21:00:00.000Z",
   context = null,
   remainingNumbers = 15,
+  balanceContext = null,
   shouldFail = () => false,
   smtpConfigurationError = false,
 } = {}) {
@@ -111,6 +123,9 @@ function automaticEmailHarness({
   const dispatchKeyById = new Map();
   const dispatchStatuses = new Map();
   const campaignUpdates = [];
+  const campaigns = [];
+  const dispatches = [];
+  const acceptedResults = [];
   const sentMessages = [];
   let smtpCalls = 0;
   let campaignCalls = 0;
@@ -126,6 +141,9 @@ function automaticEmailHarness({
     },
     async loadRemaining() {
       return remainingNumbers;
+    },
+    async loadBalanceContext() {
+      return typeof balanceContext === "function" ? balanceContext() : balanceContext;
     },
     async alreadyDispatched({ eventKey, referenceKey, drawId, userId }) {
       return acceptedDispatchKeys.has(`${eventKey}:${referenceKey}:${drawId}:${userId}`);
@@ -160,13 +178,16 @@ function automaticEmailHarness({
         },
       };
     },
-    async createCampaign() {
+    async createCampaign(input) {
       campaignCalls += 1;
+      campaigns.push(input);
       return { id: `campaign-${campaignCalls}` };
     },
-    async createDispatch({ eventKey, userId, drawId, payload }) {
+    async createDispatch(input) {
+      const { eventKey, userId, drawId, payload } = input;
       dispatchSequence += 1;
       const id = `dispatch-${dispatchSequence}`;
+      dispatches.push({ ...input, id });
       dispatchUserById.set(id, userId);
       dispatchKeyById.set(
         id,
@@ -175,8 +196,9 @@ function automaticEmailHarness({
       dispatchStatuses.set(id, "pending");
       return { id };
     },
-    async markDispatchAccepted({ dispatchId }) {
+    async markDispatchAccepted({ dispatchId, result }) {
       dispatchStatuses.set(dispatchId, "accepted");
+      acceptedResults.push(result);
       acceptedUsers.add(dispatchUserById.get(dispatchId));
       acceptedDispatchKeys.add(dispatchKeyById.get(dispatchId));
       return { id: dispatchId, status: "accepted" };
@@ -196,6 +218,9 @@ function automaticEmailHarness({
     acceptedUsers,
     dispatchStatuses,
     campaignUpdates,
+    campaigns,
+    dispatches,
+    acceptedResults,
     sentMessages,
     get smtpCalls() {
       return smtpCalls;
@@ -245,6 +270,47 @@ function automaticEvent({
   };
 }
 
+function currentBalanceContext({
+  userId = 123,
+  name = "Maria Cliente",
+  email = "maria@example.test",
+  balanceCents = 15000,
+  expiresOn = "2026-09-05",
+  daysToExpire = 30,
+  expirySource = "last_approved_purchase",
+  balanceReferenceAt = "2026-03-05T15:00:00.000Z",
+} = {}) {
+  return {
+    user_id: userId,
+    name,
+    email,
+    balance_cents: balanceCents,
+    balance_reference_at: balanceReferenceAt,
+    expires_at: expiresOn ? `${expiresOn}T03:00:00.000Z` : null,
+    expires_on: expiresOn,
+    days_to_expire: daysToExpire,
+    expiry_source: expirySource,
+  };
+}
+
+function balanceEvent({
+  eventKey = "EMAIL_BALANCE_EXPIRING_30_DAYS",
+  userId = 123,
+  referenceKey = "engine-reference-is-not-authoritative",
+} = {}) {
+  return {
+    eventKey,
+    referenceType: "user_balance",
+    referenceKey,
+    metadata: {
+      user_id: userId,
+      balance_cents: 1,
+      expires_at: "2000-01-01T00:00:00.000Z",
+      days_to_expire: -999,
+    },
+  };
+}
+
 test("nome atual do banco prevalece sobre o nome recebido do engine", () => {
   assert.equal(
     resolveDrawDisplayName({
@@ -270,7 +336,7 @@ test("banco sem nome usa draw_name recebido do engine", () => {
 });
 
 test("banco e engine sem nome usam fallback por tipo e ID", () => {
-  assert.equal(resolveDrawDisplayName({ drawId: 140, drawType: "principal" }), "Sorteio principal");
+  assert.equal(resolveDrawDisplayName({ drawId: 140, drawType: "principal" }), "Sorteio principal #140");
   assert.equal(resolveDrawDisplayName({ drawId: 145, drawType: "adicional" }), "Sorteio adicional #145");
   assert.equal(resolveDrawDisplayName({ drawId: 146, drawType: "secundario" }), "Sorteio secundário #146");
 });
@@ -279,6 +345,36 @@ test("principal, adicional e secundário preservam seus nomes reais", () => {
   assert.equal(resolveDrawDisplayName({ drawId: 140, drawType: "principal", databaseDrawName: "Relógio Rolex Submariner" }), "Relógio Rolex Submariner");
   assert.equal(resolveDrawDisplayName({ drawId: 145, drawType: "adicional", databaseDrawName: "Sorteio adicional de créditos" }), "Sorteio adicional de créditos");
   assert.equal(resolveDrawDisplayName({ drawId: 146, drawType: "secundario", databaseDrawName: "Vale-compras New Store" }), "Vale-compras New Store");
+});
+
+test("contexto do sorteio consulta product_name e usa banner_title distinto como descrição", async () => {
+  const context = await loadDrawContext(145, async (sql, params) => {
+    if (/FROM public\.draws/.test(sql)) {
+      assert.deepEqual(params, [145]);
+      return {
+        rows: [{
+          id: 145,
+          status: "open",
+          draw_type: "adicional",
+          product_name: "R$ 2.500 em compras no site",
+          product_link: null,
+          opened_at: "2026-08-01T00:00:00.000Z",
+          closed_at: null,
+        }],
+      };
+    }
+    if (/FROM public\.app_config_new/.test(sql)) {
+      assert.deepEqual(params, ["145"]);
+      return { rows: [{ id: "145", banner_title: "Vale-compras para usar na New Store" }] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  });
+
+  assert.equal(context.drawName, "R$ 2.500 em compras no site");
+  assert.equal(context.drawDescription, "Vale-compras para usar na New Store");
+  assert.equal(context.drawTypeLabel, "Sorteio adicional");
+  assert.equal(context.drawDisplayTitle, "Sorteio adicional — R$ 2.500 em compras no site");
+  assert.equal(context.drawStatusLabel, "Aberto");
 });
 
 test("assunto e conteúdo usam o nome atual do banco", async () => {
@@ -296,11 +392,11 @@ test("assunto e conteúdo usam o nome atual do banco", async () => {
     assert.equal(result.sent, 1);
     assert.equal(
       harness.sentMessages[0].subject,
-      "Restam apenas 15 números no Sorteio adicional de créditos"
+      "Restam 15 números no sorteio adicional — Sorteio adicional de créditos"
     );
     assert.match(
       harness.sentMessages[0].html,
-      /Faltam apenas 15 números para completar o Sorteio adicional de créditos\./
+      /Restam <strong>15 números<\/strong> no Sorteio adicional — Sorteio adicional de créditos\./
     );
     assert.doesNotMatch(harness.sentMessages[0].subject, /Nome antigo/);
   });
@@ -320,7 +416,7 @@ test("evento de 50 números usa o nome real no assunto", async () => {
 
     assert.equal(
       harness.sentMessages[0].subject,
-      "Restam 50 números no Relógio Rolex Submariner"
+      "Restam 50 números no sorteio adicional — Relógio Rolex Submariner"
     );
   });
 });
@@ -357,7 +453,7 @@ test("evento antigo sem draw_name continua funcionando com fallback", async () =
   });
 });
 
-test("assunto de encerramento usa o nome real sem duplicar a palavra sorteio", async () => {
+test("assunto de encerramento distingue tipo e usa o nome real", async () => {
   await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
     const harness = automaticEmailHarness({
       recipients: users(1),
@@ -375,8 +471,8 @@ test("assunto de encerramento usa o nome real sem duplicar a palavra sorteio", a
       referenceKey: "draw:140:closed_email",
     }, harness.dependencies);
 
-    assert.equal(harness.sentMessages[0].subject, "O sorteio Relógio Rolex Submariner foi encerrado");
-    assert.match(harness.sentMessages[0].html, /O sorteio <strong>Relógio Rolex Submariner<\/strong> foi encerrado\./);
+    assert.equal(harness.sentMessages[0].subject, "Sorteio principal — Relógio Rolex Submariner — encerrado");
+    assert.match(harness.sentMessages[0].html, /O <strong>Sorteio principal — Relógio Rolex Submariner<\/strong> foi encerrado\./);
   });
 });
 
@@ -428,6 +524,283 @@ test("dois sorteios com o mesmo nome não se confundem na deduplicação", async
 
     assert.equal(first.sent, 1);
     assert.equal(second.sent, 1);
+    assert.equal(harness.smtpCalls, 2);
+  });
+});
+
+const BALANCE_STAGE_CASES = [
+  ["EMAIL_BALANCE_EXPIRING_30_DAYS", 30, "Seu saldo de R$ 150,00 vence em 30 dias"],
+  ["EMAIL_BALANCE_EXPIRING_20_DAYS", 20, "Faltam 20 dias para usar seu saldo de R$ 150,00"],
+  ["EMAIL_BALANCE_EXPIRING_10_DAYS", 10, "Atenção: seu saldo vence em 10 dias"],
+  ["EMAIL_BALANCE_EXPIRING_7_DAYS", 7, "Seu saldo vence em 7 dias"],
+  ["EMAIL_BALANCE_EXPIRING_3_DAYS", 3, "Últimos 3 dias para usar seu saldo de R$ 150,00"],
+];
+
+for (const [eventKey, daysToExpire, expectedSubject] of BALANCE_STAGE_CASES) {
+  test(`${eventKey} envia somente para o usuário do saldo`, async () => {
+    await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+      const harness = automaticEmailHarness({
+        balanceContext: currentBalanceContext({ daysToExpire }),
+      });
+      const result = await handleAutomaticEmailEvent(balanceEvent({ eventKey }), harness.dependencies);
+
+      assert.equal(result.status, "processed");
+      assert.equal(result.sent, 1);
+      assert.equal(harness.smtpCalls, 1);
+      assert.equal(harness.sentMessages[0].to, "maria@example.test");
+      assert.equal(harness.sentMessages[0].subject, expectedSubject);
+      assert.match(harness.sentMessages[0].html, /05\/09\/2026/);
+      assert.match(harness.sentMessages[0].text, /R\$ 150,00/);
+    });
+  });
+}
+
+test("EMAIL_BALANCE_EXPIRED envia quando o vencimento respeita effective_from", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    await withEnv("EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM", "2026-09-01", async () => {
+      await withEnv("EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED", undefined, async () => {
+        const harness = automaticEmailHarness({
+          balanceContext: currentBalanceContext({ daysToExpire: -1 }),
+        });
+        const result = await handleAutomaticEmailEvent(
+          balanceEvent({ eventKey: "EMAIL_BALANCE_EXPIRED" }),
+          harness.dependencies
+        );
+
+        assert.equal(result.status, "processed");
+        assert.equal(harness.sentMessages[0].subject, "O prazo do seu saldo de R$ 150,00 terminou");
+        assert.match(harness.sentMessages[0].text, /terminou em 05\/09\/2026/);
+      });
+    });
+  });
+});
+
+test("evento de saldo sem saldo atual é ignorado", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({ balanceContext: null });
+    const result = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+    assert.equal(result.status, "skipped");
+    assert.equal(result.reason, "balance_not_positive");
+    assert.equal(harness.smtpCalls, 0);
+  });
+});
+
+for (const email of [null, "email-invalido"]) {
+  test(`evento de saldo rejeita destinatário ${email === null ? "sem e-mail" : "com e-mail inválido"}`, async () => {
+    await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+      const harness = automaticEmailHarness({
+        balanceContext: currentBalanceContext({ email }),
+      });
+      const result = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+      assert.equal(result.status, "skipped");
+      assert.equal(result.reason, "balance_email_invalid");
+      assert.equal(harness.smtpCalls, 0);
+    });
+  });
+}
+
+test("usuário sem fonte determinística de vencimento é auditado e não recebe e-mail", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      balanceContext: currentBalanceContext({
+        expiresOn: null,
+        daysToExpire: null,
+        expirySource: null,
+        balanceReferenceAt: null,
+      }),
+    });
+    const result = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+    assert.equal(result.status, "skipped");
+    assert.equal(result.reason, "balance_expiry_source_missing");
+    assert.equal(harness.smtpCalls, 0);
+  });
+});
+
+test("estágio recebido diferente do vencimento atual é ignorado", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      balanceContext: currentBalanceContext({ daysToExpire: 20 }),
+    });
+    const result = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+    assert.equal(result.status, "skipped");
+    assert.equal(result.reason, "balance_stage_mismatch");
+    assert.equal(harness.smtpCalls, 0);
+  });
+});
+
+test("deduplicação de saldo usa usuário, data de vencimento e estágio com draw_id nulo", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      balanceContext: currentBalanceContext(),
+    });
+    const first = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+    const second = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+
+    assert.equal(first.reference_key, "user_balance:123:expires:2026-09-05:email:30_days");
+    assert.equal(second.status, "deduped");
+    assert.equal(harness.smtpCalls, 1);
+    assert.equal(harness.dispatches[0].drawId, null);
+  });
+});
+
+test("nova data de validade permite uma nova sequência para o mesmo usuário", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    let expiresOn = "2026-09-05";
+    const harness = automaticEmailHarness({
+      balanceContext: () => currentBalanceContext({ expiresOn }),
+    });
+    const first = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+    expiresOn = "2026-10-05";
+    const second = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+
+    assert.equal(first.sent, 1);
+    assert.equal(second.sent, 1);
+    assert.notEqual(first.reference_key, second.reference_key);
+    assert.equal(harness.smtpCalls, 2);
+  });
+});
+
+test("vencido anterior ao effective_from é ignorado com backfill desativado por padrão", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    await withEnv("EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM", "2026-10-01", async () => {
+      await withEnv("EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED", undefined, async () => {
+        const harness = automaticEmailHarness({
+          balanceContext: currentBalanceContext({ daysToExpire: -20 }),
+        });
+        const result = await handleAutomaticEmailEvent(
+          balanceEvent({ eventKey: "EMAIL_BALANCE_EXPIRED" }),
+          harness.dependencies
+        );
+        assert.equal(result.status, "skipped");
+        assert.equal(result.reason, "balance_expired_before_effective_from");
+        assert.equal(harness.smtpCalls, 0);
+      });
+    });
+  });
+});
+
+test("backfill de vencidos exige ativação explícita", async () => {
+  await withEnv("EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM", undefined, async () => {
+    await withEnv("EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED", undefined, async () => {
+      assert.equal(expiredBalanceIsEligible("2026-09-05"), false);
+    });
+    await withEnv("EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED", "true", async () => {
+      assert.equal(expiredBalanceIsEligible("2026-09-05"), true);
+    });
+  });
+});
+
+test("campanha de saldo registra audiência unitária e snapshots canônicos", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({ balanceContext: currentBalanceContext() });
+    await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+
+    assert.equal(harness.campaigns[0].audienceCountExpected, 1);
+    assert.equal(harness.campaigns[0].audienceFilter, "specific_user");
+    assert.equal(harness.campaigns[0].payload.balance_cents, 15000);
+    assert.equal(harness.campaigns[0].payload.expires_date, "05/09/2026");
+    assert.equal(harness.dispatches[0].userId, 123);
+    assert.equal(harness.dispatches[0].drawId, null);
+    assert.equal(harness.acceptedResults[0].delivery_status, "unknown");
+  });
+});
+
+test("formatadores de saldo usam reais e data brasileira", () => {
+  assert.equal(formatBalanceValue(15000), "R$ 150,00");
+  assert.equal(formatBalanceExpiryDate("2026-09-05"), "05/09/2026");
+  assert.equal(balanceStageMatches("EMAIL_BALANCE_EXPIRING_7_DAYS", 7), true);
+  assert.equal(balanceStageMatches("EMAIL_BALANCE_EXPIRED", -1), true);
+  assert.equal(
+    buildBalanceReferenceKey({ userId: 123, expiresOn: "2026-09-05", eventKey: "EMAIL_BALANCE_EXPIRING_3_DAYS" }),
+    "user_balance:123:expires:2026-09-05:email:3_days"
+  );
+});
+
+test("view canônica é consultada por user_id e não por e-mail", async () => {
+  let capturedSql = null;
+  let capturedParams = null;
+  await loadBalanceExpiryContext(123, async (sql, params) => {
+    capturedSql = sql;
+    capturedParams = params;
+    return { rows: [] };
+  });
+  assert.match(capturedSql, /public\.user_coupon_balance_expiry/);
+  assert.match(capturedSql, /WHERE user_id = \$1/);
+  assert.doesNotMatch(capturedSql, /WHERE email/);
+  assert.deepEqual(capturedParams, [123]);
+});
+
+test("migration centraliza seis meses e não usa fallback móvel com NOW", async () => {
+  const sql = await readFile(new URL("../src/migrations/027_user_coupon_balance_expiry.sql", import.meta.url), "utf8");
+  assert.match(sql, /INTERVAL '6 months'/);
+  assert.match(sql, /America\/Sao_Paulo/g);
+  assert.match(sql, /coupon_value_cents/);
+  assert.doesNotMatch(sql, /COALESCE\([^)]*NOW\(\)[^)]*\)\s*\+\s*INTERVAL '6 months'/i);
+});
+
+for (const [drawType, expectedLabel] of [
+  ["principal", "Sorteio principal"],
+  ["adicional", "Sorteio adicional"],
+  ["secundario", "Sorteio secundário"],
+]) {
+  test(`${drawType} usa label, nome, descrição e situação atuais`, async () => {
+    await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+      const harness = automaticEmailHarness({
+        recipients: users(1),
+        context: {
+          ...namedDrawContext({ drawType, databaseDrawName: "Prêmio atual" }),
+          drawDescription: "Descrição atual do banco",
+          drawStatusLabel: "Aberto",
+        },
+        remainingNumbers: 15,
+      });
+      await handleAutomaticEmailEvent(automaticEvent({ drawType }), harness.dependencies);
+
+      assert.equal(resolveDrawTypeLabel(drawType), expectedLabel);
+      assert.match(harness.sentMessages[0].subject, new RegExp(expectedLabel.toLocaleLowerCase("pt-BR")));
+      assert.match(harness.sentMessages[0].html, /Prêmio atual/);
+      assert.match(harness.sentMessages[0].html, /Descrição atual do banco/);
+      assert.match(harness.sentMessages[0].html, /Situação:<\/strong> Aberto/);
+      assert.equal(harness.campaigns[0].payload.draw_type_label, expectedLabel);
+      assert.equal(harness.dispatches[0].payload.draw_description, "Descrição atual do banco");
+    });
+  });
+}
+
+test("nome atualizado no banco aparece no próximo evento sem alterar reference_key", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    let name = "Nome antigo";
+    const harness = automaticEmailHarness({
+      recipients: users(1),
+      context: () => namedDrawContext({ databaseDrawName: name }),
+    });
+    const first = await handleAutomaticEmailEvent(automaticEvent(), harness.dependencies);
+    name = "Nome atual do banco";
+    const second = await handleAutomaticEmailEvent(
+      automaticEvent({ referenceKey: "additional_draw:145:email_remaining:15:new-cycle" }),
+      harness.dependencies
+    );
+
+    assert.equal(first.reference_key, "additional_draw:145:email_remaining:15");
+    assert.match(harness.sentMessages[1].subject, /Nome atual do banco/);
+    assert.doesNotMatch(harness.sentMessages[1].subject, /Nome antigo/);
+    assert.equal(second.sent, 1);
+  });
+});
+
+test("retry após falha SMTP de saldo cria nova tentativa sem duplicar aceite", async () => {
+  await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+    const harness = automaticEmailHarness({
+      balanceContext: currentBalanceContext(),
+      shouldFail: ({ attempt }) => attempt === 1,
+    });
+    const first = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+    const second = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+    const third = await handleAutomaticEmailEvent(balanceEvent(), harness.dependencies);
+
+    assert.equal(first.status, "failed");
+    assert.equal(second.status, "processed");
+    assert.equal(third.status, "deduped");
     assert.equal(harness.smtpCalls, 2);
   });
 });
@@ -736,6 +1109,58 @@ test("rota interna aceita draw_name opcional no payload sem alterar os identific
       draw_id: 145,
       draw_type: "adicional",
       draw_name: "Sorteio adicional de créditos",
+    });
+  });
+});
+
+test("rota interna aceita evento individual de user_balance sem exigir draw_id", async () => {
+  await withEnv("PUSH_INTERNAL_EVENTS_TOKEN", "expected-token", async () => {
+    let receivedEvent = null;
+    const req = {
+      body: {
+        event_key: "EMAIL_BALANCE_EXPIRING_30_DAYS",
+        reference_type: "user_balance",
+        reference_key: "user_balance:123:expires:2026-09-05:email:30_days",
+        user_id: 123,
+        balance_cents: 15000,
+        expires_at: "2026-09-05T03:00:00.000Z",
+        days_to_expire: 30,
+      },
+      get() {
+        return "expected-token";
+      },
+    };
+    const res = fakeResponse();
+    await handleInternalEmailEventRequest(req, res, async (event) => {
+      receivedEvent = event;
+      return { ok: true, status: "processed" };
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(receivedEvent.referenceType, "user_balance");
+    assert.equal(receivedEvent.metadata.user_id, 123);
+    assert.equal(receivedEvent.metadata.draw_id, undefined);
+  });
+});
+
+test("evento de saldo com user_id inválido retorna HTTP 400", async () => {
+  await withEnv("PUSH_INTERNAL_EVENTS_TOKEN", "expected-token", async () => {
+    await withEnv("NOTIFICATION_EMAIL_AUTOMATION_ENABLED", "true", async () => {
+      const req = {
+        body: {
+          event_key: "EMAIL_BALANCE_EXPIRING_30_DAYS",
+          reference_type: "user_balance",
+          reference_key: "invalid-user",
+          metadata: { user_id: "abc" },
+        },
+        get() {
+          return "expected-token";
+        },
+      };
+      const res = fakeResponse();
+      await handleInternalEmailEventRequest(req, res);
+      assert.equal(res.statusCode, 400);
+      assert.deepEqual(res.body, { ok: false, error: "email_user_id_invalid" });
     });
   });
 });

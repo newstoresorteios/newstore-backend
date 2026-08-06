@@ -8,6 +8,8 @@ const CLIENT_ERROR_CODES = new Set([
   "email_draw_id_invalid",
   "email_reference_key_invalid",
   "email_draw_type_not_allowed",
+  "email_user_id_invalid",
+  "email_reference_type_invalid",
 ]);
 
 export function statusForEmailEventError(error) {
@@ -26,7 +28,15 @@ function eventMetadata(body = {}) {
   const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
     ? { ...body.metadata }
     : {};
-  for (const key of ["draw_id", "draw_type", "draw_name"]) {
+  for (const key of [
+    "draw_id",
+    "draw_type",
+    "draw_name",
+    "user_id",
+    "balance_cents",
+    "expires_at",
+    "days_to_expire",
+  ]) {
     if (metadata[key] == null && body[key] != null) metadata[key] = body[key];
   }
   return metadata;
@@ -62,6 +72,7 @@ export async function handleInternalEmailEventRequest(
       event_key: body.event_key ?? null,
       reference_key: body.reference_key ?? null,
       draw_id: metadata.draw_id ?? null,
+      user_id: metadata.user_id ?? null,
     });
     return res.status(statusForEmailEventError(error)).json({
       ok: false,

@@ -8,6 +8,10 @@ import {
 } from "./notificationLog.js";
 import { createSmtpTransporter, getSmtpConfig } from "./manualEmailNotifications.js";
 import { renderTemplate } from "./manualNotificationPreview.js";
+import {
+  BALANCE_EMAIL_EVENT_KEYS,
+  handleAutomaticBalanceEmailEvent,
+} from "./automaticBalanceEmailNotifications.js";
 
 export const AUTOMATIC_EMAIL_EVENT_KEYS = Object.freeze([
   "NEW_DRAW_PUBLISHED",
@@ -16,6 +20,7 @@ export const AUTOMATIC_EMAIL_EVENT_KEYS = Object.freeze([
   "EMAIL_DRAW_REMAINING_30",
   "EMAIL_DRAW_REMAINING_15",
   "DRAW_CLOSED",
+  ...BALANCE_EMAIL_EVENT_KEYS,
 ]);
 
 const REMAINING_THRESHOLDS = new Map([
@@ -54,7 +59,31 @@ export function resolveDrawDisplayName({
     : "";
   if (normalizedType === "adicional") return `Sorteio adicional${idSuffix}`;
   if (normalizedType === "secundario") return `Sorteio secundário${idSuffix}`;
+  return `Sorteio principal${idSuffix}`;
+}
+
+export function resolveDrawTypeLabel(drawType) {
+  const normalizedType = cleanText(drawType).toLowerCase();
+  if (normalizedType === "adicional") return "Sorteio adicional";
+  if (normalizedType === "secundario") return "Sorteio secundário";
   return "Sorteio principal";
+}
+
+function distinctDisplayText(value, otherValue) {
+  const text = cleanDisplayText(value);
+  if (!text) return null;
+  return text.localeCompare(cleanDisplayText(otherValue), "pt-BR", { sensitivity: "base" }) === 0
+    ? null
+    : text;
+}
+
+function drawStatusLabel(draw) {
+  if (draw?.closed_at || cleanText(draw?.status).toLowerCase() === "closed") return "Encerrado";
+  if (["sorteado", "realized", "realizado"].includes(cleanText(draw?.status).toLowerCase())) {
+    return "Resultado disponível";
+  }
+  if (cleanText(draw?.status).toLowerCase() === "open") return "Aberto";
+  return cleanDisplayText(draw?.status) || "Situação atualizada";
 }
 
 function escapeHtml(value) {
@@ -70,12 +99,6 @@ function subjectDrawName(value) {
   const name = cleanDisplayText(value);
   if (name.length <= 180) return name;
   return `${name.slice(0, 179).trimEnd()}…`;
-}
-
-function drawClosurePrefix(drawDisplayName) {
-  return /^sorteio(?:\s|$)/iu.test(cleanDisplayText(drawDisplayName))
-    ? "O"
-    : "O sorteio";
 }
 
 function isEnabled() {
@@ -123,9 +146,9 @@ function eventError(code, extra = {}) {
   return error;
 }
 
-async function loadDrawContext(drawId) {
-  const drawResult = await query(
-    `SELECT id, status, draw_type, product_name, opened_at, closed_at
+export async function loadDrawContext(drawId, runQuery = query) {
+  const drawResult = await runQuery(
+    `SELECT id, status, draw_type, product_name, product_link, opened_at, closed_at
        FROM public.draws
       WHERE id = $1`,
     [drawId]
@@ -133,7 +156,7 @@ async function loadDrawContext(drawId) {
   const draw = drawResult.rows?.[0];
   if (!draw) throw eventError("email_draw_not_found", { drawId });
 
-  const configResult = await query(
+  const configResult = await runQuery(
     `SELECT id, banner_title
        FROM public.app_config_new
       WHERE id = $1`,
@@ -141,7 +164,7 @@ async function loadDrawContext(drawId) {
   ).catch((error) => (error?.code === "42P01" ? { rows: [] } : Promise.reject(error)));
   let principalConfig = null;
   if (cleanText(draw.draw_type || "principal") === "principal" && !configResult.rows?.[0]?.banner_title) {
-    principalConfig = (await query(
+    principalConfig = (await runQuery(
       `SELECT value FROM public.app_config WHERE key = 'banner_title' LIMIT 1`
     ).catch((error) => (error?.code === "42P01" ? { rows: [] } : Promise.reject(error)))).rows?.[0] || null;
   }
@@ -155,16 +178,25 @@ async function loadDrawContext(drawId) {
     configResult.rows?.[0],
     principalConfig
   );
+  const configuredDescription = cleanText(configResult.rows?.[0]?.banner_title) ||
+    (resolvedType === "principal" ? cleanText(principalConfig?.value) : "");
+  const drawName = resolveDrawDisplayName({
+    drawId,
+    drawType: resolvedType,
+    databaseDrawName: currentDatabaseDrawName,
+  });
+  const drawTypeLabel = resolveDrawTypeLabel(resolvedType);
+  const drawDescription = distinctDisplayText(configuredDescription, drawName);
   return {
     draw: { ...draw, draw_type: resolvedType },
     config: configResult.rows?.[0] || null,
     principalConfig,
     databaseDrawName: currentDatabaseDrawName,
-    drawName: resolveDrawDisplayName({
-      drawId,
-      drawType: resolvedType,
-      databaseDrawName: currentDatabaseDrawName,
-    }),
+    drawName,
+    drawDescription,
+    drawTypeLabel,
+    drawDisplayTitle: `${drawTypeLabel} — ${drawName}`,
+    drawStatusLabel: drawStatusLabel(draw),
     drawUrl: absoluteDrawUrl(drawId),
   };
 }
@@ -212,11 +244,25 @@ async function loadRemaining(drawId) {
 }
 
 function renderAutomaticTemplate(eventKey, user, context, remainingNumbers) {
+  const drawType = cleanText(context?.draw?.draw_type).toLowerCase() || "principal";
+  const drawTypeLabel = context.drawTypeLabel || resolveDrawTypeLabel(drawType);
+  const drawName = context.drawName;
+  const drawDescription = distinctDisplayText(context.drawDescription, drawName);
+  const drawDisplayTitle = context.drawDisplayTitle || `${drawTypeLabel} — ${drawName}`;
+  const statusLabel = context.drawStatusLabel || drawStatusLabel(context.draw);
+  const actualRemaining = Number.isInteger(Number(remainingNumbers))
+    ? Number(remainingNumbers)
+    : REMAINING_THRESHOLDS.get(eventKey);
   const params = {
     name: cleanText(user.name) || "Cliente",
-    draw_name: context.drawName,
+    draw_name: drawName,
+    draw_description: drawDescription || "",
+    draw_type_label: drawTypeLabel,
+    draw_type_subject: drawTypeLabel.toLocaleLowerCase("pt-BR"),
+    draw_display_title: drawDisplayTitle,
+    draw_status: statusLabel,
     draw_url: context.drawUrl,
-    remaining_numbers: remainingNumbers,
+    remaining_numbers: actualRemaining,
   };
   const subjectParams = {
     ...params,
@@ -226,31 +272,38 @@ function renderAutomaticTemplate(eventKey, user, context, remainingNumbers) {
     ...params,
     name: escapeHtml(params.name),
     draw_name: escapeHtml(params.draw_name),
+    draw_description: escapeHtml(params.draw_description),
+    draw_type_label: escapeHtml(params.draw_type_label),
+    draw_display_title: escapeHtml(params.draw_display_title),
+    draw_status: escapeHtml(params.draw_status),
     draw_url: escapeHtml(params.draw_url),
   };
+  const htmlDescription = params.draw_description
+    ? `<p>{{draw_description}}</p>`
+    : "";
+  const textDescription = params.draw_description
+    ? `\n\n{{draw_description}}`
+    : "";
   if (eventKey === "NEW_DRAW_PUBLISHED") {
     return {
-      subject: renderTemplate("Novo sorteio disponível — {{draw_name}}", subjectParams),
-      html: renderTemplate(`<p>Olá, {{name}}!</p><p>Um novo sorteio está disponível:</p><p><strong>{{draw_name}}</strong></p><p>Acesse para participar:</p><p><a href="{{draw_url}}">{{draw_url}}</a></p><p>Boa sorte!</p><p>Equipe NewStore</p>`, htmlParams),
-      text: renderTemplate("Olá, {{name}}!\n\nUm novo sorteio está disponível:\n\n{{draw_name}}\n\nAcesse para participar:\n{{draw_url}}\n\nBoa sorte!\n\nEquipe NewStore", params),
+      subject: renderTemplate("Novo {{draw_type_subject}} — {{draw_name}}", subjectParams),
+      html: renderTemplate(`<p>Olá, {{name}}!</p><p>Um novo <strong>{{draw_type_label}}</strong> está disponível:</p><p><strong>{{draw_name}}</strong></p>${htmlDescription}<p><strong>Situação:</strong> {{draw_status}}</p><p>Acesse para participar:</p><p><a href="{{draw_url}}">{{draw_url}}</a></p><p>Boa sorte!</p><p>Equipe NewStore</p>`, htmlParams),
+      text: renderTemplate(`Olá, {{name}}!\n\nUm novo {{draw_type_subject}} está disponível:\n\n{{draw_name}}${textDescription}\n\nSituação: {{draw_status}}\n\nAcesse para participar:\n{{draw_url}}\n\nBoa sorte!\n\nEquipe NewStore`, params),
       templateKey: "NEW_DRAW_EMAIL",
     };
   }
   if (eventKey === "DRAW_CLOSED") {
-    const closurePrefix = drawClosurePrefix(params.draw_name);
     return {
-      subject: renderTemplate(`${closurePrefix} {{draw_name}} foi encerrado`, subjectParams),
-      html: renderTemplate(`<p>Olá, {{name}}!</p><p>${closurePrefix} <strong>{{draw_name}}</strong> foi encerrado.</p><p>O resultado será acompanhado pelo canal oficial da CAIXA no YouTube:</p><p><a href="${CAIXA_URL}">${CAIXA_URL}</a></p><p>O vencedor será o participante que possuir o <strong>último número sorteado da Lotomania</strong>.</p><p>Boa sorte!</p><p>Equipe NewStore</p>`, htmlParams),
-      text: renderTemplate(`Olá, {{name}}!\n\n${closurePrefix} {{draw_name}} foi encerrado.\n\nAcompanhe o resultado pelo canal oficial da CAIXA:\n\n${CAIXA_URL}\n\nO vencedor será o participante que possuir o último número sorteado da Lotomania.\n\nBoa sorte!\n\nEquipe NewStore`, params),
+      subject: renderTemplate("{{draw_type_label}} — {{draw_name}} — encerrado", subjectParams),
+      html: renderTemplate(`<p>Olá, {{name}}!</p><p>O <strong>{{draw_display_title}}</strong> foi encerrado.</p>${htmlDescription}<p><strong>Situação:</strong> {{draw_status}}</p><p>O resultado será acompanhado pelo canal oficial da CAIXA no YouTube:</p><p><a href="${CAIXA_URL}">${CAIXA_URL}</a></p><p>O vencedor será o participante que possuir o <strong>último número sorteado da Lotomania</strong>.</p><p>Boa sorte!</p><p>Equipe NewStore</p>`, htmlParams),
+      text: renderTemplate(`Olá, {{name}}!\n\nO {{draw_display_title}} foi encerrado.${textDescription}\n\nSituação: {{draw_status}}\n\nAcompanhe o resultado pelo canal oficial da CAIXA:\n\n${CAIXA_URL}\n\nO vencedor será o participante que possuir o último número sorteado da Lotomania.\n\nBoa sorte!\n\nEquipe NewStore`, params),
       templateKey: "DRAW_CLOSED_EMAIL",
     };
   }
-  const threshold = REMAINING_THRESHOLDS.get(eventKey);
-  const emphasis = threshold === 15 ? "apenas " : "";
   return {
-    subject: renderTemplate(`Restam ${emphasis}${threshold} números no {{draw_name}}`, subjectParams),
-    html: renderTemplate(`<p>Olá, {{name}}!</p><p>Faltam ${emphasis}${threshold} números para completar o {{draw_name}}.</p><p><a href="{{draw_url}}">Acesse o site para escolher seus números</a></p>`, htmlParams),
-    text: renderTemplate(`Olá, {{name}}!\n\nFaltam ${emphasis}${threshold} números para completar o {{draw_name}}.\n\nAcesse o site para escolher seus números:\n{{draw_url}}`, params),
+    subject: renderTemplate("Restam {{remaining_numbers}} números no {{draw_type_subject}} — {{draw_name}}", subjectParams),
+    html: renderTemplate(`<p>Olá, {{name}}!</p><p>Restam <strong>{{remaining_numbers}} números</strong> no {{draw_display_title}}.</p>${htmlDescription}<p><strong>Situação:</strong> {{draw_status}}</p><p><a href="{{draw_url}}">Acesse o site para escolher seus números</a></p>`, htmlParams),
+    text: renderTemplate(`Olá, {{name}}!\n\nRestam {{remaining_numbers}} números no {{draw_display_title}}.${textDescription}\n\nSituação: {{draw_status}}\n\nAcesse o site para escolher seus números:\n{{draw_url}}`, params),
     templateKey: eventKey,
   };
 }
@@ -262,7 +315,7 @@ async function alreadyDispatched({ eventKey, referenceKey, drawId, userId }) {
       WHERE channel = 'email'
         AND event_key = $1
         AND user_id = $2
-        AND draw_id = $3
+        AND draw_id IS NOT DISTINCT FROM $3
         AND payload->>'source' = 'automation'
         AND payload->>'automation' = 'true'
         AND payload->>'reference_key' = $4
@@ -292,8 +345,23 @@ export async function handleAutomaticEmailEvent({
   const failDispatch = dependencies.markDispatchFailed || markDispatchFailed;
   const updateCampaign = dependencies.updateCampaignAudienceCounts || updateCampaignAudienceCounts;
   const key = cleanText(eventKey);
-  const drawId = Number(metadata?.draw_id);
   if (!AUTOMATIC_EMAIL_EVENT_KEYS.includes(key)) throw eventError("email_event_not_allowed");
+  if (BALANCE_EMAIL_EVENT_KEYS.includes(key)) {
+    if (cleanText(referenceType) && cleanText(referenceType) !== "user_balance") {
+      throw eventError("email_reference_type_invalid");
+    }
+    return handleAutomaticBalanceEmailEvent({
+      eventKey: key,
+      referenceType,
+      referenceKey,
+      metadata,
+      occurredAt,
+    }, dependencies);
+  }
+  if (cleanText(referenceType) && !["draw", "additional_draw"].includes(cleanText(referenceType))) {
+    throw eventError("email_reference_type_invalid");
+  }
+  const drawId = Number(metadata?.draw_id);
   if (!Number.isInteger(drawId) || drawId <= 0) throw eventError("email_draw_id_invalid");
   if (!cleanText(referenceKey)) throw eventError("email_reference_key_invalid");
   console.log("[email-automation] event_received", { event_key: key, reference_key: referenceKey, draw_id: drawId });
@@ -329,13 +397,27 @@ export async function handleAutomaticEmailEvent({
     payloadDrawName,
     databaseDrawName: currentDatabaseDrawName,
   });
-  const context = { ...loadedContext, drawName: resolvedDrawName };
+  const drawTypeLabel = loadedContext?.drawTypeLabel || resolveDrawTypeLabel(drawType);
+  const resolvedDrawDescription = distinctDisplayText(
+    loadedContext?.drawDescription,
+    resolvedDrawName
+  );
+  const context = {
+    ...loadedContext,
+    drawName: resolvedDrawName,
+    drawDescription: resolvedDrawDescription,
+    drawTypeLabel,
+    drawDisplayTitle: `${drawTypeLabel} — ${resolvedDrawName}`,
+    drawStatusLabel: loadedContext?.drawStatusLabel || drawStatusLabel(loadedContext?.draw),
+  };
   console.log("[email-automation] draw_name_resolved", {
     draw_id: drawId,
     draw_type: drawType,
     payload_draw_name: cleanDisplayText(payloadDrawName) || null,
     database_draw_name: cleanDisplayText(currentDatabaseDrawName) || null,
     resolved_draw_name: resolvedDrawName,
+    resolved_draw_description: resolvedDrawDescription,
+    draw_type_label: drawTypeLabel,
     reference_key: referenceKey,
   });
   if (key === "DRAW_CLOSED" && !isDrawClosedForEmail(context.draw)) {
@@ -434,6 +516,23 @@ export async function handleAutomaticEmailEvent({
   const mailer = createMailer(smtp);
   const renderedByUser = (user) => renderAutomaticTemplate(key, user, context, remainingNumbers);
   const firstRendered = renderedByUser(pendingRecipients[0]);
+  const drawSnapshot = {
+    source: "automation",
+    automation: true,
+    event_key: key,
+    reference_key: referenceKey,
+    reference_type: referenceType,
+    draw_id: drawId,
+    draw_type: drawType,
+    draw_type_label: context.drawTypeLabel,
+    draw_name: context.drawName,
+    draw_description: context.drawDescription || null,
+    draw_display_title: context.drawDisplayTitle,
+    draw_url: context.drawUrl,
+    draw_status: context.draw?.status || null,
+    draw_status_label: context.drawStatusLabel,
+    remaining_numbers: remainingNumbers,
+  };
   const campaign = await createCampaignRecord({
     name: `Automatic email - ${firstRendered.subject}`.slice(0, 255),
     channel: "email",
@@ -441,9 +540,9 @@ export async function handleAutomaticEmailEvent({
     templateKey: firstRendered.templateKey,
     audienceFilter: key === "DRAW_CLOSED" ? "draw_participants" : "all_with_email",
     audienceParams: { draw_id: drawId, event_key: key, reference_key: referenceKey },
-    payload: { source: "automation", automation: true, event_key: key, reference_key: referenceKey, draw_id: drawId, reference_type: referenceType, occurred_at: occurredAt },
-    messageSnapshot: { source: "automation", automation: true, event_key: key, subject: firstRendered.subject },
-    audienceSnapshot: { source: "automation", automation: true, draw_id: drawId, resolved_recipients: recipients.length },
+    payload: { ...drawSnapshot, occurred_at: occurredAt },
+    messageSnapshot: { ...drawSnapshot, subject: firstRendered.subject },
+    audienceSnapshot: { ...drawSnapshot, resolved_recipients: recipients.length },
     campaignType: "automation",
     audienceCountExpected: recipients.length,
   });
@@ -462,9 +561,9 @@ export async function handleAutomaticEmailEvent({
       recipientOriginal: user.email,
       templateKey: rendered.templateKey,
       campaignId: campaign.id,
-      payload: { source: "automation", automation: true, event_key: key, reference_key: referenceKey, draw_id: drawId, reference_type: referenceType },
-      messageSnapshot: { source: "automation", automation: true, subject: rendered.subject, html: rendered.html, text: rendered.text },
-      recipientSnapshot: { source: "automation", automation: true, user_id: user.id, email: user.email, draw_id: drawId },
+      payload: drawSnapshot,
+      messageSnapshot: { ...drawSnapshot, subject: rendered.subject, html: rendered.html, text: rendered.text },
+      recipientSnapshot: { ...drawSnapshot, user_id: user.id, email: user.email },
     });
     try {
       const info = await mailer.sendMail({
