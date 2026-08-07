@@ -76,6 +76,39 @@ function normalizeNewDrawType(value) {
   return value === "adicional" ? "adicional" : "principal";
 }
 
+// Espelha a mesma regra ja usada pela rota administrativa
+// (admin_additional_draws.js): pagamento aprovado/pago vence o status
+// gravado em public.numbers, sem alterar nada no banco. Puro/testavel
+// isoladamente, sem depender de conexao com o banco.
+function mergeNumbersWithPayments(numbersRows, paidRows) {
+  const soldNumbers = new Set();
+  const initialsByNumber = new Map();
+  const ownerNameByNumber = new Map();
+
+  for (const row of paidRows || []) {
+    const n = Number(row.n);
+    if (!Number.isFinite(n)) continue;
+    soldNumbers.add(n);
+    if (initialsByNumber.has(n)) continue; // linha mais recente ja vence (paidRows ordenado por p.created_at DESC)
+
+    const initials = initialsFromNameOrEmail(row.owner_name, row.owner_email);
+    if (initials) initialsByNumber.set(n, initials);
+    if (row.owner_name) ownerNameByNumber.set(n, row.owner_name);
+  }
+
+  return (numbersRows || []).map((row) => {
+    const n = Number(row.n);
+    return {
+      ...row,
+      n,
+      status: soldNumbers.has(n) ? "sold" : row.status,
+      owner_initials: initialsByNumber.get(n) || null,
+      buyer_initials: initialsByNumber.get(n) || null,
+      owner_name: ownerNameByNumber.get(n) || null,
+    };
+  });
+}
+
 function initialsFromNameOrEmail(name, email) {
   const nm = String(name || "").trim();
   if (nm) {
@@ -213,37 +246,32 @@ router.get("/open", async (_req, res) => {
   }
 });
 
+async function loadAdditionalDrawsLanding(runQuery = query) {
+  // Todo sorteio adicional/secundario aberto ou encerrado deve continuar
+  // visivel publicamente; encerrar um novo sorteio nao pode fazer um
+  // sorteio encerrado anterior desaparecer da landing.
+  const result = await runQuery(
+    `SELECT id, status, draw_type, product_name, product_link, opened_at,
+            closed_at, realized_at, winner_user_id, winner_name, winner_number
+       FROM public.draws
+      WHERE status IN ('open', 'closed')
+        AND draw_type IN ('adicional', 'secundario')
+      ORDER BY
+        CASE WHEN status = 'open' THEN 0 ELSE 1 END,
+        CASE WHEN status = 'open' THEN id END ASC,
+        CASE WHEN status = 'closed' THEN closed_at END DESC NULLS LAST,
+        id DESC`
+  );
+  return result.rows || [];
+}
+
 router.get("/landing", async (_req, res) => {
   try {
-    const draws = await query(
-      `WITH open_draws AS (
-         SELECT id, status, draw_type, product_name, product_link, opened_at,
-                closed_at, realized_at, winner_user_id, winner_name, winner_number
-           FROM public.draws
-          WHERE status = 'open'
-            AND draw_type IN ('adicional', 'secundario')
-       ),
-       latest_closed AS (
-         SELECT id, status, draw_type, product_name, product_link, opened_at,
-                closed_at, realized_at, winner_user_id, winner_name, winner_number
-           FROM public.draws
-          WHERE status = 'closed'
-            AND draw_type IN ('adicional', 'secundario')
-          ORDER BY id DESC
-          LIMIT 1
-       )
-       SELECT *
-         FROM (
-           SELECT * FROM open_draws
-           UNION ALL
-           SELECT * FROM latest_closed
-         ) AS landing_draws
-        ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, id ASC`
-    );
+    const rows = await loadAdditionalDrawsLanding();
 
-    const configMap = await loadDrawConfigs((draws.rows || []).map((row) => row.id));
+    const configMap = await loadDrawConfigs(rows.map((row) => row.id));
     const formatted = [];
-    for (const draw of draws.rows || []) {
+    for (const draw of rows) {
       formatted.push(await formatAdditionalDraw(draw, configMap.get(String(draw.id))));
     }
 
@@ -295,37 +323,12 @@ router.get("/:id/numbers", async (req, res) => {
        LEFT JOIN public.users u ON u.id = p.user_id
        CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
        WHERE p.draw_id = $1
-         AND lower(p.status) IN ('approved', 'paid', 'pago')`,
+         AND lower(p.status) IN ('approved', 'paid', 'pago', 'sold')
+       ORDER BY num.n, p.created_at DESC NULLS LAST, p.id DESC`,
       [drawId]
     );
 
-    const initialsByNumber = new Map();
-    const ownerNameByNumber = new Map();
-
-    for (const row of paidRows.rows || []) {
-      const n = Number(row.n);
-      const initials = initialsFromNameOrEmail(row.owner_name, row.owner_email);
-
-      if (Number.isFinite(n) && initials) {
-        initialsByNumber.set(n, initials);
-      }
-
-      if (Number.isFinite(n) && row.owner_name) {
-        ownerNameByNumber.set(n, row.owner_name);
-      }
-    }
-
-    const rows = (numbersResult.rows || []).map((row) => {
-      const n = Number(row.n);
-
-      return {
-        ...row,
-        n,
-        owner_initials: initialsByNumber.get(n) || null,
-        buyer_initials: initialsByNumber.get(n) || null,
-        owner_name: ownerNameByNumber.get(n) || null,
-      };
-    });
+    const rows = mergeNumbersWithPayments(numbersResult.rows, paidRows.rows);
 
     await client.query("COMMIT");
     return res.json({ draw_id: drawId, numbers: rows });
@@ -462,7 +465,9 @@ export {
   expireDrawReservations,
   formatAdditionalDraw,
   isAdditionalDrawType,
+  loadAdditionalDrawsLanding,
   loadDrawConfigs,
+  mergeNumbersWithPayments,
   normalizeNewDrawType,
 };
 export default router;
