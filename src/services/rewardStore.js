@@ -532,15 +532,38 @@ export async function syncRewardProducts(trayProductIds, deps = {}) {
 /* ─────────────────────────── Listagens ─────────────────────────── */
 
 /** `/loja` publico: somente PostgreSQL, somente publicados. Nunca chama a Tray. */
-export async function listPublishedRewardProducts(deps = {}) {
+const STORE_PRODUCTS_DEFAULT_LIMIT = 24;
+const STORE_PRODUCTS_MAX_LIMIT = 100;
+
+/**
+ * Catalogo publico da Loja (GET /api/store/products). Paginado: uma vitrine
+ * com centenas de produtos publicados nunca deve devolver tudo de uma vez.
+ */
+export async function listPublishedRewardProducts({ page = 1, limit = STORE_PRODUCTS_DEFAULT_LIMIT } = {}, deps = {}) {
   const d = resolveDeps(deps);
+  const safeLimit = Math.min(Math.max(Number(limit) || STORE_PRODUCTS_DEFAULT_LIMIT, 1), STORE_PRODUCTS_MAX_LIMIT);
+  const safePage = Math.max(Number(page) || 1, 1);
+  const offset = (safePage - 1) * safeLimit;
+
   const { rows } = await d.query(
-    `select ${RETURNING_COLUMNS}
+    `select ${RETURNING_COLUMNS}, count(*) over () as total_count
        from public.reward_products
       where is_published = true
-      order by display_order asc, created_at asc, id asc`
+      order by display_order asc, created_at asc, id asc
+      limit $1 offset $2`,
+    [safeLimit, offset]
   );
-  return { items: rows.map(mapRowToPublicProduct) };
+
+  const total = rows.length ? Number(rows[0].total_count) : 0;
+  return {
+    items: rows.map(mapRowToPublicProduct),
+    paging: {
+      page: safePage,
+      limit: safeLimit,
+      total,
+      pages: total ? Math.ceil(total / safeLimit) : 0,
+    },
+  };
 }
 
 /** Detalhe publico de UM produto publicado. Somente PostgreSQL, nunca chama a Tray. */

@@ -11,10 +11,12 @@ import { listPublishedRewardProducts, getPublishedRewardProduct } from "../servi
 
 const router = Router();
 
-/** GET /api/store/products — somente produtos publicados, direto do PostgreSQL. */
-router.get("/products", async (_req, res) => {
+/** GET /api/store/products — somente produtos publicados, direto do PostgreSQL. Paginado. */
+router.get("/products", async (req, res) => {
   try {
-    return res.json(await listPublishedRewardProducts());
+    return res.json(
+      await listPublishedRewardProducts({ page: req.query.page, limit: req.query.limit })
+    );
   } catch (e) {
     console.error("[store] falha ao listar catalogo publicado", {
       code: e?.code || null,
