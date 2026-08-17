@@ -1,6 +1,7 @@
 // backend/src/routes/numbers.js
 import { Router } from 'express';
 import { query } from '../db.js';
+import { expireReservationForNumbersCleanup } from '../services/reservationExpiry.js';
 
 const router = Router();
 
@@ -28,19 +29,43 @@ function initialsFromNameOrEmail(name, email) {
  * - Retorna o status final para cada número
  * - (NOVO) Para números vendidos, inclui "owner_initials" (iniciais do comprador)
  */
-router.get('/', async (_req, res) => {
+router.get('/', async (req, res) => {
   try {
-    // 1) draw aberto
-    const dr = await query(
-      `SELECT id
-         FROM draws
-        WHERE status = 'open'
-          AND COALESCE(draw_type, 'principal') = 'principal'
-        ORDER BY id DESC
-        LIMIT 1`
-    );
-    if (!dr.rows.length) return res.json({ drawId: null, numbers: [] });
-    const drawId = dr.rows[0].id;
+    // 1) draw explicitamente solicitado ou principal aberto atual.
+    const requestedDrawId = req.query?.draw_id ?? req.query?.drawId;
+    let drawId = null;
+
+    if (requestedDrawId !== undefined && requestedDrawId !== null && requestedDrawId !== '') {
+      const parsed = Number(requestedDrawId);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        return res.status(400).json({ ok: false, error: 'invalid_draw_id', drawId: null, numbers: [] });
+      }
+
+      const explicit = await query(
+        `SELECT id
+           FROM public.draws
+          WHERE id = $1
+          LIMIT 1`,
+        [parsed]
+      );
+      if (!explicit.rows.length) {
+        return res.status(404).json({ ok: false, error: 'draw_not_found', drawId: null, numbers: [] });
+      }
+      drawId = parsed;
+    } else {
+      const dr = await query(
+        `SELECT id
+           FROM public.draws
+          WHERE status = 'open'
+            AND COALESCE(draw_type, 'principal') = 'principal'
+          ORDER BY id DESC
+          LIMIT 1`
+      );
+      if (!dr.rows.length) {
+        return res.json({ ok: false, error: 'no_open_draw', drawId: null, numbers: [] });
+      }
+      drawId = dr.rows[0].id;
+    }
 
     // 2) lista base de números 0..99
     const base = await query(
@@ -90,10 +115,10 @@ router.get('/', async (_req, res) => {
       const isExpired = exp && !Number.isNaN(exp) && exp < now;
 
       if (isExpired) {
-        // best-effort: não bloqueia a resposta
-        query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [r.id])
-          .catch(() => {});
-        continue;
+        // Revalida no UPDATE para fechar a corrida com o scanner de preauth.
+        // Se nada mudar, a reserva segue bloqueando (preauth pending ou hold estendido).
+        const expired = await expireReservationForNumbersCleanup(r.id, query);
+        if (expired.rowCount > 0) continue;
       }
 
       // reserva só se ainda não foi vendida

@@ -16,6 +16,7 @@ import additionalDrawsRoutes from "./routes/additional_draws.js";
 import additionalPaymentsRoutes from "./routes/additional_payments.js";
 import secondaryDrawsRoutes from "./routes/secondary_draws.js";
 import secondaryPaymentsRoutes from "./routes/secondary_payments.js";
+import checkoutBatchRoutes from "./routes/checkout_batches.js";
 import meRoutes from "./routes/me.js";
 import communicationConsentsRoutes from "./routes/communication_consents.js";
 import drawsRoutes from "./routes/draws.js";
@@ -33,6 +34,11 @@ import adminSecondaryDrawsRouter from "./routes/admin_secondary_draws.js";
 import adminCaptivesRouter from "./routes/admin_captives.js";
 import adminCaptivePreauthRouter from "./routes/admin_captive_preauth.js";
 import captivePreauthRouter from "./routes/captive_preauth.js";
+import {
+  processPendingCaptivePreauthExpirations,
+  getCaptivePreauthExpiryScanIntervalMs,
+  isCaptivePreauthExpiryScanEnabled,
+} from "./services/autopay/captivePreauthService.js";
 import adminStoreRouter from "./routes/admin_store.js";
 import adminNsCreditsRouter from "./routes/admin_nscredits.js";
 
@@ -51,6 +57,7 @@ import adminRoutes from "./routes/admin.js";
 import purchaseLimitRouter from "./routes/purchase_limit.js";
 import couponsRouter from "./routes/coupons.js";
 import trayRouter from "./routes/tray.js";
+import integrationsTrayRouter from "./routes/integrations_tray.js";
 
 import adminUsersRouter from "./routes/adminUsers.js";
 
@@ -69,6 +76,7 @@ import brevoWebhooksRouter from "./routes/brevoWebhooks.js";
 import pushRouter from "./routes/push.js";
 import internalNotificationsRouter from "./routes/internalNotifications.js";
 import internalPushEventsRouter from "./routes/internal_push_events.js";
+import internalEmailEventsRouter from "./routes/internal_email_events.js";
 
 import { autoReconcile } from './middleware/autoReconcile.js';
 
@@ -88,6 +96,30 @@ try { validateTrayConfigAtStartup(); } catch {}
 try { configureWebPush(); } catch {}
 
 const PORT = process.env.PORT || 4000;
+
+function startCaptivePreauthExpiryScanner() {
+  if (!isCaptivePreauthExpiryScanEnabled()) {
+    console.log("[captive-preauth] expired_pending_scan disabled");
+    return;
+  }
+
+  const intervalMs = getCaptivePreauthExpiryScanIntervalMs();
+  const runScan = async () => {
+    try {
+      await processPendingCaptivePreauthExpirations();
+    } catch (e) {
+      console.warn("[captive-preauth] expired_pending_scan", {
+        expired_count: 0,
+        draw_ids: [],
+        error: e?.code || e?.message || "scan_failed",
+      });
+    }
+  };
+
+  runScan();
+  setInterval(runScan, intervalMs);
+  console.log("[captive-preauth] expired_pending_scan scheduled", { interval_ms: intervalMs });
+}
 
 // Se não setar CORS_ORIGIN, usamos esta allowlist padrão
 const ORIGIN =
@@ -129,6 +161,8 @@ app.use((req, res, next) => {
   if (
     path.startsWith("/api/push") ||
     path.startsWith("/api/internal/push") ||
+    path.startsWith("/api/internal/email") ||
+    path.startsWith("/api/integrations/tray") ||
     path.startsWith("/api/internal/notifications") ||
     path.startsWith("/api/admin/push") ||
     path.startsWith("/api/admin/notifications/push") ||
@@ -148,6 +182,8 @@ app.use((req, res, next) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/push", pushRouter);
 app.use("/api/internal/push", internalPushEventsRouter);
+app.use("/api/internal/email", internalEmailEventsRouter);
+app.use("/api/integrations/tray", integrationsTrayRouter);
 app.use("/api/internal/notifications", internalNotificationsRouter);
 app.use("/api/numbers", numbersRoutes);
 app.use("/api/reservations", reservationsRoutes);
@@ -159,6 +195,7 @@ app.use("/api/additional-draws", additionalDrawsRoutes);
 app.use("/api/additional-payments", additionalPaymentsRoutes);
 app.use("/api/secondary-draws", secondaryDrawsRoutes);
 app.use("/api/secondary-payments", secondaryPaymentsRoutes);
+app.use("/api/checkout-batches", checkoutBatchRoutes);
 app.use("/api/orders", paymentsRoutes); // aliases
 app.use("/api/participations", paymentsRoutes); // aliases
 
@@ -406,6 +443,7 @@ async function bootstrap() {
     const pool = await getPool();
     await pool.query("SELECT 1");
     console.log("[db] warmup ok");
+    startCaptivePreauthExpiryScanner();
 
     app.listen(PORT, () => {
       console.log(`API listening on :${PORT}`);

@@ -318,6 +318,90 @@ test("variantes sao consultadas por product_id", async () => {
   assert.equal(variants[0].id, 10);
 });
 
+function makeVariantsPage(startId, count) {
+  return Array.from({ length: count }, (_, i) => ({
+    Variant: { id: startId + i, product_id: 123, stock: 1, reference: `V-${startId + i}`, price: "199.00", available: 1 },
+  }));
+}
+
+test("fetchTrayVariants pagina alem da pagina 1: 50 + 1 = 51 variantes", async () => {
+  const { calls, deps } = makeDeps((url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    if (page === 1) {
+      return makeResponse({
+        body: { Variants: makeVariantsPage(1, 50), paging: { total: 51, page: 1, limit: 50, maxLimit: 50 } },
+      });
+    }
+    if (page === 2) {
+      return makeResponse({
+        body: { Variants: makeVariantsPage(51, 1), paging: { total: 51, page: 2, limit: 50, maxLimit: 50 } },
+      });
+    }
+    throw new Error(`pagina inesperada solicitada: ${page}`);
+  });
+
+  const variants = await fetchTrayVariants("123", { deps });
+
+  assert.equal(variants.length, 51);
+  assert.equal(variants[0].id, 1);
+  assert.equal(variants[50].id, 51);
+  assert.equal(calls.length, 2, "deve parar assim que uma pagina curta indicar o fim");
+});
+
+test("fetchTrayVariants pagina ate a pagina 3: 50 + 50 + 1 = 101 variantes", async () => {
+  const { calls, deps } = makeDeps((url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    if (page === 1) {
+      return makeResponse({
+        body: { Variants: makeVariantsPage(1, 50), paging: { total: 101, page: 1, limit: 50, maxLimit: 50 } },
+      });
+    }
+    if (page === 2) {
+      return makeResponse({
+        body: { Variants: makeVariantsPage(51, 50), paging: { total: 101, page: 2, limit: 50, maxLimit: 50 } },
+      });
+    }
+    if (page === 3) {
+      return makeResponse({
+        body: { Variants: makeVariantsPage(101, 1), paging: { total: 101, page: 3, limit: 50, maxLimit: 50 } },
+      });
+    }
+    throw new Error(`pagina inesperada solicitada: ${page}`);
+  });
+
+  const variants = await fetchTrayVariants("123", { deps });
+
+  assert.equal(variants.length, 101);
+  assert.equal(variants[0].id, 1);
+  assert.equal(variants[100].id, 101);
+  assert.equal(calls.length, 3, "deve parar assim que uma pagina curta indicar o fim");
+});
+
+test("fetchTrayVariants nao repete pagina alem do necessario quando o total fecha exatamente no limite", async () => {
+  // 100 variantes com limit=50: pagina 1 e 2 vem cheias (50 cada). O total ja
+  // informa que 100 e tudo, entao NAO deve existir uma 3a chamada "so para
+  // confirmar que acabou" — isso seria buscar paginas alem do necessario.
+  const { calls, deps } = makeDeps((url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    if (page === 1) {
+      return makeResponse({
+        body: { Variants: makeVariantsPage(1, 50), paging: { total: 100, page: 1, limit: 50, maxLimit: 50 } },
+      });
+    }
+    if (page === 2) {
+      return makeResponse({
+        body: { Variants: makeVariantsPage(51, 50), paging: { total: 100, page: 2, limit: 50, maxLimit: 50 } },
+      });
+    }
+    throw new Error(`pagina inesperada solicitada: ${page}`);
+  });
+
+  const variants = await fetchTrayVariants("123", { deps });
+
+  assert.equal(variants.length, 100);
+  assert.equal(calls.length, 2);
+});
+
 test("marcas sao lidas do endpoint de brands (o nome vem no campo `brand`)", async () => {
   // Payload factual da loja: { Brand: { id, slug, brand } } — nao existe `name`.
   const { calls, deps } = makeDeps(() =>

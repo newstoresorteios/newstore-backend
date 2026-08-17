@@ -397,7 +397,7 @@ export async function addItem({ userId, rewardProductId, trayVariantId = null, q
     const cart = await ensureActiveCart(client, uid);
 
     // O item unico e garantido por DOIS indices parciais complementares
-    // (022_reward_carts.sql): produtos com variacao sao unicos por
+    // (030_reward_carts.sql): produtos com variacao sao unicos por
     // (carrinho, produto, variacao); produtos simples, por (carrinho, produto).
     //
     // O ON CONFLICT so resolve conflito no indice que ele INFERE. Uma linha

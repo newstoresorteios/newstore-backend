@@ -1,14 +1,17 @@
 import { Router } from "express";
 import {
   authorizeCaptivePreauthByCode,
+  authorizeCaptivePreauthForUser,
   authorizeCaptivePreauthPublic,
-  authorizeCaptivePreauthByToken,
   declineCaptivePreauthByCode,
+  declineCaptivePreauthForUser,
   declineCaptivePreauthPublic,
-  declineCaptivePreauthByToken,
   lookupCaptivePreauthByCode,
+  lookupCaptivePreauthForUser,
   lookupCaptivePreauthPublic,
+  lookupCaptivePreauthByToken,
 } from "../services/autopay/captivePreauthService.js";
+import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -74,6 +77,24 @@ function messageForResult(action, result) {
       message: messages[status] || "Esta decisão já foi registrada anteriormente.",
     };
   }
+  if (result?.code === "payment_failed" || result?.status === "failed") {
+    return {
+      status: 402,
+      title: "Pagamento nao aprovado",
+      message: "A autorizacao foi registrada, mas nao foi possivel confirmar a cobranca desta participacao.",
+    };
+  }
+  if (
+    result?.code === "number_not_available" ||
+    result?.code === "preauth_reservation_not_available" ||
+    result?.code === "preauth_reservation_expired"
+  ) {
+    return {
+      status: 409,
+      title: "Numero indisponivel",
+      message: "Nao foi possivel confirmar esta participacao porque o numero nao esta mais reservado.",
+    };
+  }
   if (action === "authorize") {
     return {
       status: 200,
@@ -107,7 +128,7 @@ function jsonForCodeDecision(result) {
   if (result?.code === "duplicate_confirmation_code") {
     return { status: 409, body: { ok: false, error: "duplicate_confirmation_code" } };
   }
-  if (result?.code === "confirmation_code_expired") {
+  if (result?.code === "confirmation_code_expired" || result?.status === "expired") {
     return {
       status: 410,
       body: {
@@ -133,6 +154,32 @@ function jsonForCodeDecision(result) {
       },
     };
   }
+  if (result?.code === "payment_failed" || result?.status === "failed") {
+    return {
+      status: 402,
+      body: {
+        ok: false,
+        error: "payment_failed",
+        status: "failed",
+        retryable: result?.retryable === true,
+        message: result?.message,
+      },
+    };
+  }
+  if (
+    result?.code === "number_not_available" ||
+    result?.code === "preauth_reservation_not_available" ||
+    result?.code === "preauth_reservation_expired"
+  ) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: "number_not_available",
+        status: result?.status || "failed",
+      },
+    };
+  }
   return {
     status: 200,
     body: {
@@ -146,6 +193,18 @@ function jsonForPublicDecision(result) {
   if (result?.code === "authorization_not_found") {
     return { status: 404, body: { ok: false, error: "authorization_not_found" } };
   }
+  if (result?.code === "payment_failed" || result?.status === "failed") {
+    return {
+      status: 402,
+      body: {
+        ok: false,
+        error: "payment_failed",
+        status: "failed",
+        retryable: result?.retryable === true,
+        message: result?.message,
+      },
+    };
+  }
   if (result?.code === "already_decided") {
     return {
       status: 200,
@@ -158,16 +217,112 @@ function jsonForPublicDecision(result) {
     };
   }
   if (result?.status === "expired") {
-    return { status: 410, body: { ok: true, status: "expired" } };
+    return {
+      status: 410,
+      body: {
+        ok: false,
+        error: "authorization_expired",
+        status: "expired",
+      },
+    };
   }
-  return { status: 200, body: { ok: true, status: result?.status } };
+  if (result?.code === "number_not_available" || result?.code === "preauth_reservation_not_available") {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: "number_not_available",
+        status: result?.status || "failed",
+      },
+    };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      status: result?.status,
+      charged: result?.charged === true,
+    },
+  };
+}
+
+function jsonForAccountDecision(result) {
+  if (result?.code === "authorization_not_found") {
+    return { status: 404, body: { ok: false, error: "authorization_not_found" } };
+  }
+  if (result?.code === "payment_failed" || result?.status === "failed") {
+    return {
+      status: 402,
+      body: {
+        ok: false,
+        error: "payment_failed",
+        status: "failed",
+        retryable: result?.retryable === true,
+        message: result?.message,
+      },
+    };
+  }
+  if (result?.code === "already_decided") {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        already_decided: true,
+        status: result.status,
+      },
+    };
+  }
+  if (result?.status === "expired") {
+    return {
+      status: 410,
+      body: {
+        ok: false,
+        error: "authorization_expired",
+        status: "expired",
+      },
+    };
+  }
+  if (
+    result?.code === "number_not_available" ||
+    result?.code === "preauth_reservation_not_available" ||
+    result?.code === "preauth_reservation_expired"
+  ) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: "number_not_available",
+        status: result?.status || "failed",
+      },
+    };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      status: result?.status,
+      charged: result?.charged === true,
+    },
+  };
 }
 
 async function handleAuthorize(req, res) {
   try {
-    const result = await authorizeCaptivePreauthByToken(req.query?.token);
-    const message = messageForResult("authorize", result);
-    return htmlResponse(res, message.title, message.message, message.status);
+    const result = await lookupCaptivePreauthByToken(req.query?.token);
+    if (!result.ok) {
+      const message = messageForResult("authorize", result);
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    if (result.status !== "pending" && result.status !== "failed") {
+      const message = messageForResult("authorize", { code: "already_decided", status: result.status });
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    return htmlResponse(
+      res,
+      "Confirmacao necessaria",
+      "Para sua seguranca, confirme sua participacao pela pagina de confirmacao. Este link nao realiza cobranca automaticamente.",
+      200
+    );
   } catch (error) {
     console.error("[captive-preauth] failed", {
       action: "authorize",
@@ -180,9 +335,21 @@ async function handleAuthorize(req, res) {
 
 async function handleDecline(req, res) {
   try {
-    const result = await declineCaptivePreauthByToken(req.query?.token);
-    const message = messageForResult("decline", result);
-    return htmlResponse(res, message.title, message.message, message.status);
+    const result = await lookupCaptivePreauthByToken(req.query?.token);
+    if (!result.ok) {
+      const message = messageForResult("decline", result);
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    if (result.status !== "pending" && result.status !== "failed") {
+      const message = messageForResult("decline", { code: "already_decided", status: result.status });
+      return htmlResponse(res, message.title, message.message, message.status);
+    }
+    return htmlResponse(
+      res,
+      "Confirmacao necessaria",
+      "Para sua seguranca, recuse sua participacao pela pagina de confirmacao. Este link nao altera sua autorizacao automaticamente.",
+      200
+    );
   } catch (error) {
     console.error("[captive-preauth] failed", {
       action: "decline",
@@ -240,6 +407,56 @@ router.post("/code/decline", async (req, res) => {
       code: error?.code || null,
     });
     return res.status(500).json({ ok: false, error: "confirmation_code_decline_failed" });
+  }
+});
+
+router.get("/me", requireAuth, async (req, res) => {
+  try {
+    const result = await lookupCaptivePreauthForUser(req.user?.id);
+    return res.json(result);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "account_lookup",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "account_lookup_failed" });
+  }
+});
+
+router.post("/me/:authorizationId/authorize", requireAuth, async (req, res) => {
+  try {
+    const result = await authorizeCaptivePreauthForUser({
+      userId: req.user?.id,
+      authorizationId: req.params.authorizationId,
+    });
+    const response = jsonForAccountDecision(result);
+    return res.status(response.status).json(response.body);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "account_authorize",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "account_authorize_failed" });
+  }
+});
+
+router.post("/me/:authorizationId/decline", requireAuth, async (req, res) => {
+  try {
+    const result = await declineCaptivePreauthForUser({
+      userId: req.user?.id,
+      authorizationId: req.params.authorizationId,
+    });
+    const response = jsonForAccountDecision(result);
+    return res.status(response.status).json(response.body);
+  } catch (error) {
+    console.error("[captive-preauth] failed", {
+      action: "account_decline",
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "account_decline_failed" });
   }
 });
 

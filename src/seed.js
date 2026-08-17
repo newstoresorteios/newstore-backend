@@ -1,5 +1,87 @@
-import { query } from './db/pg.js';
+import { getPool, query } from './db/pg.js';
 import { hashPassword } from './utils.js';
+
+async function seedInitialDrawAndNumbers() {
+  const existingDraws = await query(
+    'select count(*)::int as total from public.draws'
+  );
+  const totalDraws = Number(existingDraws.rows[0]?.total || 0);
+
+  if (totalDraws > 0) {
+    console.log('[seed] existing_draws_preserved', {
+      total_draws: totalDraws,
+      action: 'skip_data_seed',
+    });
+    return;
+  }
+
+  const pool = await getPool();
+  const client = await pool.connect();
+  let transactionOpen = false;
+
+  try {
+    await client.query('begin');
+    transactionOpen = true;
+
+    await client.query(
+      "select pg_advisory_xact_lock(hashtext('newstore_initial_seed'))"
+    );
+
+    const lockedDraws = await client.query(
+      'select count(*)::int as total from public.draws'
+    );
+    const lockedTotalDraws = Number(lockedDraws.rows[0]?.total || 0);
+
+    if (lockedTotalDraws > 0) {
+      console.log('[seed] existing_draws_preserved', {
+        total_draws: lockedTotalDraws,
+        action: 'skip_data_seed',
+      });
+      await client.query('commit');
+      transactionOpen = false;
+      return;
+    }
+
+    const drawTypeColumn = await client.query(
+      `select 1
+         from information_schema.columns
+        where table_schema = 'public'
+          and table_name = 'draws'
+          and column_name = 'draw_type'
+        limit 1`
+    );
+
+    const insertedDraw = drawTypeColumn.rows.length
+      ? await client.query(
+          `insert into public.draws(status, draw_type)
+           values('open', 'principal')
+           returning id`
+        )
+      : await client.query(
+          `insert into public.draws(status)
+           values('open')
+           returning id`
+        );
+    const drawId = insertedDraw.rows[0].id;
+
+    await client.query(
+      `insert into public.numbers(draw_id, n, status, reservation_id)
+       select $1, n, 'available', null
+         from generate_series(0, 99) as generated(n)`,
+      [drawId]
+    );
+
+    await client.query('commit');
+    transactionOpen = false;
+  } catch (error) {
+    if (transactionOpen) {
+      await client.query('rollback').catch(() => {});
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 export async function ensureSchema() {
   // Tabelas
@@ -53,27 +135,8 @@ export async function ensureSchema() {
     );
   `);
 
-  // Sorteio aberto
-  const open = await query(`select id from draws where status='open' order by id desc limit 1`);
-  let drawId;
-  if (open.rows.length) {
-    drawId = open.rows[0].id;
-  } else {
-    const ins = await query(`insert into draws(status) values('open') returning id`);
-    drawId = ins.rows[0].id;
-  }
-
-  // Garante 100 números (00-99)
-  const count = await query(`select count(*)::int as c from numbers where draw_id=$1`, [drawId]);
-  if (count.rows[0].c < 100) {
-    await query('delete from numbers where draw_id=$1', [drawId]);
-    const tuples = [];
-    for (let i = 0; i < 100; i++) {
-      tuples.push(`($1, ${i}, 'available', null)`);
-    }
-    const sql = `insert into numbers(draw_id, n, status, reservation_id) values ${tuples.join(', ')}`;
-    await query(sql, [drawId]);
-  }
+  // Cria o sorteio inicial somente quando o banco ainda não possui draws.
+  await seedInitialDrawAndNumbers();
 
   // Usuário de teste
   const email = 'teste@newstore.com';

@@ -3,12 +3,78 @@ import { v4 as uuid } from "uuid";
 import { getPool, query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
+import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
+import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
+import { handleAutomaticEmailEvent } from "../services/notifications/automaticEmailNotifications.js";
+import {
+  assertCanOpenAdditionalDraw,
+  getOpenDrawLimitResponse,
+  isDrawTypeConstraintViolation,
+  isOneOpenPerTypeConstraint,
+  lockOpenDrawSlots,
+} from "../services/openDrawLimits.js";
 import { formatAdditionalDraw, loadDrawConfigs } from "./additional_draws.js";
 
 const router = Router();
 const VALID_STATUSES = new Set(["draft", "open", "closed", "cancelled"]);
 
 router.use(requireAuth, requireAdmin);
+
+export async function emitAdminAdditionalDrawPublished(draw, handler = handlePushAutomationEvent) {
+  if (!draw?.id) return;
+
+  const productName = draw.product_name || "Sorteio adicional New Store";
+  try {
+    await handler({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      source: "admin",
+      referenceType: "additional_draw",
+      referenceKey: `additional_draw:${draw.id}:published`,
+      metadata: {
+        draw_id: Number(draw.id),
+        draw_type: "adicional",
+        is_additional_draw: true,
+        product_name: productName,
+        draw_name: productName,
+        draw_url: "/",
+        origin: "admin_additional_draws",
+      },
+      actor: {
+        type: "admin_additional_draws",
+      },
+      dryRun: process.env.PUSH_ENGINE_DRY_RUN !== "false",
+    });
+  } catch (error) {
+    console.warn("[admin_additional_draws] push automation event skipped", {
+      event_key: "NEW_DRAW_PUBLISHED",
+      reference_type: "additional_draw",
+      reference_key: `additional_draw:${draw.id}:published`,
+      draw_id: Number(draw.id),
+      code: error?.code || null,
+      message: error?.message || null,
+    });
+  }
+}
+
+async function emitAdminAdditionalDrawEmail(draw) {
+  if (!draw?.id) return;
+  const drawType = draw.draw_type === "principal" ? "principal" : "adicional";
+  try {
+    await handleAutomaticEmailEvent({
+      eventKey: "NEW_DRAW_PUBLISHED",
+      referenceType: drawType === "principal" ? "draw" : "additional_draw",
+      referenceKey: `${drawType === "principal" ? "draw" : "additional_draw"}:${draw.id}:published_email`,
+      metadata: { draw_id: Number(draw.id), draw_type: drawType, product_name: draw.product_name || null },
+      occurredAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn("[admin_additional_draws] email automation skipped", {
+      event_key: "NEW_DRAW_PUBLISHED",
+      draw_id: Number(draw.id),
+      code: error?.code || null,
+    });
+  }
+}
 
 function toOptionalString(value, maxLength) {
   if (value === undefined) return undefined;
@@ -256,14 +322,8 @@ router.post("/", async (req, res) => {
     await client.query("BEGIN");
 
     if (status === "open") {
-      await client.query(
-        `UPDATE public.draws
-            SET status = 'closed',
-                closed_at = COALESCE(closed_at, NOW())
-          WHERE status = 'open'
-            AND draw_type = $1`,
-        [drawType]
-      );
+      await lockOpenDrawSlots(client);
+      await assertCanOpenAdditionalDraw(client);
     }
 
     const inserted = await client.query(
@@ -284,6 +344,10 @@ router.post("/", async (req, res) => {
     await ensureDrawNumbers(client, draw.id, numberCount.count);
 
     await client.query("COMMIT");
+    if (draw.status === "open") {
+      await emitAdminAdditionalDrawPublished(draw);
+      await emitAdminAdditionalDrawEmail(draw);
+    }
     const configMap = await loadDrawConfigs([draw.id]);
     return res.status(201).json({
       draw: await formatAdditionalDraw(draw, configMap.get(String(draw.id))),
@@ -300,8 +364,18 @@ router.post("/", async (req, res) => {
       table: e?.table,
       detail: e?.detail,
     });
-    if (e?.code === "23514") {
+    const limitResponse = getOpenDrawLimitResponse(e);
+    if (limitResponse) {
+      return res.status(409).json(limitResponse);
+    }
+    if (isDrawTypeConstraintViolation(e)) {
       return res.status(409).json({ error: "draw_type_adicional_not_allowed" });
+    }
+    if (isOneOpenPerTypeConstraint(e)) {
+      return res.status(409).json({
+        error: "additional_draw_database_limit",
+        message: "O banco ainda está configurado para permitir apenas um sorteio aberto por tipo.",
+      });
     }
     if (e?.code === "23505") {
       return res.status(409).json({ error: "additional_draw_duplicate" });
@@ -320,6 +394,7 @@ router.patch("/:id", async (req, res) => {
 
   const updates = [];
   const params = [];
+  let requestedStatus;
   const addUpdate = (column, value) => {
     params.push(value);
     updates.push(`${column} = $${params.length}`);
@@ -352,10 +427,10 @@ router.patch("/:id", async (req, res) => {
   }
 
   if (req.body?.status !== undefined) {
-    const status = String(req.body.status).trim();
-    if (!VALID_STATUSES.has(status)) return res.status(400).json({ error: "invalid_status" });
-    addUpdate("status", status);
-    if (status === "open") updates.push("opened_at = COALESCE(opened_at, NOW())");
+    requestedStatus = String(req.body.status).trim();
+    if (!VALID_STATUSES.has(requestedStatus)) return res.status(400).json({ error: "invalid_status" });
+    addUpdate("status", requestedStatus);
+    if (requestedStatus === "closed") updates.push("closed_at = COALESCE(closed_at, NOW())");
   }
 
   const configValues = {
@@ -369,8 +444,12 @@ router.patch("/:id", async (req, res) => {
   try {
     await client.query("BEGIN");
 
+    if (requestedStatus === "open") {
+      await lockOpenDrawSlots(client);
+    }
+
     const current = await client.query(
-      `SELECT id, product_name
+      `SELECT id, status, product_name
          FROM public.draws
         WHERE id = $1
           AND draw_type IN ('adicional', 'secundario')
@@ -380,6 +459,12 @@ router.patch("/:id", async (req, res) => {
     if (!current.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "draw_not_found" });
+    }
+    const previousStatus = current.rows[0].status;
+
+    if (previousStatus !== "open" && requestedStatus === "open") {
+      await assertCanOpenAdditionalDraw(client);
+      updates.push("opened_at = COALESCE(opened_at, NOW())");
     }
 
     let updatedRow;
@@ -409,6 +494,10 @@ router.patch("/:id", async (req, res) => {
     await upsertConfig(client, drawId, configValues, updatedRow.product_name || current.rows[0].product_name);
 
     await client.query("COMMIT");
+    if (previousStatus !== "open" && updatedRow.status === "open") {
+      await emitAdminAdditionalDrawPublished(updatedRow);
+      await emitAdminAdditionalDrawEmail(updatedRow);
+    }
     const configMap = await loadDrawConfigs([drawId]);
     return res.json({
       draw: await formatAdditionalDraw(updatedRow, configMap.get(String(drawId))),
@@ -417,6 +506,14 @@ router.patch("/:id", async (req, res) => {
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[admin_additional_draws/update] error:", e?.code || e?.message || e);
+    const limitResponse = getOpenDrawLimitResponse(e);
+    if (limitResponse) return res.status(409).json(limitResponse);
+    if (isOneOpenPerTypeConstraint(e)) {
+      return res.status(409).json({
+        error: "additional_draw_database_limit",
+        message: "O banco ainda está configurado para permitir apenas um sorteio aberto por tipo.",
+      });
+    }
     if (e?.status === 400) return res.status(400).json({ error: e.message });
     return res.status(500).json({ error: "additional_draw_update_failed" });
   } finally {
@@ -568,6 +665,8 @@ router.post("/:id/assign-numbers", async (req, res) => {
         RETURNING n, status, reservation_id`,
       [drawId, nums]
     );
+
+    await closeDrawIfSoldOut(drawId, client);
 
     await client.query("COMMIT");
 

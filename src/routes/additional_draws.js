@@ -2,17 +2,124 @@ import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { getPool, query } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
+import { pendingCaptivePreauthReservationGuardSql } from "../services/reservationExpiry.js";
 
 const router = Router();
 
 const RESERVATION_TTL_MIN = Math.max(1, Number(process.env.RESERVATION_TTL_MIN || 30));
+const AUTH_COOKIE_NAMES = [
+  process.env.AUTH_COOKIE_NAME || "ns_auth",
+  "ns_auth_token",
+  "token",
+  "jwt",
+];
+
+const ERROR_MESSAGES = {
+  unauthorized: "Faca login para reservar numeros.",
+  invalid_draw_id: "Sorteio adicional invalido.",
+  numbers_must_be_array: "Selecione ao menos um numero do sorteio adicional.",
+  invalid_numbers: "Selecao de numeros invalida.",
+  no_numbers: "Selecione ao menos um numero do sorteio adicional.",
+  draw_not_found: "Sorteio adicional nao encontrado.",
+  draw_not_open: "Esse sorteio adicional nao esta mais disponivel.",
+  numbers_not_found: "Numero nao encontrado neste sorteio adicional.",
+  numbers_reserved: "Esse numero ja esta reservado temporariamente.",
+  numbers_unavailable: "Esse numero nao esta mais disponivel.",
+  additional_config_not_found: "Configuracao do sorteio adicional indisponivel.",
+  invalid_ticket_price: "Valor do sorteio adicional indisponivel.",
+  reserve_failed: "Nao foi possivel reservar numeros do adicional.",
+};
+
+function jsonError(res, status, error, extra = {}) {
+  return res.status(status).json({
+    ok: false,
+    error,
+    message: ERROR_MESSAGES[error] || ERROR_MESSAGES.reserve_failed,
+    ...extra,
+  });
+}
 
 function isAdditionalDrawType(value) {
   return value === "adicional" || value === "secundario";
 }
 
+function sanitizeToken(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^Bearer\s+/i, "")
+    .replace(/^['"]|['"]$/g, "");
+}
+
+function hasAdditionalReserveCredential(req) {
+  const authorization = sanitizeToken(req.headers?.authorization);
+  if (authorization) return true;
+  const cookies = req.cookies || {};
+  for (const name of AUTH_COOKIE_NAMES) {
+    const token = sanitizeToken(cookies[name]);
+    if (token) return true;
+  }
+  return false;
+}
+
+function requireAdditionalReserveCredential(req, res, next) {
+  if (!hasAdditionalReserveCredential(req)) {
+    return res.status(401).json({
+      ok: false,
+      error: "unauthorized",
+      message: "Faça login para reservar números.",
+    });
+  }
+  return next();
+}
+
 function normalizeNewDrawType(value) {
   return value === "adicional" ? "adicional" : "principal";
+}
+
+// Espelha a mesma regra ja usada pela rota administrativa
+// (admin_additional_draws.js): pagamento aprovado/pago vence o status
+// gravado em public.numbers, sem alterar nada no banco. Puro/testavel
+// isoladamente, sem depender de conexao com o banco.
+function mergeNumbersWithPayments(numbersRows, paidRows) {
+  const soldNumbers = new Set();
+  const initialsByNumber = new Map();
+  const ownerNameByNumber = new Map();
+
+  for (const row of paidRows || []) {
+    const n = Number(row.n);
+    if (!Number.isFinite(n)) continue;
+    soldNumbers.add(n);
+    if (initialsByNumber.has(n)) continue; // linha mais recente ja vence (paidRows ordenado por p.created_at DESC)
+
+    const initials = initialsFromNameOrEmail(row.owner_name, row.owner_email);
+    if (initials) initialsByNumber.set(n, initials);
+    if (row.owner_name) ownerNameByNumber.set(n, row.owner_name);
+  }
+
+  return (numbersRows || []).map((row) => {
+    const n = Number(row.n);
+    return {
+      ...row,
+      n,
+      status: soldNumbers.has(n) ? "sold" : row.status,
+      owner_initials: initialsByNumber.get(n) || null,
+      buyer_initials: initialsByNumber.get(n) || null,
+      owner_name: ownerNameByNumber.get(n) || null,
+    };
+  });
+}
+
+function initialsFromNameOrEmail(name, email) {
+  const nm = String(name || "").trim();
+  if (nm) {
+    const parts = nm.split(/\s+/).filter(Boolean);
+    const first = parts[0]?.[0] || "";
+    const last = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0]?.[1] || "");
+    return (first + last).toUpperCase();
+  }
+  const mail = String(email || "").trim();
+  const user = mail.includes("@") ? mail.split("@")[0] : mail;
+  return user.slice(0, 2).toUpperCase();
 }
 
 function normalizeNumbers(input) {
@@ -51,6 +158,7 @@ async function expireDrawReservations(client, drawId = null) {
         SET status = 'expired'
       WHERE r.status = 'active'
         AND r.expires_at < NOW()
+        AND ${pendingCaptivePreauthReservationGuardSql("r")}
         ${drawFilter}
       RETURNING r.id, r.draw_id, r.numbers`,
     params
@@ -138,6 +246,42 @@ router.get("/open", async (_req, res) => {
   }
 });
 
+async function loadAdditionalDrawsLanding(runQuery = query) {
+  // Todo sorteio adicional/secundario aberto ou encerrado deve continuar
+  // visivel publicamente; encerrar um novo sorteio nao pode fazer um
+  // sorteio encerrado anterior desaparecer da landing.
+  const result = await runQuery(
+    `SELECT id, status, draw_type, product_name, product_link, opened_at,
+            closed_at, realized_at, winner_user_id, winner_name, winner_number
+       FROM public.draws
+      WHERE status IN ('open', 'closed')
+        AND draw_type IN ('adicional', 'secundario')
+      ORDER BY
+        CASE WHEN status = 'open' THEN 0 ELSE 1 END,
+        CASE WHEN status = 'open' THEN id END ASC,
+        CASE WHEN status = 'closed' THEN closed_at END DESC NULLS LAST,
+        id DESC`
+  );
+  return result.rows || [];
+}
+
+router.get("/landing", async (_req, res) => {
+  try {
+    const rows = await loadAdditionalDrawsLanding();
+
+    const configMap = await loadDrawConfigs(rows.map((row) => row.id));
+    const formatted = [];
+    for (const draw of rows) {
+      formatted.push(await formatAdditionalDraw(draw, configMap.get(String(draw.id))));
+    }
+
+    return res.json({ draws: formatted });
+  } catch (e) {
+    console.error("[additional_draws/landing] error:", e?.code || e?.message || e);
+    return res.status(500).json({ error: "additional_draws_landing_failed" });
+  }
+});
+
 router.get("/:id/numbers", async (req, res) => {
   const drawId = Number(req.params.id);
   if (!Number.isInteger(drawId) || drawId <= 0) {
@@ -162,7 +306,7 @@ router.get("/:id/numbers", async (req, res) => {
       return res.status(404).json({ error: "draw_not_found" });
     }
 
-    const numbers = await client.query(
+    const numbersResult = await client.query(
       `SELECT n, status, reservation_id
          FROM public.numbers
         WHERE draw_id = $1
@@ -170,8 +314,24 @@ router.get("/:id/numbers", async (req, res) => {
       [drawId]
     );
 
+    const paidRows = await client.query(
+      `SELECT
+         num.n::int AS n,
+         u.name AS owner_name,
+         u.email AS owner_email
+       FROM public.payments p
+       LEFT JOIN public.users u ON u.id = p.user_id
+       CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
+       WHERE p.draw_id = $1
+         AND lower(p.status) IN ('approved', 'paid', 'pago', 'sold')
+       ORDER BY num.n, p.created_at DESC NULLS LAST, p.id DESC`,
+      [drawId]
+    );
+
+    const rows = mergeNumbersWithPayments(numbersResult.rows, paidRows.rows);
+
     await client.query("COMMIT");
-    return res.json({ draw_id: drawId, numbers: numbers.rows || [] });
+    return res.json({ draw_id: drawId, numbers: rows });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[additional_draws/numbers] error:", e?.code || e?.message || e);
@@ -181,14 +341,14 @@ router.get("/:id/numbers", async (req, res) => {
   }
 });
 
-router.post("/:id/reserve", requireAuth, async (req, res) => {
+router.post("/:id/reserve", requireAdditionalReserveCredential, requireAuth, async (req, res) => {
   const drawId = Number(req.params.id);
   if (!Number.isInteger(drawId) || drawId <= 0) {
-    return res.status(400).json({ error: "invalid_draw_id" });
+    return jsonError(res, 400, "invalid_draw_id");
   }
 
   const normalized = normalizeNumbers(req.body?.numbers);
-  if (normalized.error) return res.status(400).json({ error: normalized.error });
+  if (normalized.error) return jsonError(res, 400, normalized.error);
 
   const nums = normalized.numbers;
   const pool = await getPool();
@@ -209,11 +369,11 @@ router.post("/:id/reserve", requireAuth, async (req, res) => {
     const draw = drawRes.rows[0];
     if (!draw) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "draw_not_found" });
+      return jsonError(res, 404, "draw_not_found");
     }
     if (draw.status !== "open") {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "draw_not_open" });
+      return jsonError(res, 400, "draw_not_open");
     }
 
     const locked = await client.query(
@@ -229,15 +389,22 @@ router.post("/:id/reserve", requireAuth, async (req, res) => {
     const notFound = nums.filter((n) => !found.has(n));
     if (notFound.length) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "numbers_not_found", numbers: notFound });
+      return jsonError(res, 400, "numbers_not_found", { numbers: notFound });
     }
 
     const conflicts = locked.rows
       .filter((row) => String(row.status).toLowerCase() !== "available")
-      .map((row) => Number(row.n));
+      .map((row) => ({
+        n: Number(row.n),
+        status: String(row.status || "").toLowerCase(),
+      }));
     if (conflicts.length) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ error: "numbers_unavailable", conflicts });
+      const hasReserved = conflicts.some((item) => item.status === "reserved");
+      const error = hasReserved ? "numbers_reserved" : "numbers_unavailable";
+      return jsonError(res, 409, error, {
+        conflicts: conflicts.map((item) => item.n),
+      });
     }
 
     const reservationId = uuid();
@@ -266,13 +433,13 @@ router.post("/:id/reserve", requireAuth, async (req, res) => {
     );
     if (!config.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "additional_config_not_found" });
+      return jsonError(res, 404, "additional_config_not_found");
     }
 
     const priceCents = Number(config.rows[0]?.ticket_price_cents);
     if (!Number.isInteger(priceCents) || priceCents <= 0) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "invalid_ticket_price" });
+      return jsonError(res, 400, "invalid_ticket_price");
     }
 
     await client.query("COMMIT");
@@ -287,7 +454,7 @@ router.post("/:id/reserve", requireAuth, async (req, res) => {
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[additional_draws/reserve] error:", e?.code || e?.message || e);
-    return res.status(500).json({ error: "reserve_failed" });
+    return jsonError(res, 500, "reserve_failed");
   } finally {
     client.release();
   }
@@ -298,7 +465,9 @@ export {
   expireDrawReservations,
   formatAdditionalDraw,
   isAdditionalDrawType,
+  loadAdditionalDrawsLanding,
   loadDrawConfigs,
+  mergeNumbersWithPayments,
   normalizeNewDrawType,
 };
 export default router;

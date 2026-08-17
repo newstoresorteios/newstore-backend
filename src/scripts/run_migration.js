@@ -1,89 +1,84 @@
-// Script para executar migrations.
+// Script para executar uma migration localizada exclusivamente em src/migrations.
 //
-//   node src/scripts/run_migration.js 020_reward_products.sql
-//   npm run migrate -- 020_reward_products.sql 021_nscredit_wallets.sql
+//   node src/scripts/run_migration.js 001_x.sql              (DATABASE_URL)
+//   node src/scripts/run_migration.js --test 001_x.sql       (TEST_DATABASE_URL, obrigatorio)
 //
-// Cada arquivo roda na SUA PROPRIA transacao, na ordem informada: se o
-// terceiro falhar, os dois primeiros permanecem aplicados e o erro aponta
-// exatamente qual arquivo parou.
-//
-// Sem argumento o script NAO toca no banco: lista as migrations disponiveis
-// e sai. Aplicar tudo as cegas nunca e o padrao seguro.
-import "dotenv/config";
-import { readFileSync, readdirSync } from "fs";
+// Ver src/scripts/migrationTarget.js para as guardas de producao/teste.
+import "../config/env.js";
+import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
-import { dirname, join, basename } from "path";
-import { getPool } from "../db.js";
+import { basename, dirname, resolve } from "path";
+import { resolveMigrationTarget, MigrationTargetError } from "./migrationTarget.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const MIGRATIONS_DIR = join(__dirname, "../migrations");
 
-function listMigrations() {
+async function runMigration() {
+  const rawArgs = process.argv.slice(2);
+  const isTestMode = rawArgs.includes("--test");
+  const args = rawArgs.filter((a) => a !== "--test");
+  const migrationName = args[0] || "001_add_vindi_columns.sql";
+
+  if (
+    migrationName !== basename(migrationName) ||
+    migrationName.includes("..") ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*\.sql$/.test(migrationName)
+  ) {
+    console.error("Nome de migration invalido.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const migrationsDir = resolve(__dirname, "../migrations");
+  const migrationPath = resolve(migrationsDir, migrationName);
+  if (dirname(migrationPath) !== migrationsDir) {
+    console.error("Migration fora de src/migrations.");
+    process.exitCode = 1;
+    return;
+  }
+
+  let target;
   try {
-    return readdirSync(MIGRATIONS_DIR)
-      .filter((f) => f.toLowerCase().endsWith(".sql"))
-      .sort();
-  } catch {
-    return [];
-  }
-}
-
-/** So aceita o nome do arquivo: nada de caminho arbitrario vindo da linha de comando. */
-function resolveMigration(arg) {
-  const name = basename(String(arg || "").trim());
-  if (!name || !name.toLowerCase().endsWith(".sql")) {
-    throw new Error(`nome de migration invalido: ${arg}`);
-  }
-  const available = listMigrations();
-  if (!available.includes(name)) {
-    throw new Error(`migration nao encontrada: ${name}`);
-  }
-  return { name, path: join(MIGRATIONS_DIR, name) };
-}
-
-async function runMigrations(names) {
-  // Resolve TODOS os nomes antes de abrir conexao: um nome errado nao deve
-  // sequer encostar no banco, muito menos aplicar metade do lote.
-  const planned = names.map(resolveMigration);
-
-  const pool = await getPool();
-
-  for (const { name, path } of planned) {
-    const sql = readFileSync(path, "utf-8");
-
-    console.log(`Executando migration: ${name}`);
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query(sql);
-      await client.query("COMMIT");
-      console.log(`  OK: ${name}`);
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      console.error(`  FALHOU: ${name} -> ${e?.message || e}`);
-      client.release();
-      await pool.end().catch(() => {});
-      process.exit(1);
+    target = resolveMigrationTarget({ isTestMode, env: process.env });
+  } catch (error) {
+    if (error instanceof MigrationTargetError) {
+      console.error(error.message);
+      process.exitCode = 1;
+      return;
     }
-    client.release();
+    throw error;
   }
 
-  await pool.end().catch(() => {});
-  console.log("Migrations aplicadas com sucesso.");
+  // Define DATABASE_URL ANTES de importar db.js: o pool le a env no
+  // carregamento do modulo, entao o import precisa ser dinamico e vir
+  // depois da guarda acima -- nunca antes.
+  process.env.DATABASE_URL = target.url;
+  const { getPool } = await import("../db.js");
+
+  const sql = readFileSync(migrationPath, "utf-8");
+  const pool = await getPool();
+  const client = await pool.connect();
+  let transactionOpen = false;
+
+  try {
+    console.log(`Executando migration: ${migrationName} (modo ${target.mode}, host ${target.host || "?"})`);
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query(sql);
+    await client.query("COMMIT");
+    transactionOpen = false;
+    console.log(`Migration executada com sucesso: ${migrationName}`);
+  } catch (error) {
+    if (transactionOpen) await client.query("ROLLBACK").catch(() => {});
+    console.error(`Erro ao executar migration ${migrationName}:`, error?.message || error);
+    process.exitCode = 1;
+  } finally {
+    client.release();
+    await pool.end();
+  }
 }
 
-const args = process.argv.slice(2).filter(Boolean);
-
-if (args.length === 0) {
-  console.log("Uso: node src/scripts/run_migration.js <arquivo.sql> [outro.sql ...]");
-  console.log("");
-  console.log("Migrations disponiveis:");
-  for (const name of listMigrations()) console.log(`  ${name}`);
-  process.exit(1);
-}
-
-runMigrations(args).catch((e) => {
-  console.error(`Erro: ${e?.message || e}`);
-  process.exit(1);
+runMigration().catch((error) => {
+  console.error("Falha ao preparar migration:", error?.message || error);
+  process.exitCode = 1;
 });

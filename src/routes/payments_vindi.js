@@ -4,6 +4,7 @@ import express from "express";
 import { getPool } from "../db.js";
 import { parseWebhook, getBill, getCharge } from "../services/vindi.js";
 import { creditCouponOnApprovedPayment } from "../services/couponBalance.js";
+import { closeDrawIfSoldOut } from "../services/drawLifecycle.js";
 
 const router = express.Router();
 
@@ -208,6 +209,8 @@ router.post("/vindi/webhook", express.json(), async (req, res) => {
              where draw_id = $2 and n = any($3::int2[])`,
             [resvId, payment.draw_id, payment.numbers]
           );
+
+          await closeDrawIfSoldOut(payment.draw_id, client);
         }
       } else if (newStatus === "refunded") {
         // Se foi refundado, libera números (se ainda não foram usados)

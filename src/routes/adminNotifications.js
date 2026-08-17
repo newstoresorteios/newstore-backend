@@ -26,6 +26,13 @@ import {
 } from "../services/notifications/brevoWhatsApp.js";
 import { sendTestPushToConfiguredSubscription } from "../services/notifications/pushNotifications.js";
 import { assertPushTestAccountAllowed } from "../services/notifications/pushAccessGuard.js";
+import { getManualNotificationCatalog } from "../services/notifications/manualNotificationCatalog.js";
+import {
+  buildManualNotificationPreview,
+  sanitizePreviewForResponse,
+} from "../services/notifications/manualNotificationPreview.js";
+import { sendManualPushNotification } from "../services/notifications/manualPushNotifications.js";
+import { sendManualEmailNotification } from "../services/notifications/manualEmailNotifications.js";
 
 const router = express.Router();
 
@@ -33,6 +40,174 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 router.use(requireAuth, requireAdmin);
+
+function manualErrorStatus(code) {
+  if (code === "manual_template_not_found") return 404;
+  if (code === "manual_template_not_allowed") return 400;
+  if (
+    code === "manual_email_smtp_not_configured" ||
+    code === "manual_push_no_eligible_recipients" ||
+    code === "manual_email_no_valid_recipients" ||
+    code === "email_consent_not_available"
+  ) return 400;
+  if (
+    code === "unsupported_manual_channel" ||
+    code === "manual_recipients_required" ||
+    code === "manual_email_url_invalid" ||
+    code === "manual_too_many_recipients" ||
+    code === "manual_audience_too_large" ||
+    code === "manual_bulk_confirmation_required" ||
+    String(code || "").startsWith("manual_push_")
+  ) return 400;
+  return 500;
+}
+
+router.get("/catalog", async (_req, res) => {
+  try {
+    const catalog = await getManualNotificationCatalog();
+    return res.json(catalog);
+  } catch (error) {
+    console.error("[admin/notifications] catalog error", {
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return res.status(500).json({ ok: false, error: "manual_preview_failed" });
+  }
+});
+
+router.post("/manual/preview", async (req, res) => {
+  try {
+    const preview = await buildManualNotificationPreview({ payload: req.body || {} });
+    return res.json(sanitizePreviewForResponse(preview));
+  } catch (error) {
+    const code = error?.code || "manual_preview_failed";
+    console.warn("[admin/notifications] manual preview failed", {
+      admin_user_id: req.user?.id || null,
+      code,
+    });
+    return res.status(manualErrorStatus(code)).json({
+      ok: false,
+      error: code,
+      ...(error?.max && { max: error.max }),
+    });
+  }
+});
+
+router.post("/manual/send", async (req, res) => {
+  try {
+    const channel = String(req.body?.channel || "").trim().toLowerCase();
+    if (channel === "push") {
+      const result = await sendManualPushNotification({
+        payload: req.body || {},
+        adminUserId: req.user?.id ?? null,
+      });
+      const status = result.error ? manualErrorStatus(result.error) : 200;
+      return res.status(status).json(result);
+    }
+
+    if (channel === "email") {
+      const result = await sendManualEmailNotification({
+        payload: req.body || {},
+        adminUserId: req.user?.id ?? null,
+      });
+      const status = result.error ? manualErrorStatus(result.error) : 200;
+      return res.status(status).json(result);
+    }
+
+    if (channel === "whatsapp") {
+      const preview = await buildManualNotificationPreview({ payload: req.body || {} });
+      const cleanPreview = sanitizePreviewForResponse(preview);
+      if (preview.requires_bulk_confirmation && req.body?.confirm_bulk_send !== true) {
+        return res.status(400).json({
+          ok: false,
+          error: "manual_bulk_confirmation_required",
+          eligible_users: preview.eligible_users,
+          eligible_devices: preview.eligible_devices,
+          valid_phones: preview.valid_phones,
+          valid_emails: preview.valid_emails,
+        });
+      }
+      if (!preview.valid_phones) {
+        return res.status(400).json({
+          ok: false,
+          error: "manual_recipients_required",
+          ...cleanPreview,
+        });
+      }
+
+      const out = await manualSendSelected({
+        channel: "whatsapp",
+        provider: "brevo",
+        templateKey: req.body?.template_key || "GENERIC_TEST",
+        templateId: req.body?.template_id,
+        message: req.body?.message,
+        params: req.body?.params || {},
+        recipients: (
+          preview.normalized.audience === "all_consented"
+            ? preview.normalized.eligibleUserIds
+            : preview.normalized.userIds
+        ).map((userId) => ({ user_id: userId })),
+        useCustomRecipient: false,
+        dryRun: false,
+        adminUserId: req.user?.id ?? null,
+        audience: preview.normalized.audience,
+        consentCategory:
+          preview.normalized.audience === "all_consented" ? "operational" : "manual",
+        audienceStats: {
+          requested_users: preview.requested_users,
+          eligible_users: preview.eligible_users,
+          blocked_by_consent: preview.blocked_by_consent,
+          missing_contact: preview.missing_contact,
+          estimated_batches: preview.estimated_batches,
+        },
+      });
+
+      if (out.error) {
+        const code =
+          out.error === "too_many_recipients" ? "manual_too_many_recipients" :
+          out.error === "recipients_required" ? "manual_recipients_required" :
+          out.error;
+        return res.status(manualErrorStatus(code)).json({ ok: false, error: code, ...out });
+      }
+
+      return res.json({
+        ok: out.ok,
+        channel: "whatsapp",
+        provider: "brevo",
+        campaign_id: out.campaign?.id || null,
+        campaign: out.campaign || null,
+        dispatches: out.dispatches || [],
+        summary: out.summary || null,
+        warning: out.warning || null,
+        requested_users: preview.requested_users,
+        eligible_users: preview.eligible_users,
+        valid_phones: preview.valid_phones,
+        eligible_devices: 0,
+        batches_processed: out.batches_processed || 0,
+        sent: out.sent || 0,
+        accepted: out.accepted || 0,
+        failed: out.failed || 0,
+        skipped: out.skipped || 0,
+        blocked_by_consent: preview.blocked_by_consent,
+        missing_contact: preview.missing_contact,
+      });
+    }
+
+    return res.status(400).json({ ok: false, error: "unsupported_manual_channel" });
+  } catch (error) {
+    const code = error?.code || "manual_send_failed";
+    console.error("[admin/notifications] manual send failed", {
+      admin_user_id: req.user?.id || null,
+      code,
+      message: error?.message || null,
+    });
+    return res.status(manualErrorStatus(code)).json({
+      ok: false,
+      error: code,
+      ...(error?.max && { max: error.max }),
+    });
+  }
+});
 
 router.post("/push/test-single-device", async (req, res) => {
   try {
@@ -416,11 +591,14 @@ router.post("/templates/sync-brevo-whatsapp", async (req, res) => {
       synced_count: result.synced_count,
     });
 
+    const catalog = await getManualNotificationCatalog();
+
     return res.json({
       ok: true,
       fetched_count: result.fetched_count,
       synced_count: result.synced_count,
       templates: result.templates,
+      catalog,
     });
   } catch (e) {
     console.error("[admin/notifications] sync brevo templates:error", {
@@ -750,6 +928,9 @@ router.post("/test-whatsapp", async (req, res) => {
       )
     );
   } catch (e) {
+    if (e?.code === "manual_template_not_found" || e?.code === "manual_template_not_allowed") {
+      return res.status(manualErrorStatus(e.code)).json({ ok: false, error: e.code });
+    }
     console.error("[admin/notifications] test-whatsapp error", {
       message: e?.message || null,
       stack: e?.stack || null,
@@ -861,6 +1042,9 @@ router.post("/manual-send-selected", async (req, res) => {
       ...(out.message && { message: out.message }),
     });
   } catch (e) {
+    if (e?.code === "manual_template_not_found" || e?.code === "manual_template_not_allowed") {
+      return res.status(manualErrorStatus(e.code)).json({ ok: false, error: e.code });
+    }
     console.error("[admin/notifications] manual-send-selected error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
@@ -915,6 +1099,9 @@ router.post("/manual-send", async (req, res) => {
       )
     );
   } catch (e) {
+    if (e?.code === "manual_template_not_found" || e?.code === "manual_template_not_allowed") {
+      return res.status(manualErrorStatus(e.code)).json({ ok: false, error: e.code });
+    }
     console.error("[admin/notifications] manual-send error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }

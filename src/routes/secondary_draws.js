@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { getPool } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { getTicketPriceCents } from "../services/config.js";
+import { pendingCaptivePreauthReservationGuardSql } from "../services/reservationExpiry.js";
 
 const router = Router();
 
@@ -21,6 +22,19 @@ function isAdditionalDrawType(value) {
 
 function normalizeNewDrawType(value) {
   return value === "adicional" ? "adicional" : "principal";
+}
+
+function initialsFromNameOrEmail(name, email) {
+  const nm = String(name || "").trim();
+  if (nm) {
+    const parts = nm.split(/\s+/).filter(Boolean);
+    const first = parts[0]?.[0] || "";
+    const last = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0]?.[1] || "");
+    return (first + last).toUpperCase();
+  }
+  const mail = String(email || "").trim();
+  const user = mail.includes("@") ? mail.split("@")[0] : mail;
+  return user.slice(0, 2).toUpperCase();
 }
 
 function normalizeNumbers(input) {
@@ -56,6 +70,7 @@ async function expireDrawReservations(client, drawId = null) {
         SET status = 'expired'
       WHERE r.status = 'active'
         AND r.expires_at < NOW()
+        AND ${pendingCaptivePreauthReservationGuardSql("r")}
         ${drawFilter}
       RETURNING r.id, r.draw_id`,
     params
@@ -158,7 +173,7 @@ router.get("/:id/numbers", async (req, res) => {
       return res.status(404).json({ error: "draw_not_found" });
     }
 
-    const { rows } = await client.query(
+    const numbersResult = await client.query(
       `SELECT n, status, reservation_id
          FROM numbers
         WHERE draw_id = $1
@@ -166,8 +181,49 @@ router.get("/:id/numbers", async (req, res) => {
       [drawId]
     );
 
+    const paidRows = await client.query(
+      `SELECT
+         num.n::int AS n,
+         u.name AS owner_name,
+         u.email AS owner_email
+       FROM public.payments p
+       LEFT JOIN public.users u ON u.id = p.user_id
+       CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
+       WHERE p.draw_id = $1
+         AND lower(p.status) IN ('approved', 'paid', 'pago')`,
+      [drawId]
+    );
+
+    const initialsByNumber = new Map();
+    const ownerNameByNumber = new Map();
+
+    for (const row of paidRows.rows || []) {
+      const n = Number(row.n);
+      const initials = initialsFromNameOrEmail(row.owner_name, row.owner_email);
+
+      if (Number.isFinite(n) && initials) {
+        initialsByNumber.set(n, initials);
+      }
+
+      if (Number.isFinite(n) && row.owner_name) {
+        ownerNameByNumber.set(n, row.owner_name);
+      }
+    }
+
+    const rows = (numbersResult.rows || []).map((row) => {
+      const n = Number(row.n);
+
+      return {
+        ...row,
+        n,
+        owner_initials: initialsByNumber.get(n) || null,
+        buyer_initials: initialsByNumber.get(n) || null,
+        owner_name: ownerNameByNumber.get(n) || null,
+      };
+    });
+
     await client.query("COMMIT");
-    return res.json({ draw_id: drawId, numbers: rows || [] });
+    return res.json({ draw_id: drawId, numbers: rows });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch {}
     console.error("[secondary_draws/numbers] error:", e?.code || e?.message || e);

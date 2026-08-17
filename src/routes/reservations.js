@@ -3,6 +3,10 @@ import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import {
+  cleanupExpiredReservationsGlobal,
+  pendingCaptivePreauthReservationGuardSql,
+} from '../services/reservationExpiry.js';
 
 const router = Router();
 
@@ -11,29 +15,8 @@ const router = Router();
  * Mantido para “limpeza geral”; a expiração crítica também acontece
  * dentro da transação ao reservar (garante consistência).
  */
-async function cleanupExpiredGlobal() {
-  // expira qualquer reserva “bloqueadora” vencida
-  await query(
-    `UPDATE reservations
-        SET status = 'expired'
-      WHERE expires_at IS NOT NULL
-        AND expires_at < NOW()
-        AND lower(coalesce(status,'')) IN ('active','pending','reserved','')`
-  );
-
-  // libera números que ficaram presos com reservation_id sem reserva ativa
-  await query(
-    `UPDATE numbers n
-        SET status = 'available',
-            reservation_id = NULL
-      WHERE n.status = 'reserved'
-        AND NOT EXISTS (
-              SELECT 1
-                FROM reservations r
-               WHERE r.id = n.reservation_id
-                 AND lower(coalesce(r.status,'')) IN ('active','pending','reserved','')
-            )`
-  );
+export async function cleanupExpiredGlobal(runQuery = query) {
+  return cleanupExpiredReservationsGlobal(runQuery);
 }
 
 router.post('/', requireAuth, async (req, res) => {
@@ -50,7 +33,7 @@ router.post('/', requireAuth, async (req, res) => {
     }
 
     // limpeza “background” (não bloqueia o request)
-    try { cleanupExpiredGlobal(); } catch {}
+    void cleanupExpiredGlobal().catch(() => {});
 
     const { numbers } = req.body || {};
     if (!Array.isArray(numbers) || numbers.length === 0) {
@@ -122,10 +105,22 @@ router.post('/', requireAuth, async (req, res) => {
           const isExpired = r.expires_at && new Date(r.expires_at).getTime() <= Date.now();
 
           if (isBlocking && isExpired) {
-            // expira a reserva e marca para liberar seus números
-            await query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [rid]);
-            if (!byResId.has(rid)) byResId.set(rid, []);
-            byResId.get(rid).push(row.n);
+            // Só o fluxo de preauth pode resolver uma reserva ligada a autorização pending.
+            const expired = await query(
+              `UPDATE public.reservations reservation
+                  SET status = 'expired'
+                WHERE reservation.id = $1
+                  AND reservation.expires_at IS NOT NULL
+                  AND reservation.expires_at <= now()
+                  AND lower(coalesce(reservation.status, '')) IN ('active', 'pending', 'reserved', '')
+                  AND ${pendingCaptivePreauthReservationGuardSql("reservation")}
+                RETURNING reservation.id`,
+              [rid]
+            );
+            if (expired.rowCount > 0) {
+              if (!byResId.has(rid)) byResId.set(rid, []);
+              byResId.get(rid).push(row.n);
+            }
           }
         }
       }

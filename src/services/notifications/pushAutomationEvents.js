@@ -4,6 +4,7 @@ import {
   getAllowedPushRuleEvents,
 } from "./pushRules.js";
 import { sendPushToSubscriptionRow } from "./pushNotifications.js";
+import { handleWhatsAppAutomationEvent } from "./whatsappAutomationEvents.js";
 
 const MAX_METADATA_BYTES = 4096;
 const MAX_RECIPIENT_USER_IDS = 500;
@@ -11,6 +12,8 @@ const SENSITIVE_KEY_RE = /(password|secret|token|authorization|cookie|endpoint|p
 
 const PUBLIC_EVENT_KEYS = new Set([
   "NEW_DRAW_PUBLISHED",
+  "DRAW_REMAINING_NUMBERS_75",
+  "DRAW_REMAINING_NUMBERS_50",
   "DRAW_REMAINING_NUMBERS_20",
   "DRAW_REMAINING_NUMBERS_10",
   "WINNER_DEFINED",
@@ -18,6 +21,7 @@ const PUBLIC_EVENT_KEYS = new Set([
 
 const USER_EVENT_KEYS = new Set([
   "BALANCE_EXPIRING_30_DAYS",
+  "BALANCE_EXPIRING_15_DAYS",
   "BALANCE_EXPIRING_10_DAYS",
   "BALANCE_EXPIRING_7_DAYS",
   "BALANCE_EXPIRED",
@@ -246,6 +250,120 @@ async function countReferencesForScan({ eventKey, scanId, referenceKey }) {
   return Number(result.rows?.[0]?.count || 0);
 }
 
+function buildAutomationDedupeKey({ eventKey, referenceKey }) {
+  return `push:${eventKey}:${referenceKey}`;
+}
+
+function isRetryableLedgerStatus(status) {
+  return String(status || "").toLowerCase() === "failed";
+}
+
+async function claimAutomationEventLedger({
+  eventKey,
+  referenceType,
+  referenceKey,
+  source,
+  scanId,
+  occurredAt,
+  metadata,
+  recipientUserIds,
+  dryRun,
+}) {
+  if (!referenceKey) return { claimed: false, deduped: false, ledger: null };
+
+  const dedupeKey = buildAutomationDedupeKey({ eventKey, referenceKey });
+  const mode = dryRun ? "test" : "production";
+  const meta = {
+    source,
+    scan_id: scanId,
+    occurred_at: occurredAt,
+    reference_type: referenceType,
+    reference_key: referenceKey,
+    metadata,
+    recipient_user_ids: recipientUserIds,
+    automation: true,
+  };
+
+  const inserted = await query(
+    `INSERT INTO public.notification_event_ledger (
+       event_key, dedupe_key, channel, category, entity_type, entity_id, status, mode, meta
+     ) VALUES ($1, $2, 'push', 'operational', $3, $4, 'processing', $5, $6::jsonb)
+     ON CONFLICT (dedupe_key) DO NOTHING
+     RETURNING id, event_key, dedupe_key, status`,
+    [eventKey, dedupeKey, referenceType || null, referenceKey, mode, JSON.stringify(meta)]
+  );
+  if (inserted.rowCount) {
+    return { claimed: true, deduped: false, ledger: inserted.rows[0] };
+  }
+
+  const existing = await query(
+    `SELECT id, event_key, dedupe_key, status
+       FROM public.notification_event_ledger
+      WHERE dedupe_key = $1
+      LIMIT 1`,
+    [dedupeKey]
+  );
+  const ledger = existing.rows?.[0] || null;
+  if (ledger && isRetryableLedgerStatus(ledger.status)) {
+    const retry = await query(
+      `UPDATE public.notification_event_ledger
+          SET status = 'processing',
+              mode = $2,
+              meta = $3::jsonb
+        WHERE id = $1
+          AND status = 'failed'
+        RETURNING id, event_key, dedupe_key, status`,
+      [ledger.id, mode, JSON.stringify(meta)]
+    );
+    if (retry.rowCount) return { claimed: true, deduped: false, ledger: retry.rows[0] };
+  }
+
+  return { claimed: false, deduped: true, ledger };
+}
+
+async function finishAutomationEventLedger(ledgerClaim, result, { category = "operational", dryRun = true } = {}) {
+  if (!ledgerClaim?.claimed || !ledgerClaim?.ledger?.id) return;
+  const status = String(result?.status || "processed").slice(0, 80);
+  const meta = {
+    final_status: status,
+    deduped: Boolean(result?.deduped),
+    attempted: Number(result?.attempted || 0),
+    sent: Number(result?.sent || 0),
+    failed: Number(result?.failed || 0),
+    reason: result?.reason || null,
+  };
+  try {
+    await query(
+      `UPDATE public.notification_event_ledger
+          SET status = $2,
+              category = $3,
+              mode = $4,
+              meta = COALESCE(meta, '{}'::jsonb) || $5::jsonb
+        WHERE id = $1`,
+      [ledgerClaim.ledger.id, status, category || "operational", dryRun ? "test" : "production", JSON.stringify(meta)]
+    );
+  } catch (error) {
+    console.warn("[push-internal] ledger:finish_failed", {
+      event_key: ledgerClaim.ledger.event_key || null,
+      dedupe_key: ledgerClaim.ledger.dedupe_key || null,
+      status,
+      error: error?.code || error?.message || "ledger_finish_failed",
+    });
+  }
+}
+
+function buildDedupedAutomationResult({ eventKey, referenceKey, ledger }) {
+  return {
+    ok: true,
+    event_key: eventKey,
+    status: "deduped",
+    deduped: true,
+    reference_key: referenceKey,
+    reason: "already_processed",
+    ledger_status: ledger?.status || null,
+  };
+}
+
 async function insertSafetySkipped({
   eventKey,
   source,
@@ -335,6 +453,40 @@ export async function handlePushAutomationEvent({
     ? sanitizeMetadataValue(actor)
     : null;
   const engineSource = isEngineSource(safeSource);
+  let ledgerClaim = null;
+  let whatsappResult = null;
+
+  async function ensureLedgerClaim() {
+    if (ledgerClaim) return ledgerClaim;
+    ledgerClaim = await claimAutomationEventLedger({
+      eventKey: key,
+      referenceType: safeReferenceType,
+      referenceKey: safeReferenceKey,
+      source: safeSource,
+      scanId: safeScanId,
+      occurredAt: occurred.value,
+      metadata: safeMetadata,
+      recipientUserIds: safeRecipientUserIds,
+      dryRun,
+    });
+    return ledgerClaim;
+  }
+
+  async function getDedupedResultIfNeeded() {
+    const claim = await ensureLedgerClaim();
+    if (!claim?.deduped) return null;
+    return buildDedupedAutomationResult({
+      eventKey: key,
+      referenceKey: safeReferenceKey,
+      ledger: claim.ledger,
+    });
+  }
+
+  async function finishWithLedger(result, category = "operational") {
+    const finalResult = whatsappResult ? { ...result, whatsapp: whatsappResult } : result;
+    await finishAutomationEventLedger(ledgerClaim, finalResult, { category, dryRun });
+    return finalResult;
+  }
 
   if (engineSource) {
     const skippedArgs = {
@@ -350,18 +502,24 @@ export async function handlePushAutomationEvent({
     };
 
     if (envBool("PUSH_ENGINE_REQUIRE_OCCURRED_AT", true) && !occurred.valid) {
-      return insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_occurred_at" });
+      const deduped = await getDedupedResultIfNeeded();
+      if (deduped) return deduped;
+      return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_occurred_at" }));
     }
 
     if (occurred.valid && envBool("PUSH_ENGINE_SAFETY_NO_BACKFILL", true)) {
       const maxAgeHours = envPositiveInt("PUSH_ENGINE_MAX_EVENT_AGE_HOURS", 24);
       if (Date.now() - occurred.date.getTime() > maxAgeHours * 60 * 60 * 1000) {
-        return insertSafetySkipped({ ...skippedArgs, reason: "safety_event_too_old" });
+        const deduped = await getDedupedResultIfNeeded();
+        if (deduped) return deduped;
+        return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_event_too_old" }));
       }
     }
 
     if (envBool("PUSH_ENGINE_REQUIRE_SCAN_ID", true) && !safeScanId) {
-      return insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_scan_id" });
+      const deduped = await getDedupedResultIfNeeded();
+      if (deduped) return deduped;
+      return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_scan_id" }));
     }
 
     if (!dryRun && safeScanId && !envBool("PUSH_ENGINE_ALLOW_LARGE_BATCH", false)) {
@@ -375,45 +533,43 @@ export async function handlePushAutomationEvent({
         referenceKey: safeReferenceKey,
       });
       if (!existingSent && acceptedReferences >= maxReferences) {
-        return insertSafetySkipped({ ...skippedArgs, reason: "safety_scan_event_limit_exceeded" });
+        const deduped = await getDedupedResultIfNeeded();
+        if (deduped) return deduped;
+        return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_scan_event_limit_exceeded" }));
       }
     }
   }
 
   if (!dryRun) {
     assertAutomationRealSendAllowed(key);
-    const dedupe = await findSentDispatch({ eventKey: key, referenceKey: safeReferenceKey });
-    if (dedupe) {
-      const dispatch = await insertAutomationDispatch({
-        eventKey: key,
-        status: "deduped",
-        category: "operational",
-        title: "Push duplicado",
-        body: "Evento ja enviado para esta referencia.",
-        url: null,
-        payload: {
-          source: safeSource,
-          scan_id: safeScanId,
-          occurred_at: occurred.value,
-          reference_type: safeReferenceType,
-          reference_key: safeReferenceKey,
-          metadata: safeMetadata,
-          recipient_user_ids: safeRecipientUserIds,
-          automation: true,
-          real_send: true,
-          deduped: true,
-          deduped_dispatch_id: dedupe.id,
-        },
-      });
-      return {
-        ok: true,
-        event_key: key,
-        status: "deduped",
-        deduped: true,
-        reference_key: safeReferenceKey,
-        dispatch,
-      };
-    }
+  }
+
+  const deduped = await getDedupedResultIfNeeded();
+  if (deduped) return deduped;
+
+  try {
+    whatsappResult = await handleWhatsAppAutomationEvent({
+      eventKey: key,
+      source: safeSource,
+      referenceType: safeReferenceType,
+      referenceKey: safeReferenceKey,
+      metadata: safeMetadata,
+      recipientUserIds: safeRecipientUserIds,
+      dryRun,
+    });
+  } catch (error) {
+    console.warn("[push-internal] whatsapp automation failed", {
+      event_key: key,
+      reference_key: safeReferenceKey,
+      code: error?.code || null,
+      message: error?.message || null,
+    });
+    whatsappResult = {
+      ok: false,
+      event_key: key,
+      status: "failed",
+      reason: error?.code || error?.message || "whatsapp_automation_failed",
+    };
   }
 
   const rule = await getActivePushRuleByEventKey(key);
@@ -439,7 +595,7 @@ export async function handlePushAutomationEvent({
         actor: safeActor,
       },
     });
-    return { ok: true, event_key: key, status: "skipped", dispatch };
+    return finishWithLedger({ ok: true, event_key: key, status: "skipped", dispatch });
   }
 
   const renderedTitle = renderTemplate(rule.title_template, safeMetadata);
@@ -474,7 +630,7 @@ export async function handlePushAutomationEvent({
           no_recipients: true,
         },
       });
-      return {
+      return finishWithLedger({
         ok: true,
         event_key: key,
         status: "skipped",
@@ -483,7 +639,7 @@ export async function handlePushAutomationEvent({
         failed: 0,
         reference_key: safeReferenceKey,
         dispatch,
-      };
+      }, rule.category || "operational");
     }
 
     let sent = 0;
@@ -517,7 +673,7 @@ export async function handlePushAutomationEvent({
         failed += 1;
       }
     }
-    return {
+    return finishWithLedger({
       ok: true,
       event_key: key,
       status: sent > 0 ? "sent" : "failed",
@@ -525,7 +681,7 @@ export async function handlePushAutomationEvent({
       sent,
       failed,
       reference_key: safeReferenceKey,
-    };
+    }, rule.category || "operational");
   }
 
   const dispatch = await insertAutomationDispatch({
@@ -549,5 +705,5 @@ export async function handlePushAutomationEvent({
     },
   });
 
-  return { ok: true, event_key: key, status: "dry_run", dispatch };
+  return finishWithLedger({ ok: true, event_key: key, status: "dry_run", dispatch }, rule.category || "operational");
 }

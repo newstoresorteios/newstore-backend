@@ -16,10 +16,24 @@ router.get('/', requireAuth, async (req, res) => {
     const userId = req.user.id;
     // busca no banco pra garantir dados atualizados
     const r = await query(
-      'select id, name, email, phone, is_admin from users where id = $1',
+      `select id, name, email, phone, is_admin, winner_balance_cents, winner_balance_updated_at
+         from users
+        where id = $1`,
       [userId]
     );
     const u = r.rows[0] || req.user;
+    const user = {
+      id: u.id,
+      name: u.name || null,
+      email: u.email || null,
+      phone: u.phone || null,
+      is_admin: !!u.is_admin,
+    };
+    const winnerBalanceCents = u.winner_balance_cents == null ? null : Number(u.winner_balance_cents);
+    if (Number.isFinite(winnerBalanceCents) && winnerBalanceCents > 0) {
+      user.winner_balance_cents = winnerBalanceCents;
+      user.winner_balance_updated_at = u.winner_balance_updated_at || null;
+    }
 
     // "Membro desde" para a area do cliente. Consulta separada e tolerante:
     // se a coluna nao existir no ambiente, o /me continua respondendo normalmente.
@@ -30,17 +44,9 @@ router.get('/', requireAuth, async (req, res) => {
     } catch (e) {
       console.warn('[me] created_at indisponivel:', e?.code || e?.message);
     }
+    user.created_at = memberSince;
 
-    return res.json({
-      user: {
-        id: u.id,
-        name: u.name || null,
-        email: u.email || null,
-        phone: u.phone || null,
-        is_admin: !!u.is_admin,
-        created_at: memberSince,
-      },
-    });
+    return res.json({ user });
   } catch (e) {
     console.error('[me] error:', e);
     return res.status(500).json({ error: 'me_failed' });

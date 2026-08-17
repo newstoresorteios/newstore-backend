@@ -1,15 +1,275 @@
 // backend/src/routes/admin_dashboard.js
 import { Router } from "express";
-import { query } from "../db.js";
+import { getPool, query } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getTicketPriceCents, setTicketPriceCents } from "../services/config.js";
 import { runAutopayForDraw } from "../services/autopayRunner.js";
+import {
+  createCaptivePreAuthorizationsForDraw,
+  isCaptivePreauthEnabled,
+  resolveCaptivePreauthDrawRequirement,
+} from "../services/autopay/captivePreauthService.js";
 import { handlePushAutomationEvent } from "../services/notifications/pushAutomationEvents.js";
 
 const router = Router();
 
 function log(...a) {
   console.log("[admin/dashboard]", ...a);
+}
+
+function normalizePrincipalConfigPayload(body = {}) {
+  if (
+    body.ticket_price_cents === undefined ||
+    body.banner_title === undefined ||
+    body.max_numbers_per_selection === undefined
+  ) {
+    return { error: "principal_config_fields_required" };
+  }
+
+  const ticketPriceCents = Number(body.ticket_price_cents);
+  if (!Number.isInteger(ticketPriceCents) || ticketPriceCents <= 0) {
+    return { error: "invalid_ticket_price_cents" };
+  }
+  if (typeof body.banner_title !== "string") {
+    return { error: "invalid_banner_title" };
+  }
+  const bannerTitle = body.banner_title.trim();
+  if (bannerTitle.length > 255) {
+    return { error: "invalid_banner_title" };
+  }
+  const maxNumbersPerSelection = Number(body.max_numbers_per_selection);
+  if (!Number.isInteger(maxNumbersPerSelection) || maxNumbersPerSelection <= 0) {
+    return { error: "invalid_max_numbers_per_selection" };
+  }
+  return {
+    value: {
+      ticket_price_cents: ticketPriceCents,
+      banner_title: bannerTitle,
+      max_numbers_per_selection: maxNumbersPerSelection,
+    },
+  };
+}
+
+function normalizePersistedPrincipalConfig(globalRows, drawRow) {
+  const global = new Map((globalRows || []).map((row) => [String(row.key), row.value]));
+  return {
+    global: {
+      ticket_price_cents: Number(global.get("ticket_price_cents")),
+      banner_title: String(global.get("banner_title") ?? "").trim(),
+      max_numbers_per_selection: Number(global.get("max_numbers_per_selection")),
+    },
+    draw: {
+      ticket_price_cents: Number(drawRow?.ticket_price_cents),
+      banner_title: String(drawRow?.banner_title ?? "").trim(),
+      max_numbers_per_selection: Number(drawRow?.max_numbers_per_selection),
+    },
+  };
+}
+
+function samePrincipalConfig(left, right) {
+  return (
+    left.ticket_price_cents === right.ticket_price_cents &&
+    left.banner_title === right.banner_title &&
+    left.max_numbers_per_selection === right.max_numbers_per_selection
+  );
+}
+
+export function createPrincipalDrawConfigHandler(options = {}) {
+  const getPoolFn = options.getPoolFn || getPool;
+  return async function savePrincipalDrawConfig(req, res) {
+    const drawId = Number(req.params.drawId);
+    if (!Number.isInteger(drawId) || drawId <= 0) {
+      return res.status(400).json({ error: "invalid_draw_id" });
+    }
+    const normalized = normalizePrincipalConfigPayload(req.body || {});
+    if (normalized.error) return res.status(400).json({ error: normalized.error });
+
+    const fields = ["ticket_price_cents", "banner_title", "max_numbers_per_selection"];
+    console.log("[admin-draw-config] update_started", { draw_id: drawId, fields });
+
+    let client;
+    let transactionOpen = false;
+    try {
+      const pool = await getPoolFn();
+      client = await pool.connect();
+      await client.query("BEGIN");
+      transactionOpen = true;
+
+      const drawResult = await client.query(
+        `SELECT id, status, draw_type
+           FROM public.draws
+          WHERE id = $1
+          FOR UPDATE`,
+        [drawId]
+      );
+      const draw = drawResult.rows?.[0] || null;
+      if (!draw) {
+        await client.query("ROLLBACK");
+        transactionOpen = false;
+        console.warn("[admin-draw-config] update_rolled_back", { draw_id: drawId, reason: "draw_not_found" });
+        return res.status(404).json({ error: "draw_not_found" });
+      }
+      if (String(draw.draw_type || "principal").trim().toLowerCase() !== "principal") {
+        await client.query("ROLLBACK");
+        transactionOpen = false;
+        console.warn("[admin-draw-config] update_rolled_back", { draw_id: drawId, reason: "principal_draw_required" });
+        return res.status(400).json({ error: "principal_draw_required" });
+      }
+
+      const currentPriceResult = await client.query(
+        `SELECT value
+           FROM public.app_config
+          WHERE key = 'ticket_price_cents'
+          LIMIT 1`
+      );
+      const currentPrice = Number(
+        currentPriceResult.rows?.[0]?.value ?? process.env.PRICE_CENTS ?? 5500
+      );
+      if (normalized.value.ticket_price_cents !== currentPrice) {
+        const activityResult = await client.query(
+          `SELECT
+             EXISTS (SELECT 1 FROM public.payments WHERE draw_id = $1) AS has_payment,
+             EXISTS (
+               SELECT 1 FROM public.reservations
+                WHERE draw_id = $1
+                  AND lower(coalesce(status, '')) IN ('active', 'pending', 'reserved', 'paid')
+             ) AS has_active_reservation,
+             EXISTS (
+               SELECT 1 FROM public.numbers
+                WHERE draw_id = $1
+                  AND lower(coalesce(status, 'available')) IN ('sold', 'reserved')
+             ) AS has_sold_or_reserved_number,
+             EXISTS (SELECT 1 FROM public.autopay_draw_authorizations WHERE draw_id = $1) AS has_preauthorization,
+             EXISTS (SELECT 1 FROM public.autopay_runs WHERE draw_id = $1) AS has_autopay_run`,
+          [drawId]
+        );
+        const activity = activityResult.rows?.[0] || {};
+        if (Object.values(activity).some(Boolean)) {
+          console.warn("[admin-draw-config] ticket_price_locked", { draw_id: drawId });
+          await client.query("ROLLBACK");
+          transactionOpen = false;
+          console.warn("[admin-draw-config] update_rolled_back", { draw_id: drawId, reason: "draw_ticket_price_locked" });
+          return res.status(409).json({
+            error: "draw_ticket_price_locked",
+            message: "O valor da cota não pode ser alterado após o início das vendas.",
+          });
+        }
+      }
+
+      const config = normalized.value;
+      await client.query(
+        `INSERT INTO public.app_config (key, value, updated_at)
+         SELECT entry.key, entry.value, NOW()
+           FROM unnest($1::text[], $2::text[]) AS entry(key, value)
+         ON CONFLICT (key) DO UPDATE
+           SET value = EXCLUDED.value,
+               updated_at = NOW()`,
+        [
+          ["ticket_price_cents", "banner_title", "max_numbers_per_selection"],
+          [String(config.ticket_price_cents), config.banner_title, String(config.max_numbers_per_selection)],
+        ]
+      );
+      await client.query(
+        `INSERT INTO public.app_config_new AS cfg
+           (id, banner_title, ticket_price_cents, max_numbers_per_selection)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE
+           SET banner_title = EXCLUDED.banner_title,
+               ticket_price_cents = EXCLUDED.ticket_price_cents,
+               max_numbers_per_selection = EXCLUDED.max_numbers_per_selection`,
+        [String(drawId), config.banner_title, config.ticket_price_cents, config.max_numbers_per_selection]
+      );
+
+      const [globalResult, individualResult] = await Promise.all([
+        client.query(
+          `SELECT key, value
+             FROM public.app_config
+            WHERE key = ANY($1::text[])`,
+          [["ticket_price_cents", "banner_title", "max_numbers_per_selection"]]
+        ),
+        client.query(
+          `SELECT banner_title, ticket_price_cents, max_numbers_per_selection
+             FROM public.app_config_new
+            WHERE id = $1
+            LIMIT 1`,
+          [String(drawId)]
+        ),
+      ]);
+      const persisted = normalizePersistedPrincipalConfig(
+        globalResult.rows,
+        individualResult.rows?.[0]
+      );
+      if (
+        !samePrincipalConfig(persisted.global, config) ||
+        !samePrincipalConfig(persisted.draw, config)
+      ) {
+        const error = new Error("draw_config_sync_failed");
+        error.code = "draw_config_sync_failed";
+        throw error;
+      }
+
+      await client.query("COMMIT");
+      transactionOpen = false;
+      console.log("[admin-draw-config] update_committed", {
+        draw_id: drawId,
+        sync: { global: true, draw: true },
+      });
+      return res.json({
+        ok: true,
+        draw: {
+          id: Number(draw.id),
+          status: draw.status,
+          draw_type: draw.draw_type || "principal",
+        },
+        config,
+        sync: { global: true, draw: true },
+      });
+    } catch (error) {
+      if (transactionOpen && client) {
+        try { await client.query("ROLLBACK"); } catch {}
+      }
+      console.warn("[admin-draw-config] update_rolled_back", {
+        draw_id: drawId,
+        reason: error?.code || error?.message || "principal_config_update_failed",
+      });
+      const syncFailed = error?.code === "draw_config_sync_failed";
+      return res.status(500).json({
+        error: syncFailed ? "draw_config_sync_failed" : "principal_config_update_failed",
+      });
+    } finally {
+      if (client) client.release();
+    }
+  };
+}
+
+async function createCaptivePreauthIfEnabled(drawId, adminUserId, context, amountCents) {
+  if (!isCaptivePreauthEnabled()) {
+    return { ok: true, skipped: true, reason: "captive_preauth_disabled" };
+  }
+  try {
+    const requirement = await resolveCaptivePreauthDrawRequirement(drawId, { amountCents });
+    if (!requirement.required) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "amount_not_above_default",
+        ...requirement,
+      };
+    }
+    return await createCaptivePreAuthorizationsForDraw(drawId, { adminUserId, amountCents });
+  } catch (error) {
+    console.error(`[${context}] captive preauth failed`, {
+      draw_id: drawId,
+      admin_user_id: adminUserId || null,
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+    return {
+      ok: false,
+      error: error?.message || "captive_preauth_create_failed",
+      code: error?.code || null,
+    };
+  }
 }
 
 async function emitAdminNewDrawPublished(drawId) {
@@ -49,14 +309,12 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
   try {
     console.log("[admin/dashboard] GET /summary");
 
-    // sorteio aberto mais recente
+    // principal aberto; se nao houver, ultimo principal como historico
     const d = await query(
-      `SELECT id, opened_at
+      `SELECT id, status, draw_type, opened_at, closed_at, realized_at
          FROM draws
-        WHERE status = 'open'
-          AND COALESCE(draw_type, 'principal') = 'principal'
-        ORDER BY opened_at DESC NULLS LAST,
-                 created_at DESC NULLS LAST,
+        WHERE COALESCE(draw_type, 'principal') = 'principal'
+        ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END,
                  id DESC
         LIMIT 1`
     );
@@ -67,6 +325,10 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
     if (!current?.id) {
       return res.json({
         draw_id: null,
+        status: null,
+        draw_type: null,
+        closed_at: null,
+        realized_at: null,
         total: 0,
         sold: 0,
         remaining: 0,
@@ -117,6 +379,10 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
 
     return res.json({
       draw_id: current.id,
+      status: current.status,
+      draw_type: current.draw_type || "principal",
+      closed_at: current.closed_at || null,
+      realized_at: current.realized_at || null,
       total,
       sold,
       remaining,
@@ -132,30 +398,80 @@ router.get("/summary", requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
+router.patch(
+  "/draws/:drawId/config",
+  requireAuth,
+  requireAdmin,
+  createPrincipalDrawConfigHandler()
+);
+
 
 /**
  * POST /api/admin/dashboard/new
- * Fecha sorteios principais 'open', cria um novo principal e popula os numeros.
+ * Cria um novo principal somente quando nenhum principal esta aberto e popula os numeros.
  * e DISPARA o Autopay oficial (services/autopayRunner.js).
  */
 router.post("/new", requireAuth, requireAdmin, async (req, res) => {
+  let client;
+  let transactionOpen = false;
   try {
     log("POST /new");
-    const numberCount = Number(req.body?.number_count ?? 100);
-    if (!Number.isInteger(numberCount) || numberCount <= 0 || numberCount > 10000) {
-      return res.status(400).json({ error: "invalid_number_count" });
+    const body = req.body || {};
+    const normalizedConfig = normalizePrincipalConfigPayload(body);
+    const numberCount = Number(body.number_count);
+    if (
+      normalizedConfig.error ||
+      !normalizedConfig.value?.banner_title ||
+      body.number_count === undefined ||
+      !Number.isInteger(numberCount) ||
+      numberCount <= 0 ||
+      numberCount > 10000
+    ) {
+      return res.status(422).json({
+        error: "principal_draw_config_required",
+        message: "Informe o valor, a frase promocional e o limite do novo sorteio.",
+      });
     }
-
-    // fecha os abertos anteriores
-    await query(
-      `update draws
-          set status = 'closed', closed_at = now()
-        where status = 'open'
-          and COALESCE(draw_type, 'principal') = 'principal'`
+    const config = normalizedConfig.value;
+    const pool = await getPool();
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('newstore_principal_creation'))`
     );
 
+    const currentPrincipalResult = await client.query(
+      `SELECT id, status, draw_type, opened_at
+         FROM public.draws
+        WHERE status = 'open'
+          AND COALESCE(draw_type, 'principal') = 'principal'
+        ORDER BY id DESC
+        LIMIT 1`
+    );
+    const currentPrincipal = currentPrincipalResult.rows?.[0] || null;
+    if (currentPrincipal) {
+      await client.query("ROLLBACK");
+      transactionOpen = false;
+      console.warn("[admin-dashboard] principal_creation_blocked", {
+        current_draw_id: Number(currentPrincipal.id),
+        current_status: currentPrincipal.status,
+        admin_user_id: req.user?.id ?? null,
+      });
+      return res.status(409).json({
+        error: "principal_draw_already_open",
+        message: "Já existe um sorteio principal em andamento. Ele não foi alterado.",
+        current_draw: {
+          id: Number(currentPrincipal.id),
+          status: currentPrincipal.status,
+        },
+      });
+    }
+
+    const principalTicketPriceCents = config.ticket_price_cents;
+
     // cria draw novo
-    const ins = await query(
+    const ins = await client.query(
       `insert into draws(status, draw_type, opened_at, autopay_ran_at)
        values('open', 'principal', now(), null)
        returning id`
@@ -163,28 +479,176 @@ router.post("/new", requireAuth, requireAdmin, async (req, res) => {
     const newId = ins.rows[0].id;
     log("novo draw id =", newId);
 
+    await client.query(
+      `INSERT INTO public.app_config (key, value, updated_at)
+       SELECT entry.key, entry.value, NOW()
+         FROM unnest($1::text[], $2::text[]) AS entry(key, value)
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value,
+             updated_at = NOW()`,
+      [
+        ["ticket_price_cents", "banner_title", "max_numbers_per_selection"],
+        [String(config.ticket_price_cents), config.banner_title, String(config.max_numbers_per_selection)],
+      ]
+    );
+    await client.query(
+      `INSERT INTO public.app_config_new AS cfg
+         (id, banner_title, ticket_price_cents, max_numbers_per_selection)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (id) DO UPDATE
+         SET banner_title = EXCLUDED.banner_title,
+             ticket_price_cents = EXCLUDED.ticket_price_cents,
+             max_numbers_per_selection = EXCLUDED.max_numbers_per_selection`,
+      [String(newId), config.banner_title, config.ticket_price_cents, config.max_numbers_per_selection]
+    );
+
     // popula numeros do sorteio principal
-    await query(
+    await client.query(
       `insert into numbers(draw_id, n, status, reservation_id)
        select $1, gs::int, 'available', null
          from generate_series(0, $2::int - 1) as gs`,
       [newId, numberCount]
     );
 
+    const [globalResult, individualResult] = await Promise.all([
+      client.query(
+        `SELECT key, value
+           FROM public.app_config
+          WHERE key = ANY($1::text[])`,
+        [["ticket_price_cents", "banner_title", "max_numbers_per_selection"]]
+      ),
+      client.query(
+        `SELECT banner_title, ticket_price_cents, max_numbers_per_selection
+           FROM public.app_config_new
+          WHERE id = $1
+          LIMIT 1`,
+        [String(newId)]
+      ),
+    ]);
+    const persisted = normalizePersistedPrincipalConfig(
+      globalResult.rows,
+      individualResult.rows?.[0]
+    );
+    if (
+      !samePrincipalConfig(persisted.global, config) ||
+      !samePrincipalConfig(persisted.draw, config)
+    ) {
+      const error = new Error("draw_config_sync_failed");
+      error.code = "draw_config_sync_failed";
+      throw error;
+    }
+
+    await client.query("COMMIT");
+    transactionOpen = false;
+
     // dispara o AUTOPAY oficial — gera logs [autopayRunner]
+    const captivePreauth = await createCaptivePreauthIfEnabled(
+      newId,
+      req.user?.id ?? null,
+      "admin/dashboard/new",
+      principalTicketPriceCents
+    );
+    if (!captivePreauth?.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: "captive_preauth_create_failed",
+        draw_id: newId,
+        ticket_price_cents: principalTicketPriceCents,
+        sold: 0,
+        remaining: numberCount,
+        captive_preauth: captivePreauth,
+      });
+    }
+
     const autopay = await runAutopayForDraw(newId);
 
     // resposta inclui o resultado do autopay para depuração
     if (!autopay?.ok) {
       console.warn("[admin/dashboard] autopay falhou", autopay);
-      return res.status(500).json({ ok: false, draw_id: newId, sold: 0, remaining: numberCount, autopay });
+      return res.status(500).json({
+        ok: false,
+        draw_id: newId,
+        ticket_price_cents: principalTicketPriceCents,
+        sold: 0,
+        remaining: numberCount,
+        captive_preauth: captivePreauth,
+        autopay,
+      });
     }
 
     await emitAdminNewDrawPublished(newId);
-    return res.json({ ok: true, draw_id: newId, sold: 0, remaining: numberCount, autopay });
+    return res.json({
+      ok: true,
+      draw_id: newId,
+      ticket_price_cents: principalTicketPriceCents,
+      sold: 0,
+      remaining: numberCount,
+      captive_preauth: captivePreauth,
+      autopay,
+      draw: {
+        id: Number(newId),
+        status: "open",
+        draw_type: "principal",
+      },
+      config,
+      sync: { global: true, draw: true },
+    });
   } catch (e) {
+    if (transactionOpen && client) {
+      try { await client.query("ROLLBACK"); } catch {}
+    }
     console.error("[admin/dashboard] /new error:", e);
+    if (e?.code === "draw_config_sync_failed") {
+      return res.status(500).json({
+        error: "draw_config_sync_failed",
+        message: "Não foi possível salvar a configuração do novo sorteio.",
+      });
+    }
     return res.status(500).json({ error: "new_draw_failed" });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+/**
+ * POST /api/admin/dashboard/draws/:drawId/close
+ * Fecha manualmente sorteio principal legado sem alterar resultado ou numeros.
+ */
+router.post("/draws/:drawId/close", requireAuth, requireAdmin, async (req, res) => {
+  const drawId = Number(req.params.drawId);
+  if (!Number.isInteger(drawId) || drawId <= 0) {
+    return res.status(400).json({ error: "invalid_draw_id" });
+  }
+
+  try {
+    const current = await query(
+      `SELECT id, status, draw_type, closed_at, realized_at, winner_number, winner_user_id, winner_name
+         FROM public.draws
+        WHERE id = $1
+          AND COALESCE(draw_type, 'principal') = 'principal'`,
+      [drawId]
+    );
+
+    if (!current.rowCount) return res.status(404).json({ error: "draw_not_found" });
+    if (current.rows[0].status !== "open") {
+      return res.status(409).json({ error: "draw_not_open", draw: current.rows[0] });
+    }
+
+    const updated = await query(
+      `UPDATE public.draws
+          SET status = 'closed',
+              closed_at = COALESCE(closed_at, NOW())
+        WHERE id = $1
+          AND status = 'open'
+          AND COALESCE(draw_type, 'principal') = 'principal'
+        RETURNING id, status, draw_type, closed_at, realized_at, winner_number, winner_user_id, winner_name`,
+      [drawId]
+    );
+
+    return res.json({ ok: true, draw: updated.rows[0] });
+  } catch (e) {
+    console.error("[admin/dashboard] /draws/:drawId/close error:", e);
+    return res.status(500).json({ error: "close_draw_failed" });
   }
 });
 
