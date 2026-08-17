@@ -272,20 +272,47 @@ export async function fetchTrayProduct(trayProductId, options = {}) {
   return raw;
 }
 
+/**
+ * Teto de seguranca contra loop infinito caso a Tray nunca sinalize o fim
+ * (nem `paging.total` nem uma pagina curta). Nao e um limite de produto: um
+ * produto real jamais precisa de milhares de variantes.
+ */
+const TRAY_VARIANTS_MAX_PAGES = 200;
+
 export async function fetchTrayVariants(trayProductId, options = {}) {
   const id = String(trayProductId ?? "").trim();
   if (!id) throw new TrayCatalogError("tray_product_id_missing", { status: 400 });
 
-  const body = await trayCatalogGet(
-    "/variants",
-    { product_id: id, limit: TRAY_MAX_LIMIT, page: 1 },
-    options
-  );
-  const raw = unwrapCollection(body, "Variants", "Variant");
-  if (!raw) {
-    throw new TrayCatalogError("tray_invalid_response", { status: 502 });
+  const limit = TRAY_MAX_LIMIT;
+  const variants = [];
+
+  for (let page = 1; page <= TRAY_VARIANTS_MAX_PAGES; page += 1) {
+    const body = await trayCatalogGet(
+      "/variants",
+      { product_id: id, limit, page },
+      options
+    );
+    const raw = unwrapCollection(body, "Variants", "Variant");
+    if (!raw) {
+      throw new TrayCatalogError("tray_invalid_response", { status: 502 });
+    }
+    variants.push(...raw);
+
+    // Fim factual: a Tray so devolve menos que `limit` itens na ultima pagina
+    // (ou zero, se a paginacao pedida ja passou do fim). Isso vale mesmo sem
+    // `paging.total` no corpo.
+    if (raw.length < limit) return variants;
+
+    // Quando `paging.total` esta presente e ja foi atingido, nao vale a pena
+    // pedir mais uma pagina so para receber uma lista vazia de confirmacao.
+    const { total } = normalizePaging(body, page, limit);
+    if (total !== null && variants.length >= total) return variants;
   }
-  return raw;
+
+  throw new TrayCatalogError("tray_variants_pagination_exceeded", {
+    status: 502,
+    publicDetails: { pages: TRAY_VARIANTS_MAX_PAGES },
+  });
 }
 
 export async function fetchTrayBrands(options = {}) {
