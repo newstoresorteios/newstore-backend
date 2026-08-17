@@ -209,6 +209,32 @@ test("o indice unico impede item duplicado (produto simples)", skipOpts, async (
   );
 });
 
+// Regressao: os dois indices unicos sao PARCIAIS e complementares. O
+// ON CONFLICT precisa apontar para o indice do CAMINHO (simples ou variacao);
+// apontar sempre para o de variacao faz a segunda adicao de um produto simples
+// violar o indice simples e estourar 23505 em vez de somar a quantidade.
+test("adicionar o mesmo produto SIMPLES duas vezes soma a quantidade", skipOpts, async () => {
+  await resetCart();
+
+  await addItem({ userId, rewardProductId: simpleProductId, quantity: 1 }, deps);
+  await addItem({ userId, rewardProductId: simpleProductId, quantity: 2 }, deps);
+
+  const cart = await getCart(userId, deps);
+  assert.equal(cart.items.length, 1, "produto simples nao pode virar duas linhas");
+  assert.equal(cart.items[0].quantity, 3, "a segunda adicao tem que somar, nao falhar");
+});
+
+test("adicionar a mesma VARIACAO duas vezes soma a quantidade", skipOpts, async () => {
+  await resetCart();
+
+  await addItem({ userId, rewardProductId: variantProductId, trayVariantId: "2003", quantity: 1 }, deps);
+  await addItem({ userId, rewardProductId: variantProductId, trayVariantId: "2003", quantity: 2 }, deps);
+
+  const cart = await getCart(userId, deps);
+  assert.equal(cart.items.length, 1);
+  assert.equal(cart.items[0].quantity, 3);
+});
+
 test("adicoes concorrentes do mesmo item nao criam linha duplicada", skipOpts, async () => {
   await resetCart();
 

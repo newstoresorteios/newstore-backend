@@ -396,12 +396,25 @@ export async function addItem({ userId, rewardProductId, trayVariantId = null, q
 
     const cart = await ensureActiveCart(client, uid);
 
-    const { rows } = await client.query(
+    // O item unico e garantido por DOIS indices parciais complementares
+    // (022_reward_carts.sql): produtos com variacao sao unicos por
+    // (carrinho, produto, variacao); produtos simples, por (carrinho, produto).
+    //
+    // O ON CONFLICT so resolve conflito no indice que ele INFERE. Uma linha
+    // com tray_variant_id NULL nao entra no indice de variacao, entao apontar
+    // para ele no caminho simples nao evitaria nada: a violacao cairia no
+    // indice simples e viraria 23505. Por isso o arbitro segue o caminho.
+    const conflictTarget =
+      variantId === null
+        ? "(cart_id, reward_product_id) where tray_variant_id is null"
+        : "(cart_id, reward_product_id, tray_variant_id) where tray_variant_id is not null";
+
+    await client.query(
       `insert into public.reward_cart_items
          (cart_id, reward_product_id, tray_product_id, tray_variant_id, quantity,
           nscredits_unit_price_snapshot, product_name_snapshot, variant_name_snapshot, image_url_snapshot)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       on conflict (cart_id, reward_product_id, tray_variant_id) where tray_variant_id is not null
+       on conflict ${conflictTarget}
        do update set quantity = public.reward_cart_items.quantity + excluded.quantity,
                      nscredits_unit_price_snapshot = excluded.nscredits_unit_price_snapshot,
                      updated_at = now()
@@ -418,32 +431,6 @@ export async function addItem({ userId, rewardProductId, trayVariantId = null, q
         product.image_url ?? null,
       ]
     );
-
-    // Produto simples usa o outro indice parcial (tray_variant_id IS NULL),
-    // que o ON CONFLICT acima nao cobre — resolvemos explicitamente.
-    if (!rows.length && variantId === null) {
-      const upsert = await client.query(
-        `insert into public.reward_cart_items
-           (cart_id, reward_product_id, tray_product_id, tray_variant_id, quantity,
-            nscredits_unit_price_snapshot, product_name_snapshot, variant_name_snapshot, image_url_snapshot)
-         values ($1,$2,$3,null,$4,$5,$6,null,$7)
-         on conflict (cart_id, reward_product_id) where tray_variant_id is null
-         do update set quantity = public.reward_cart_items.quantity + excluded.quantity,
-                       nscredits_unit_price_snapshot = excluded.nscredits_unit_price_snapshot,
-                       updated_at = now()
-         returning ${CART_ITEM_COLUMNS.replace(/i\./g, "")}`,
-        [
-          cart.id,
-          product.id,
-          product.tray_product_id,
-          qty,
-          toSafeInt(product.nscredits_price),
-          product.name ?? null,
-          product.image_url ?? null,
-        ]
-      );
-      if (upsert.rows.length) return buildCart(cart, await loadItems(client, cart.id));
-    }
 
     return buildCart(cart, await loadItems(client, cart.id));
   });

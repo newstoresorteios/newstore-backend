@@ -130,6 +130,20 @@ function makeDb({ rewards = {}, tray = {}, trayFails = {}, balance = 8450 } = {}
           String(i.tray_variant_id ?? "") === String(tray_variant_id ?? "")
       );
       if (existing) {
+        // O PostgreSQL so resolve o conflito no indice-arbitro declarado no
+        // ON CONFLICT. Os dois indices sao PARCIAIS: o de variacao so indexa
+        // linhas com tray_variant_id NOT NULL, o simples so as NULL.
+        // Conflito em QUALQUER outro indice unico e erro 23505, nao upsert.
+        const arbiterIsVariant = /on conflict\s*\(\s*cart_id\s*,\s*reward_product_id\s*,\s*tray_variant_id\s*\)/.test(s);
+        const rowHasVariant = existing.tray_variant_id != null;
+        if (arbiterIsVariant !== rowHasVariant) {
+          throw Object.assign(new Error("duplicate key value violates unique constraint"), {
+            code: "23505",
+            constraint: rowHasVariant
+              ? "idx_reward_cart_items_unique_with_variant"
+              : "idx_reward_cart_items_unique_simple",
+          });
+        }
         existing.quantity += Number(quantity);
         existing.nscredits_unit_price_snapshot = String(price);
         return { rows: [existing], rowCount: 1 };
