@@ -45,8 +45,18 @@ function parseTrayDateToMs(s) {
 
 function computeExpMs(auth) {
   const marginMs = 60_000;
-  const expStr = auth?.date_expiration_access_token || null;
-  const expMs = parseTrayDateToMs(expStr);
+  const expMs = parseTrayDateToMs(auth?.date_expiration_access_token);
+
+  // A Tray devolve as datas SEM timezone, no relógio da loja (BRT/UTC-3).
+  // Interpretar `date_expiration_access_token` como UTC faz um token recém-emitido
+  // parecer expirado, forçando um refresh a cada chamada.
+  // `date_activated` vem no MESMO relógio, então a diferença entre as duas é o
+  // TTL factual (medido: 180 min) e cancela o fuso — sem precisar assumir nenhum.
+  const actMs = parseTrayDateToMs(auth?.date_activated);
+  if (expMs && actMs && expMs > actMs) {
+    return Date.now() + (expMs - actMs) - marginMs;
+  }
+
   if (expMs) return Math.max(0, expMs - marginMs);
 
   const sec = Number.isFinite(Number(auth?.expires_in)) ? Number(auth.expires_in) : 3000;
@@ -158,7 +168,9 @@ async function trayTokenWithMeta({ signal, rid = null, forceBootstrap = false, o
   // 4.2 refresh (prioridade)
   if (!forceBootstrap && refresh.token) {
     const url = `${apiBase}/auth?refresh_token=${encodeURIComponent(refresh.token)}`;
-    console.log("[tray.auth] refresh start", { rid, url });
+    // NUNCA logar o refresh_token: a URL vai mascarada.
+    const safeUrl = url.replace(/(refresh_token=)[^&]+/i, "$1***");
+    console.log("[tray.auth] refresh start", { rid, url: safeUrl });
     const r = await fetchWithRetry(url, { method: "GET", signal }, { label: "tray.auth.refresh" });
     const parsed = await readBodySafe(r);
     const body = parsed?.body || null;
@@ -263,7 +275,17 @@ export async function trayToken({ signal, rid } = {}) {
 export async function trayTokenHealth({ signal } = {}) {
   try {
     const out = await trayTokenWithMeta({ signal });
-    return { ok: true, ...out };
+    // NUNCA devolver o access_token: /api/tray/health e uma rota sem autenticacao.
+    // Contrato documentado em TRAY_OAUTH_README.md: ok, authMode, apiBase,
+    // expAccessAt, hasRefreshKV, lastError.
+    return {
+      ok: true,
+      authMode: out.authMode,
+      apiBase: out.apiBase,
+      expAccessAt: out.expAccessAt,
+      hasRefreshKV: out.hasRefreshKV,
+      lastError: out.lastError,
+    };
   } catch (e) {
     return {
       ok: false,

@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
+import { getBalance } from '../services/nscreditWallet.js';
 
 const router = Router();
 
@@ -20,6 +21,16 @@ router.get('/', requireAuth, async (req, res) => {
     );
     const u = r.rows[0] || req.user;
 
+    // "Membro desde" para a area do cliente. Consulta separada e tolerante:
+    // se a coluna nao existir no ambiente, o /me continua respondendo normalmente.
+    let memberSince = null;
+    try {
+      const c = await query('select created_at from users where id = $1', [userId]);
+      memberSince = c.rows[0]?.created_at || null;
+    } catch (e) {
+      console.warn('[me] created_at indisponivel:', e?.code || e?.message);
+    }
+
     return res.json({
       user: {
         id: u.id,
@@ -27,11 +38,30 @@ router.get('/', requireAuth, async (req, res) => {
         email: u.email || null,
         phone: u.phone || null,
         is_admin: !!u.is_admin,
+        created_at: memberSince,
       },
     });
   } catch (e) {
     console.error('[me] error:', e);
     return res.status(500).json({ error: 'me_failed' });
+  }
+});
+
+/**
+ * GET /api/me/nscredits
+ * Saldo da carteira de NSCreditos do usuario AUTENTICADO.
+ *
+ * O userId vem sempre do token: um usuario nunca consulta a carteira de outro.
+ * Quem nunca recebeu creditos tem saldo 0 — isso e um saldo valido, nao erro.
+ * Falha real do servidor devolve 500, nunca "0" silencioso.
+ */
+router.get('/nscredits', requireAuth, async (req, res) => {
+  try {
+    const { balance } = await getBalance(req.user.id);
+    return res.json({ wallet: { balance } });
+  } catch (e) {
+    console.error('[me/nscredits] error:', e?.code || e?.message);
+    return res.status(Number(e?.status) || 500).json({ error: e?.code || 'nscredits_failed' });
   }
 });
 
