@@ -33,6 +33,12 @@ import adminSecondaryDrawsRouter from "./routes/admin_secondary_draws.js";
 import adminCaptivesRouter from "./routes/admin_captives.js";
 import adminCaptivePreauthRouter from "./routes/admin_captive_preauth.js";
 import captivePreauthRouter from "./routes/captive_preauth.js";
+import adminStoreRouter from "./routes/admin_store.js";
+import adminNsCreditsRouter from "./routes/admin_nscredits.js";
+
+// Loja de Premios (publica)
+import storeRouter from "./routes/store.js";
+import storeCartRouter from "./routes/store_cart.js";
 
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
@@ -128,7 +134,10 @@ app.use((req, res, next) => {
     path.startsWith("/api/admin/notifications/push") ||
     path.startsWith("/api/captive-preauth") ||
     path.startsWith("/api/admin/captive-preauth") ||
-    path.startsWith("/cativo")
+    path.startsWith("/cativo") ||
+    // Loja de Premios nao tem relacao com pagamentos/reservas.
+    path.startsWith("/api/store") ||
+    path.startsWith("/api/admin/store")
   ) {
     return next();
   }
@@ -169,6 +178,8 @@ app.use("/api/admin/balance-history", adminBalanceHistoryRouter);
 app.use("/api/admin/secondary-draws", adminSecondaryDrawsRouter);
 app.use("/api/admin/captives", adminCaptivesRouter);
 app.use("/api/admin/captive-preauth", adminCaptivePreauthRouter);
+app.use("/api/admin/store/nscredits", adminNsCreditsRouter);
+app.use("/api/admin/store", adminStoreRouter);
 
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza
@@ -192,6 +203,11 @@ app.use("/api/purchase-limit", purchaseLimitRouter);
 
 // Cupons
 app.use("/api/coupons", couponsRouter);
+
+// Loja de Premios (catalogo publico — somente PostgreSQL, nunca consulta a Tray)
+// O carrinho vem ANTES do catalogo para nao ser capturado por /products/:id.
+app.use("/api/store/cart", storeCartRouter);
+app.use("/api/store", storeRouter);
 
 // Tray OAuth callback e health
 app.use("/tray", trayRouter);       // /tray/callback/auth
