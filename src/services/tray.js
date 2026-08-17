@@ -272,6 +272,91 @@ export async function trayToken({ signal, rid } = {}) {
   return out.token;
 }
 
+/**
+ * Health do OAuth — SOMENTE LEITURA.
+ *
+ * Nunca chama a Tray, nunca troca TRAY_CODE, nunca faz refresh, nunca
+ * escreve no kv_store. So le: env configurada, cache em memoria do processo,
+ * e o que ja estiver persistido no kv_store.
+ *
+ * Existe porque /api/tray/health e publica e sem autenticacao: qualquer
+ * monitor/crawler/operador que bata nela repetidamente nao pode, so por
+ * isso, consumir o TRAY_CODE ou renovar credenciais. Quem precisa de token
+ * de verdade (catalogo, cupons) continua usando trayToken()/
+ * trayTokenWithMeta(), que seguem fazendo bootstrap/refresh normalmente.
+ */
+export async function trayTokenHealthReadOnly() {
+  const { consumerKey, consumerSecret } = getTrayEnvConfig();
+  const configured = !!(consumerKey && consumerSecret);
+  const apiBase = await getTrayApiBase().catch(() => null);
+  const hasRefreshKV = (await getTrayRefreshToken().catch(() => ({ source: "none" }))).source === "kv";
+
+  if (!configured) {
+    return {
+      ok: false,
+      configured: false,
+      authMode: null,
+      apiBase,
+      expAccessAt: null,
+      hasRefreshKV,
+      lastError: "tray_env_missing_keys",
+    };
+  }
+
+  // 1) cache em memoria: este processo ja autenticou (via trayToken real) e
+  // ainda esta dentro da validade.
+  if (cache.token && Date.now() < cache.expMs) {
+    return {
+      ok: true,
+      configured: true,
+      authMode: "cache",
+      apiBase,
+      expAccessAt: cache.expAccessAt,
+      hasRefreshKV,
+      lastError: null,
+    };
+  }
+
+  // 2) cache persistido no kv_store (outro processo/deploy ja autenticou).
+  const cachedDb = await getTrayCachedAccessToken().catch(() => ({ token: null, expAccessAt: null }));
+  if (cachedDb?.token && cachedDb?.expAccessAt) {
+    const expMs = parseTrayDateToMs(cachedDb.expAccessAt);
+    if (expMs && Date.now() < expMs - 60_000) {
+      return {
+        ok: true,
+        configured: true,
+        authMode: "cache",
+        apiBase,
+        expAccessAt: cachedDb.expAccessAt,
+        hasRefreshKV,
+        lastError: null,
+      };
+    }
+    // Token existe mas expirou: informa, nao renova. A renovacao e
+    // responsabilidade de quem de fato precisa falar com a Tray.
+    return {
+      ok: false,
+      configured: true,
+      authMode: null,
+      apiBase,
+      expAccessAt: cachedDb.expAccessAt,
+      hasRefreshKV,
+      lastError: "tray_access_token_expired",
+    };
+  }
+
+  // 3) nunca autenticou nesta instalacao.
+  return {
+    ok: false,
+    configured: true,
+    authMode: null,
+    apiBase,
+    expAccessAt: null,
+    hasRefreshKV,
+    lastError: "tray_auth_not_initialized",
+  };
+}
+
 export async function trayTokenHealth({ signal } = {}) {
   try {
     const out = await trayTokenWithMeta({ signal });

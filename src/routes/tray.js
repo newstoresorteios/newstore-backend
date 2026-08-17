@@ -1,6 +1,6 @@
 // src/routes/tray.js
 import { Router } from "express";
-import { trayBootstrap, trayTokenHealth } from "../services/tray.js";
+import { trayBootstrap, trayTokenHealthReadOnly } from "../services/tray.js";
 
 const router = Router();
 
@@ -36,11 +36,12 @@ router.get("/callback/auth", async (req, res) => {
 });
 
 /**
- * Health do OAuth.
+ * Health do OAuth — SOMENTE LEITURA. Nunca autentica, nunca renova, nunca
+ * escreve no kv_store (ver src/services/tray.js: trayTokenHealthReadOnly).
  * GET /api/tray/health
  */
 router.get("/health", async (_req, res) => {
-  const out = await trayTokenHealth();
+  const out = await trayTokenHealthReadOnly();
   return res.json(out);
 });
 
