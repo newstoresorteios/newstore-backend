@@ -3,9 +3,10 @@
 // Pre-validacao factual do carrinho.
 //
 // Combina TRES fontes:
-//   1. reward_products  (publicacao e preco vigente em NSCreditos)
-//   2. Tray             (produto, variacao, disponibilidade, estoque) — GET
-//   3. nscredit_wallets (saldo factual do cliente)
+//   1. reward_products      (publicacao e preco vigente em NSCreditos)
+//   2. Tray                 (produto, variacao, disponibilidade, estoque) — GET
+//   3. coupon_value_cents   (saldo factual do cliente — FASE 5: o cupom
+//                            individual do usuario, nao mais nscredit_wallets)
 //
 // ESTA OPERACAO NAO ALTERA NADA:
 //   nao debita NSCreditos, nao grava ledger, nao cria pedido,
@@ -14,7 +15,7 @@
 // Resultado: `valid` + problemas com CODIGOS ESTAVEIS por item e por carrinho.
 // Nunca colapsa tudo num erro generico.
 
-import { getBalance } from "./nscreditWallet.js";
+import { getCouponBalance } from "./couponLedger.js";
 import {
   CART_ISSUES,
   resolveDeps as resolveCartDeps,
@@ -25,10 +26,20 @@ import {
   trayErrorToIssue,
 } from "./rewardCart.js";
 
+/**
+ * Saldo em NSCreditos (mesma escala de reward_products.nscredits_price):
+ * users.coupon_value_cents / 100. O valor armazenado nunca muda de forma,
+ * essa divisao e so para comparar com o total do carrinho.
+ */
+async function defaultGetWalletBalance(userId, deps) {
+  const b = await getCouponBalance(userId, deps);
+  return { balance: b.balance_cents / 100, is_expired: b.is_expired };
+}
+
 function resolveDeps(deps = {}) {
   return {
     ...resolveCartDeps(deps),
-    getWalletBalance: deps.getWalletBalance || ((userId) => getBalance(userId, deps)),
+    getWalletBalance: deps.getWalletBalance || ((userId) => defaultGetWalletBalance(userId, deps)),
   };
 }
 
@@ -99,13 +110,16 @@ export async function validateCart(userId, deps = {}) {
   // Saldo: leitura pura. Nao altera a carteira nem grava ledger.
   let wallet = { balance: 0, sufficient: false, missing: 0 };
   let walletUnavailable = false;
+  let couponExpired = false;
   try {
-    const { balance } = await d.getWalletBalance(userId);
+    const { balance, is_expired } = await d.getWalletBalance(userId);
     const total = cart.totals.nscredits;
+    couponExpired = !!is_expired;
+    const sufficient = !couponExpired && balance >= total;
     wallet = {
       balance,
-      sufficient: balance >= total,
-      missing: Math.max(0, total - balance),
+      sufficient,
+      missing: couponExpired ? total : Math.max(0, total - balance),
     };
   } catch {
     walletUnavailable = true;
@@ -113,6 +127,7 @@ export async function validateCart(userId, deps = {}) {
   }
 
   if (walletUnavailable) cartIssues.push("wallet_unavailable");
+  else if (cart.items.length > 0 && couponExpired) cartIssues.push(CART_ISSUES.COUPON_EXPIRED);
   else if (cart.items.length > 0 && !wallet.sufficient) cartIssues.push(CART_ISSUES.INSUFFICIENT_NSCREDITS);
 
   const valid = cartIssues.length === 0 && items.every((i) => i.valid);

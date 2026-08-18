@@ -2,7 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-import { createPrincipalDrawConfigHandler } from "../src/routes/admin_dashboard.js";
+// config/auth.js exige JWT_SECRET (ou equivalente) no import — mesmo guard
+// ja usado em nscreditRoutes.test.js/storeCheckoutRoutes.test.js.
+//
+// IMPORTANTE: import ESTATICO e hoisted pelo ESM (roda antes de qualquer
+// outro codigo do modulo, mesmo que apareca depois no texto-fonte) — por
+// isso o guard abaixo so funciona com import DINAMICO, nunca com
+// `import ... from` no topo do arquivo.
+process.env.JWT_SECRET = process.env.JWT_SECRET || "test-secret-admin-dashboard";
+
+const { createPrincipalDrawConfigHandler } = await import("../src/routes/admin_dashboard.js");
 
 const VALID_CONFIG = {
   ticket_price_cents: 5500,

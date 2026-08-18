@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { assertReadOnlyMethod, TrayCatalogError } from "../src/services/trayCatalogClient.js";
+import { assertReadOnlyMethod, assertAllowedTrayMutation, TrayCatalogError } from "../src/services/trayCatalogClient.js";
 import { getTrayCatalogProduct, listTrayCatalog } from "../src/services/trayCatalog.js";
 import { publishRewardProducts, syncRewardProducts, patchRewardProduct } from "../src/services/rewardStore.js";
 
@@ -119,6 +119,20 @@ test("a camada de catalogo recusa qualquer metodo que nao seja GET", () => {
     );
   }
   assert.equal(assertReadOnlyMethod("GET"), "GET");
+});
+
+test("allow-list de mutacoes Tray (item 16, Fase 5): NADA esta autorizado hoje", () => {
+  // A guarda existe para o dia em que a Fase E for desbloqueada, mas ate la
+  // qualquer operacao — inclusive nomes plausiveis — tem que ser recusada.
+  for (const operation of ["tray_order_create", "tray_cart_create", "tray_shipping_create", "unknown_operation", ""]) {
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "GET"]) {
+      assert.throws(
+        () => assertAllowedTrayMutation(operation, method),
+        (e) => e instanceof TrayCatalogError && e.code === "tray_mutation_not_allowed",
+        `${operation || "(vazio)"} ${method} deveria ser recusado`
+      );
+    }
+  }
 });
 
 test("listar o catalogo Tray so emite GET", async () => {

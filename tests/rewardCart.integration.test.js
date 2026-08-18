@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 
 import { getCart, addItem, updateItem, removeItem, clearCart, CART_ISSUES } from "../src/services/rewardCart.js";
 import { validateCart } from "../src/services/rewardCartValidator.js";
-import { applyAdminAdjustment, getBalance, getTransactionHistory } from "../src/services/nscreditWallet.js";
+import { applyCouponLedgerEntry, getCouponBalance } from "../src/services/couponLedger.js";
 
 const TEST_DB = process.env.TEST_DATABASE_URL || "";
 const SKIP = !TEST_DB;
@@ -100,7 +100,8 @@ before(async () => {
       if (!p) throw Object.assign(new Error("tray_product_not_found"), { code: "tray_product_not_found", status: 404 });
       return JSON.parse(JSON.stringify(p));
     },
-    getWalletBalance: (uid) => getBalance(uid, base),
+    // Sem override: exercita o caminho default real do validador, que le
+    // users.coupon_value_cents (Fase 5) via couponLedger.js.
   };
 
   const stamp = Date.now();
@@ -283,17 +284,17 @@ test("um usuario nao ve nem altera o carrinho do outro", skipOpts, async () => {
 
 test("validar o carrinho NAO altera saldo nem ledger", skipOpts, async () => {
   await resetCart();
-  await pool.query("delete from public.nscredit_transactions where user_id=$1", [userId]);
-  await pool.query("delete from public.nscredit_wallets where user_id=$1", [userId]);
+  await pool.query("delete from public.coupon_balance_history where user_id=$1", [userId]);
+  await pool.query("update public.users set coupon_value_cents=0, coupon_expires_at=null where id=$1", [userId]);
 
-  await applyAdminAdjustment(
-    { userId, adminUserId: adminId, operation: "credit", amount: 8450, reason: "Saldo para o teste de carrinho" },
+  await applyCouponLedgerEntry(
+    { userId, operation: "credit", amountCents: 845000, eventType: "ADMIN_BALANCE_ADJUSTMENT", channel: "ADMIN" },
     walletDeps
   );
 
-  const saldoAntes = (await getBalance(userId, walletDeps)).balance;
-  const ledgerAntes = await getTransactionHistory(userId, { page: 1, limit: 100 }, walletDeps);
-  assert.equal(saldoAntes, 8450);
+  const saldoAntes = (await getCouponBalance(userId, walletDeps)).balance_cents;
+  const ledgerAntes = await pool.query("select id from public.coupon_balance_history where user_id=$1 order by created_at", [userId]);
+  assert.equal(saldoAntes, 845000);
 
   await addItem({ userId, rewardProductId: simpleProductId, quantity: 1 }, deps); // 5000
   const out = await validateCart(userId, deps);
@@ -303,21 +304,22 @@ test("validar o carrinho NAO altera saldo nem ledger", skipOpts, async () => {
   assert.equal(out.wallet.balance, 8450);
   assert.equal(out.wallet.sufficient, true);
 
-  const saldoDepois = (await getBalance(userId, walletDeps)).balance;
-  const ledgerDepois = await getTransactionHistory(userId, { page: 1, limit: 100 }, walletDeps);
+  const saldoDepois = (await getCouponBalance(userId, walletDeps)).balance_cents;
+  const ledgerDepois = await pool.query("select id from public.coupon_balance_history where user_id=$1 order by created_at", [userId]);
 
-  assert.equal(saldoDepois, 8450, "o saldo NAO pode mudar");
-  assert.equal(ledgerDepois.paging.total, ledgerAntes.paging.total, "o ledger NAO pode ganhar linhas");
+  assert.equal(saldoDepois, 845000, "o saldo NAO pode mudar");
+  assert.equal(ledgerDepois.rows.length, ledgerAntes.rows.length, "o ledger NAO pode ganhar linhas");
   assert.deepEqual(
-    ledgerDepois.items.map((i) => i.id),
-    ledgerAntes.items.map((i) => i.id),
+    ledgerDepois.rows.map((r) => r.id),
+    ledgerAntes.rows.map((r) => r.id),
     "o ledger tem que ser exatamente o mesmo"
   );
 });
 
 test("saldo insuficiente mantem o carrinho e nao debita", skipOpts, async () => {
   await resetCart();
-  const saldo = (await getBalance(userId, walletDeps)).balance;
+  const saldoCents = (await getCouponBalance(userId, walletDeps)).balance_cents;
+  const saldo = saldoCents / 100;
 
   await addItem({ userId, rewardProductId: simpleProductId, quantity: 2 }, deps); // 10000
   const out = await validateCart(userId, deps);
@@ -328,8 +330,29 @@ test("saldo insuficiente mantem o carrinho e nao debita", skipOpts, async () => 
   assert.equal(out.wallet.missing, 10000 - saldo);
   assert.ok(out.issues.includes(CART_ISSUES.INSUFFICIENT_NSCREDITS));
 
-  assert.equal((await getBalance(userId, walletDeps)).balance, saldo, "saldo intacto");
+  assert.equal((await getCouponBalance(userId, walletDeps)).balance_cents, saldoCents, "saldo intacto");
   assert.equal((await getCart(userId, deps)).items.length, 1, "o carrinho continua salvo");
+});
+
+test("cupom expirado bloqueia o carrinho mesmo com saldo suficiente", skipOpts, async () => {
+  await resetCart();
+  await pool.query("delete from public.coupon_balance_history where user_id=$1", [userId]);
+  // A view canonica de expiracao (migration 027) resolve por DATA de
+  // calendario em America/Sao_Paulo, nao por timestamp exato: "1h atras" no
+  // mesmo dia ainda conta como valido. Precisa ser um dia anterior de verdade.
+  await pool.query(
+    "update public.users set coupon_value_cents=845000, coupon_expires_at=$2 where id=$1",
+    [userId, new Date(Date.now() - 2 * 24 * 3600_000).toISOString()]
+  );
+
+  await addItem({ userId, rewardProductId: simpleProductId, quantity: 1 }, deps); // 5000
+  const out = await validateCart(userId, deps);
+
+  assert.equal(out.valid, false);
+  assert.ok(out.issues.includes(CART_ISSUES.COUPON_EXPIRED));
+  assert.equal(out.wallet.sufficient, false);
+
+  await pool.query("update public.users set coupon_expires_at=null where id=$1", [userId]);
 });
 
 /* ─────────────────────────── Nao-mutacao da Tray ─────────────────────────── */
