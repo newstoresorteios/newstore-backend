@@ -46,6 +46,7 @@ after(async () => {
 beforeEach(async () => {
   if (SKIP) return;
   await pool.query("delete from kv_store where k like 'tray_%'");
+  __resetTrayCacheForTests();
 
   // Nenhum teste aqui pode alcancar a rede de verdade. Se algum caminho
   // (bug) tentar chamar a Tray, o mock explode com um erro claro.
@@ -84,7 +85,7 @@ async function snapshotKv() {
 // no incidente anterior). Redireciona para o Postgres local de teste antes
 // de importar qualquer coisa que toque o banco.
 process.env.DATABASE_URL = TEST_DB || process.env.DATABASE_URL;
-const { trayTokenHealthReadOnly, trayToken } = await import("../src/services/tray.js");
+const { trayTokenHealthReadOnly, trayToken, __resetTrayCacheForTests } = await import("../src/services/tray.js");
 
 test("A: env configurada, sem token no kv_store -> nao chama rede, nao escreve, informa nao inicializado", skipOpts, async () => {
   try {
@@ -188,6 +189,7 @@ test("D: operacao real de catalogo com access expirado continua fazendo refresh 
     const byKey = Object.fromEntries(rows.map((r) => [r.k, r.v]));
     assert.equal(byKey.tray_access_token, "fresh-access-token-novo", "o fluxo real ainda persiste o token novo");
     assert.equal(byKey.tray_refresh_token, "fresh-refresh-token-novo");
+    assert.ok(Number.isFinite(Number(byKey.tray_access_exp_ms)), "expMs corrigido tambem deve ser persistido");
   } finally {
     restoreFetch();
   }
@@ -223,6 +225,52 @@ test("F: sem TRAY_CONSUMER_KEY/SECRET -> nao configurado, nao chama rede", skipO
   } finally {
     process.env.TRAY_CONSUMER_KEY = "test-consumer-key";
     process.env.TRAY_CONSUMER_SECRET = "test-consumer-secret";
+    restoreFetch();
+  }
+});
+
+test("H: expAccessAt sem timezone pareceria expirado no parse ingenuo, mas expMs persistido (corrigido) ainda e valido", skipOpts, async () => {
+  try {
+    // "date_expiration_access_token" da Tray vem sem timezone, no relogio da
+    // loja (BRT/UTC-3, ver computeExpMs). Um parser ingenuo que trata essa
+    // string como UTC acha o token expirado ~3h antes da hora real. Por isso
+    // persistimos tambem o expMs ja corrigido (calculado uma unica vez, no
+    // momento do bootstrap/refresh real) para o health reusar sem refazer a
+    // conta errada.
+    const naiveLooksExpired = new Date(Date.now() - 60 * 60_000).toISOString().slice(0, 19).replace("T", " ");
+    const correctedStillValidMs = Date.now() + 2 * 3600_000;
+    await seedKv({
+      tray_access_token: "fake-access-token-abc",
+      tray_access_exp_at: naiveLooksExpired,
+      tray_access_exp_ms: String(correctedStillValidMs),
+      tray_refresh_token: "fake-refresh-token-xyz",
+    });
+
+    const out = await trayTokenHealthReadOnly();
+
+    assert.deepEqual(fetchCalls, [], "nao pode ter chamado a Tray");
+    assert.equal(out.ok, true, "o expMs corrigido diz que o token ainda e valido");
+    assert.equal(out.authMode, "cache");
+    assert.equal(out.lastError, null);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("I: sem expMs persistido (token antigo, anterior a este fix) cai para o parse ingenuo do expAccessAt", skipOpts, async () => {
+  try {
+    const futureNaive = new Date(Date.now() + 60 * 60_000).toISOString().slice(0, 19).replace("T", " ");
+    await seedKv({
+      tray_access_token: "fake-access-token-abc",
+      tray_access_exp_at: futureNaive,
+      tray_refresh_token: "fake-refresh-token-xyz",
+    });
+
+    const out = await trayTokenHealthReadOnly();
+
+    assert.deepEqual(fetchCalls, []);
+    assert.equal(out.ok, true, "sem expMs persistido, usa o parse ingenuo (compatibilidade com tokens escritos antes do fix)");
+  } finally {
     restoreFetch();
   }
 });

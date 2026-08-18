@@ -11,6 +11,13 @@ let cache = { token: null, expMs: 0, expAccessAt: null, mode: null };
 let lastError = null;
 let codeInvalidUntilMs = 0;
 
+/** Uso exclusivo de testes: reseta o cache de autenticacao em memoria do modulo. */
+export function __resetTrayCacheForTests() {
+  cache = { token: null, expMs: 0, expAccessAt: null, mode: null };
+  lastError = null;
+  codeInvalidUntilMs = 0;
+}
+
 function form(obj) {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(obj)) p.append(k, v ?? "");
@@ -147,10 +154,13 @@ async function trayTokenWithMeta({ signal, rid = null, forceBootstrap = false, o
     return { token: cache.token, authMode: "cache", apiBase, expAccessAt: cache.expAccessAt, hasRefreshKV, lastError };
   }
 
-  // 4.1.1 cache DB opcional
-  const cachedDb = await getTrayCachedAccessToken().catch(() => ({ token: null, expAccessAt: null }));
+  // 4.1.1 cache DB opcional. Prefere o expMs ja corrigido (persistido junto do
+  // token real) -- o parse ingenuo de expAccessAt erra pelo fuso da loja
+  // (BRT/UTC-3, ver computeExpMs) e so serve de fallback para tokens salvos
+  // antes desse campo existir.
+  const cachedDb = await getTrayCachedAccessToken().catch(() => ({ token: null, expAccessAt: null, expMs: null }));
   if (cachedDb?.token && cachedDb?.expAccessAt) {
-    const expMs = parseTrayDateToMs(cachedDb.expAccessAt);
+    const expMs = Number.isFinite(cachedDb.expMs) ? cachedDb.expMs : parseTrayDateToMs(cachedDb.expAccessAt);
     if (expMs && Date.now() < (expMs - 60_000)) {
       cache = { token: cachedDb.token, expMs: expMs - 60_000, expAccessAt: cachedDb.expAccessAt, mode: "cache" };
       return { token: cachedDb.token, authMode: "cache", apiBase, expAccessAt: cachedDb.expAccessAt, hasRefreshKV, lastError };
@@ -200,7 +210,7 @@ async function trayTokenWithMeta({ signal, rid = null, forceBootstrap = false, o
       lastError = null;
 
       if (body.refresh_token) await setTrayRefreshToken(body.refresh_token).catch(() => {});
-      await setTrayAccessToken(body.access_token, expAccessAt).catch(() => {});
+      await setTrayAccessToken(body.access_token, expAccessAt, expMs).catch(() => {});
       cache = { token: body.access_token, expMs: expMs, expAccessAt, mode: "refresh" };
       return { token: body.access_token, authMode: "refresh", apiBase, expAccessAt, hasRefreshKV: true, lastError };
     }
@@ -255,7 +265,7 @@ async function trayTokenWithMeta({ signal, rid = null, forceBootstrap = false, o
     lastError = null;
 
     if (body.refresh_token) await setTrayRefreshToken(body.refresh_token).catch(() => {});
-    await setTrayAccessToken(body.access_token, expAccessAt).catch(() => {});
+    await setTrayAccessToken(body.access_token, expAccessAt, expMs).catch(() => {});
     cache = { token: body.access_token, expMs: expMs, expAccessAt, mode: "bootstrap" };
     return { token: body.access_token, authMode: "bootstrap", apiBase, expAccessAt, hasRefreshKV: true, lastError };
   }
@@ -318,9 +328,11 @@ export async function trayTokenHealthReadOnly() {
   }
 
   // 2) cache persistido no kv_store (outro processo/deploy ja autenticou).
-  const cachedDb = await getTrayCachedAccessToken().catch(() => ({ token: null, expAccessAt: null }));
+  // Prefere o expMs ja corrigido; sem ele (token salvo antes desse campo
+  // existir) cai no parse ingenuo, que erra pelo fuso da loja (BRT/UTC-3).
+  const cachedDb = await getTrayCachedAccessToken().catch(() => ({ token: null, expAccessAt: null, expMs: null }));
   if (cachedDb?.token && cachedDb?.expAccessAt) {
-    const expMs = parseTrayDateToMs(cachedDb.expAccessAt);
+    const expMs = Number.isFinite(cachedDb.expMs) ? cachedDb.expMs : parseTrayDateToMs(cachedDb.expAccessAt);
     if (expMs && Date.now() < expMs - 60_000) {
       return {
         ok: true,

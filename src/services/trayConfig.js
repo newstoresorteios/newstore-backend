@@ -147,15 +147,29 @@ export async function clearTrayRefreshToken() {
   await kvDel("tray_refresh_token").catch(() => {});
 }
 
-export async function setTrayAccessToken(at, expAccessAt) {
+/**
+ * @param {string} at access_token
+ * @param {string} expAccessAt string bruta da Tray (sem timezone, relogio da loja)
+ * @param {number|null} expMs epoch ms ja corrigido (ver computeExpMs em tray.js) --
+ *   opcional, mas sem ele quem le do kv_store (ex.: health read-only) so tem o
+ *   parse ingenuo de expAccessAt, que erra pelo fuso da loja (BRT/UTC-3).
+ */
+export async function setTrayAccessToken(at, expAccessAt, expMs = null) {
   if (at) await kvSet("tray_access_token", at);
   if (expAccessAt) await kvSet("tray_access_exp_at", expAccessAt);
+  if (Number.isFinite(expMs)) await kvSet("tray_access_exp_ms", String(Math.trunc(expMs)));
 }
 
 export async function getTrayCachedAccessToken() {
   const at = await kvGet("tray_access_token").catch(() => null);
   const exp = await kvGet("tray_access_exp_at").catch(() => null);
-  return { token: at ? String(at) : null, expAccessAt: exp ? String(exp) : null };
+  const expMsRaw = await kvGet("tray_access_exp_ms").catch(() => null);
+  const expMs = expMsRaw != null ? Number(expMsRaw) : null;
+  return {
+    token: at ? String(at) : null,
+    expAccessAt: exp ? String(exp) : null,
+    expMs: Number.isFinite(expMs) ? expMs : null,
+  };
 }
 
 
