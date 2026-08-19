@@ -75,6 +75,7 @@ import adminNotificationsRouter from "./routes/adminNotifications.js";
 import adminPushLogsRouter from "./routes/admin_push_logs.js";
 import adminPushRulesRouter from "./routes/admin_push_rules.js";
 import brevoWebhooksRouter from "./routes/brevoWebhooks.js";
+import trayOrderWebhookRouter from "./routes/trayOrderWebhook.js";
 import pushRouter from "./routes/push.js";
 import internalNotificationsRouter from "./routes/internalNotifications.js";
 import internalPushEventsRouter from "./routes/internal_push_events.js";
@@ -230,6 +231,7 @@ app.use("/api/admin/push", adminPushLogsRouter);
 app.use("/api/admin/push/rules", adminPushRulesRouter);
 
 app.use("/api/webhooks/brevo", brevoWebhooksRouter);
+app.use("/api/webhooks/tray", trayOrderWebhookRouter); // POST /api/webhooks/tray/order — bloqueado por config externa, ver Fase G
 app.use("/api/internal/notifications", internalNotificationsRouter);
 app.use("/api/captive-preauth", captivePreauthRouter);
 app.use("/cativo", captivePreauthRouter);

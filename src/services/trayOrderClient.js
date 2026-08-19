@@ -27,7 +27,7 @@
 // controlado antes de confiar nisso em volume.
 
 import { trayMutationRequest } from "./trayMutationClient.js";
-import { TrayCatalogError } from "./trayCatalogClient.js";
+import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
 
 /**
  * @param {object} params
@@ -67,4 +67,28 @@ export async function createTrayOrder({ customerId, items, notes }, options = {}
   }
 
   return { orderId: String(orderId), raw: result };
+}
+
+/**
+ * GET /orders/:id/full — leitura pura, usada pelo reconciliador do webhook
+ * de pedido (Fase G) para confirmar coupon_code/discount de um pedido antes
+ * de agir sobre o saldo local. Nunca confia so no payload do webhook (que
+ * so traz o id) — sempre busca o dado oficial na Tray.
+ * @returns {Promise<{couponCode: string|null, discount: number}>}
+ */
+export async function getTrayOrderFull(orderId, options = {}) {
+  const id = String(orderId || "").trim();
+  if (!id) throw new TrayCatalogError("order_id_missing", { status: 400 });
+
+  const body = await trayCatalogGet(`/orders/${encodeURIComponent(id)}/full`, {}, options);
+  const order = body?.Order ?? body?.order ?? null;
+  if (!order || typeof order !== "object") {
+    throw new TrayCatalogError("tray_invalid_response", { status: 502 });
+  }
+
+  const couponCode = order.coupon_code != null && String(order.coupon_code).trim() !== "" ? String(order.coupon_code).trim() : null;
+  const discountRaw = order.discount;
+  const discount = discountRaw == null ? 0 : Number(String(discountRaw).replace(",", "."));
+
+  return { couponCode, discount: Number.isFinite(discount) ? discount : 0, raw: order };
 }
