@@ -3,7 +3,7 @@ import { Router } from 'express';
 import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
-import { getBalance } from '../services/nscreditWallet.js';
+import { getCouponBalance } from '../services/couponLedger.js';
 
 const router = Router();
 
@@ -55,16 +55,31 @@ router.get('/', requireAuth, async (req, res) => {
 
 /**
  * GET /api/me/nscredits
- * Saldo da carteira de NSCreditos do usuario AUTENTICADO.
+ * Saldo de NSCreditos do usuario AUTENTICADO.
  *
- * O userId vem sempre do token: um usuario nunca consulta a carteira de outro.
- * Quem nunca recebeu creditos tem saldo 0 — isso e um saldo valido, nao erro.
+ * FASE 5: os NSCreditos SAO o cupom individual do usuario
+ * (users.coupon_value_cents) — nao ha mais carteira separada. O mesmo
+ * beneficio pode ser usado na loja Tray ou resgatado aqui.
+ *
+ * O userId vem sempre do token: um usuario nunca consulta o cupom de outro.
+ * Quem nunca recebeu credito tem saldo 0 — isso e um saldo valido, nao erro.
  * Falha real do servidor devolve 500, nunca "0" silencioso.
+ *
+ * `balance` e o valor ja convertido para NSCreditos (coupon_value_cents/100)
+ * pronto para exibicao; `balance_cents` e o valor canonico armazenado.
  */
 router.get('/nscredits', requireAuth, async (req, res) => {
   try {
-    const { balance } = await getBalance(req.user.id);
-    return res.json({ wallet: { balance } });
+    const b = await getCouponBalance(req.user.id);
+    return res.json({
+      wallet: {
+        balance: b.balance_cents / 100,
+        balance_cents: b.balance_cents,
+        coupon_code: b.coupon_code,
+        expires_at: b.expires_at,
+        is_expired: b.is_expired,
+      },
+    });
   } catch (e) {
     console.error('[me/nscredits] error:', e?.code || e?.message);
     return res.status(Number(e?.status) || 500).json({ error: e?.code || 'nscredits_failed' });

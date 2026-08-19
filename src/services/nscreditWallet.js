@@ -1,5 +1,15 @@
 // src/services/nscreditWallet.js
 //
+// LEGADO / INATIVO NA LOJA a partir da FASE 5 (decisao de negocio: o cupom
+// individual do usuario passou a ser a fonte de NSCreditos, ver
+// src/services/couponLedger.js e src/services/couponAdmin.js).
+//
+// Este arquivo NAO foi apagado nem alterado em comportamento — nscredit_wallets
+// e nscredit_transactions continuam existindo em producao e este service
+// continua funcional, so que nada na Loja o chama mais. Mantido por
+// compatibilidade/auditoria; nao usar em codigo novo da Loja de Premios.
+//
+// --- comentario original, ainda valido para o dado ja existente abaixo ---
 // Carteira de NSCreditos.
 //
 // NSCreditos sao uma moeda propria da Loja de Premios. NAO tem relacao com

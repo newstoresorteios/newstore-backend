@@ -30,6 +30,7 @@ export const CART_ISSUES = {
   INSUFFICIENT_STOCK: "insufficient_stock",
   PRICE_CHANGED: "price_changed",
   INSUFFICIENT_NSCREDITS: "insufficient_nscredits",
+  COUPON_EXPIRED: "coupon_expired",
   TRAY_UNAVAILABLE: "tray_unavailable",
 };
 

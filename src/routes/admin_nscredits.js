@@ -12,10 +12,10 @@
 import { Router } from "express";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import {
-  searchUsersForAdmin,
-  getAdminWalletDetail,
-  applyAdminAdjustment,
-} from "../services/nscreditWallet.js";
+  searchUsersForCouponAdmin as searchUsersForAdmin,
+  getUserCouponDetail as getAdminWalletDetail,
+  applyAdminCouponAdjustment as applyAdminAdjustment,
+} from "../services/couponAdmin.js";
 
 const router = Router();
 

@@ -45,6 +45,8 @@ import adminNsCreditsRouter from "./routes/admin_nscredits.js";
 // Loja de Premios (publica)
 import storeRouter from "./routes/store.js";
 import storeCartRouter from "./routes/store_cart.js";
+import storeCheckoutRouter from "./routes/store_checkout.js";
+import storeRedemptionsRouter from "./routes/store_redemptions.js";
 
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
@@ -244,6 +246,8 @@ app.use("/api/coupons", couponsRouter);
 // Loja de Premios (catalogo publico — somente PostgreSQL, nunca consulta a Tray)
 // O carrinho vem ANTES do catalogo para nao ser capturado por /products/:id.
 app.use("/api/store/cart", storeCartRouter);
+app.use("/api/store/checkout", storeCheckoutRouter);
+app.use("/api/store/redemptions", storeRedemptionsRouter);
 app.use("/api/store", storeRouter);
 
 // Tray OAuth callback e health

@@ -19,6 +19,19 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.TRAY_CATALOG_TIMEOUT_MS || 12000);
 /** Metodos HTTP permitidos nesta camada. Catalogo Tray e read-only. */
 const READ_ONLY_METHODS = new Set(["GET"]);
 
+/**
+ * Allow-list explicita de mutacoes Tray autorizadas, por operacao de
+ * dominio. NENHUMA operacao esta autorizada hoje — ver relatorio da Fase E
+ * (resgate real): a criacao de pedido depende de uma decisao de produto
+ * sobre payment_type/payment_method que ainda nao existe, e nao adivinhamos
+ * aqui. Quando uma mutacao for autorizada, ela entra nomeada nesta lista
+ * (ex.: { operation: "tray_order_create", methods: ["POST"] }) — nunca como
+ * uma liberacao geral de metodo.
+ */
+const ALLOWED_MUTATIONS = new Map([
+  // "tray_order_create" -> new Set(["POST"])  // Fase E, quando desbloqueada.
+]);
+
 export class TrayCatalogError extends Error {
   constructor(code, { status = 502, retryAfterSeconds = null, publicDetails = null } = {}) {
     super(code);
@@ -31,13 +44,31 @@ export class TrayCatalogError extends Error {
 }
 
 /**
- * Guarda dura: esta camada so pode emitir GET.
- * Qualquer tentativa de mutacao no catalogo Tray falha aqui, antes da rede.
+ * Guarda dura: o catalogo (produtos/variantes/marcas/health) so pode
+ * emitir GET. Qualquer tentativa de mutacao aqui falha antes da rede.
  */
 export function assertReadOnlyMethod(method) {
   const m = String(method || "").toUpperCase();
   if (!READ_ONLY_METHODS.has(m)) {
     throw new TrayCatalogError("tray_catalog_is_read_only", { status: 500 });
+  }
+  return m;
+}
+
+/**
+ * Guarda para qualquer mutacao FORA do catalogo (carrinho, frete, pedido,
+ * sincronizacao de cupom). So passa se `operation` estiver explicitamente
+ * na allow-list PARA aquele metodo. Hoje a lista esta vazia: toda chamada
+ * aqui falha, de proposito, ate a Fase E decidir o contrato de pagamento.
+ */
+export function assertAllowedTrayMutation(operation, method) {
+  const m = String(method || "").toUpperCase();
+  const allowedMethods = ALLOWED_MUTATIONS.get(String(operation || ""));
+  if (!allowedMethods || !allowedMethods.has(m)) {
+    throw new TrayCatalogError("tray_mutation_not_allowed", {
+      status: 500,
+      publicDetails: { operation: String(operation || ""), method: m },
+    });
   }
   return m;
 }
