@@ -6,14 +6,16 @@
 //
 // Passos:
 //   1. Resolver o customer_id Tray do usuario (trayCustomerResolver.js):
-//      cache -> busca por e-mail -> cria (POST /customers) se o perfil
-//      estiver completo (birth_date). Bloqueio isolado e deterministico
-//      quando o perfil esta incompleto ou ha ambiguidade — nunca um
+//      cache -> busca por e-mail E por cpf -> reconcilia -> cria
+//      (POST /customers) se o perfil estiver completo (birth_date + cpf,
+//      M7.1: cpf provado obrigatorio pra esta loja via teste controlado
+//      real). Bloqueio isolado e deterministico quando o perfil esta
+//      incompleto ou ha ambiguidade/conflito de identidade — nunca um
 //      bloqueio geral do resgate, nunca uma mutacao Tray sem necessidade.
 //   2. Criar o pedido real (trayOrderClient.js), identificando o resgate
 //      via o campo oficial `notes` — nunca via payment_method inventado.
 
-import { resolveTrayCustomerId, TrayCustomerProfileIncompleteError } from "./trayCustomerResolver.js";
+import { resolveTrayCustomerId, TrayCustomerProfileIncompleteError, TrayCustomerIdentityConflictError } from "./trayCustomerResolver.js";
 import { createTrayOrder } from "./trayOrderClient.js";
 import { TrayCatalogError } from "./trayCatalogClient.js";
 
@@ -26,7 +28,7 @@ export class TrayOrderNotImplementedError extends Error {
   }
 }
 
-export { TrayCustomerProfileIncompleteError };
+export { TrayCustomerProfileIncompleteError, TrayCustomerIdentityConflictError };
 
 /**
  * Bloqueio ISOLADO e deterministico: mais de um Customer Tray tem
@@ -63,11 +65,12 @@ function buildNotes({ redemptionId, couponSnapshot }) {
  * @param {object} params
  * @param {number} params.userId id NewStore do usuario (chave de cache/lock do customer_id Tray)
  * @param {string} params.redemptionId
- * @param {object} params.userProfile { name, email, birthDate, phone } — perfil NewStore completo
+ * @param {object} params.userProfile { name, email, birthDate, cpf, phone } — perfil NewStore completo
  * @param {Array<{tray_product_id:string, tray_variant_id?:string|null, quantity:number}>} params.items
  * @param {object} params.couponSnapshot { coupon_code, tray_coupon_id }
- * @throws {TrayCustomerProfileIncompleteError} sem Customer existente e perfil sem birth_date
- * @throws {TrayCustomerAmbiguousError} mais de um Customer Tray com o mesmo e-mail
+ * @throws {TrayCustomerProfileIncompleteError} sem Customer existente e perfil sem birth_date/cpf
+ * @throws {TrayCustomerAmbiguousError} mais de um Customer Tray com o mesmo e-mail/cpf
+ * @throws {TrayCustomerIdentityConflictError} e-mail e cpf apontam pra identidades incompativeis
  * @throws {TrayOrderAmbiguousError} timeout/rede instavel NA CRIACAO do pedido (nunca compensar sozinho)
  * @throws {TrayCatalogError} demais falhas deterministicas (400/401/404/5xx) — seguro compensar
  */
@@ -81,7 +84,13 @@ export async function createTrayRedemptionOrder(params, options = {}) {
   try {
     customerId = await resolveTrayCustomerId(
       userId,
-      { name: userProfile?.name || "", email, birthDate: userProfile?.birthDate || null, phone: userProfile?.phone || null },
+      {
+        name: userProfile?.name || "",
+        email,
+        birthDate: userProfile?.birthDate || null,
+        cpf: userProfile?.cpf || null,
+        phone: userProfile?.phone || null,
+      },
       options
     );
   } catch (e) {

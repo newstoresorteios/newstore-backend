@@ -29,11 +29,16 @@ function sslFor(url) {
   }
 }
 
+const VALID_CPF = "11144477735";
+
 before(async () => {
   if (SKIP) return;
   const pg = (await import("pg")).default;
   pool = new pg.Pool({ connectionString: TEST_DB, ssl: sslFor(TEST_DB), max: 10 });
 
+  // cpf NAO e gravado no seed -- resolveTrayCustomerId nunca le users.cpf
+  // (so tray_customer_id, pra cache); o cpf do PERFIL usado na resolucao
+  // vem do objeto passado em cada teste, nunca da linha em si.
   const stamp = Date.now();
   userId = (await pool.query(
     `insert into public.users (name, email, pass_hash, is_admin, birth_date) values ($1,$2,'x',false,'1990-01-01') returning id`,
@@ -54,21 +59,23 @@ beforeEach(async () => {
 
 test("dois resolveTrayCustomerId concorrentes para o mesmo usuario: so um cria, o outro reusa", skipOpts, async () => {
   const deps = { query: (sql, params) => pool.query(sql, params), getPool: async () => pool };
-  const profile = { name: "Resolver Test", email: `x@x.com`, birthDate: "1990-01-01", phone: null };
+  const profile = { name: "Resolver Test", email: `x@x.com`, birthDate: "1990-01-01", cpf: VALID_CPF, phone: null };
 
   let createCalls = 0;
-  const createTrayCustomer = async () => {
+  const createTrayCustomer = async (p) => {
     createCalls++;
+    assert.equal(p.cpf, VALID_CPF, "cpf precisa chegar na criacao real");
     // Atraso real para dar chance de uma corrida genuina acontecer se o
     // lock nao estiver funcionando.
     await new Promise((r) => setTimeout(r, 150));
     return { id: "TRAY-CUST-REAL-1" };
   };
   const findTrayCustomerByEmail = async () => null; // nunca existe na Tray nos dois processos
+  const findTrayCustomerByCpf = async () => null;
 
   const [a, b] = await Promise.all([
-    resolveTrayCustomerId(userId, profile, { ...deps, createTrayCustomer, findTrayCustomerByEmail }),
-    resolveTrayCustomerId(userId, profile, { ...deps, createTrayCustomer, findTrayCustomerByEmail }),
+    resolveTrayCustomerId(userId, profile, { ...deps, createTrayCustomer, findTrayCustomerByEmail, findTrayCustomerByCpf }),
+    resolveTrayCustomerId(userId, profile, { ...deps, createTrayCustomer, findTrayCustomerByEmail, findTrayCustomerByCpf }),
   ]);
 
   assert.equal(a, "TRAY-CUST-REAL-1");
@@ -79,20 +86,24 @@ test("dois resolveTrayCustomerId concorrentes para o mesmo usuario: so um cria, 
   assert.equal(rows[0].tray_customer_id, "TRAY-CUST-REAL-1");
 });
 
-test("cinco resolveTrayCustomerId concorrentes: ainda assim so uma criacao", skipOpts, async () => {
+test("cinco resolveTrayCustomerId concorrentes: ainda assim so uma criacao (com cpf)", skipOpts, async () => {
   const deps = { query: (sql, params) => pool.query(sql, params), getPool: async () => pool };
-  const profile = { name: "Resolver Test", email: `x@x.com`, birthDate: "1990-01-01", phone: null };
+  const profile = { name: "Resolver Test", email: `x@x.com`, birthDate: "1990-01-01", cpf: VALID_CPF, phone: null };
 
   let createCalls = 0;
-  const createTrayCustomer = async () => {
+  const createTrayCustomer = async (p) => {
     createCalls++;
+    assert.equal(p.cpf, VALID_CPF);
     await new Promise((r) => setTimeout(r, 80));
     return { id: "TRAY-CUST-REAL-2" };
   };
   const findTrayCustomerByEmail = async () => null;
+  const findTrayCustomerByCpf = async () => null;
 
   const results = await Promise.all(
-    Array.from({ length: 5 }, () => resolveTrayCustomerId(userId, profile, { ...deps, createTrayCustomer, findTrayCustomerByEmail }))
+    Array.from({ length: 5 }, () =>
+      resolveTrayCustomerId(userId, profile, { ...deps, createTrayCustomer, findTrayCustomerByEmail, findTrayCustomerByCpf })
+    )
   );
 
   assert.ok(results.every((id) => id === "TRAY-CUST-REAL-2"));

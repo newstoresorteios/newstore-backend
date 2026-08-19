@@ -37,6 +37,7 @@ import {
   TrayOrderNotImplementedError,
   TrayCustomerProfileIncompleteError,
   TrayCustomerAmbiguousError,
+  TrayCustomerIdentityConflictError,
   TrayOrderAmbiguousError,
 } from "./trayRedemptionOrder.js";
 import { ensureTrayCouponForUser } from "./trayCouponEnsure.js";
@@ -239,15 +240,17 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
 
   // Necessario para resolver/criar o customer_id Tray (a Tray nao conhece
   // users.id) — ver trayCustomerResolver.js / trayRedemptionOrder.js.
-  // birth_date so existe quando o usuario ja completou o perfil de
+  // birth_date/cpf so existem quando o usuario ja completou o perfil de
   // resgate (rewardProfile.js) — null aqui e um estado valido, tratado
-  // como bloqueio isolado se um Customer novo precisar ser criado.
-  const userRow = await query(`select name, email, phone, birth_date from public.users where id = $1`, [userId]);
+  // como bloqueio isolado se um Customer novo precisar ser criado. cpf
+  // nunca e logado (PII) — so passa pelo resolver/DTO Tray.
+  const userRow = await query(`select name, email, phone, birth_date, cpf from public.users where id = $1`, [userId]);
   const userProfile = {
     name: userRow.rows[0]?.name || null,
     email: userRow.rows[0]?.email || null,
     phone: userRow.rows[0]?.phone || null,
     birthDate: userRow.rows[0]?.birth_date || null,
+    cpf: userRow.rows[0]?.cpf || null,
   };
 
   const redemption = await createRedemptionRow(query, {
@@ -324,11 +327,14 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
     }
 
     // Deterministico (inclusive TrayOrderNotImplementedError,
-    // TrayCustomerProfileIncompleteError e TrayCustomerAmbiguousError):
-    // sabemos que nenhum pedido foi criado, entao compensar imediatamente
-    // e seguro.
+    // TrayCustomerProfileIncompleteError, TrayCustomerAmbiguousError e
+    // TrayCustomerIdentityConflictError): sabemos que nenhum pedido foi
+    // criado, entao compensar imediatamente e seguro.
     const reason =
-      e instanceof TrayOrderNotImplementedError || e instanceof TrayCustomerProfileIncompleteError || e instanceof TrayCustomerAmbiguousError
+      e instanceof TrayOrderNotImplementedError ||
+      e instanceof TrayCustomerProfileIncompleteError ||
+      e instanceof TrayCustomerAmbiguousError ||
+      e instanceof TrayCustomerIdentityConflictError
         ? e.code
         : "tray_order_failed";
     const compensation = await applyCouponLedgerEntry(
@@ -343,11 +349,17 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       deps
     );
 
+    // M7.1: conflito de identidade (e-mail x cpf apontando pra Customers
+    // Tray incompativeis) reusa o status blocked_tray_customer_ambiguous
+    // -- mesma familia semantica ("resolucao de Customer Tray bloqueada,
+    // precisa de auditoria humana, nunca escolhida as cegas"); o motivo
+    // especifico (tray_customer_identity_conflict + reason detalhado) fica
+    // em failure_reason, sem exigir uma nova migration so pra este status.
     const finalStatus = e instanceof TrayOrderNotImplementedError
       ? "blocked_tray_contract_pending"
       : e instanceof TrayCustomerProfileIncompleteError
         ? "blocked_tray_profile_incomplete"
-        : e instanceof TrayCustomerAmbiguousError
+        : e instanceof TrayCustomerAmbiguousError || e instanceof TrayCustomerIdentityConflictError
           ? "blocked_tray_customer_ambiguous"
           : "compensated";
     await setStatus(query, redemption.id, finalStatus, { coupon_value_after_cents: compensation.balance_cents, failure_reason: reason });

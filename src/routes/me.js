@@ -4,7 +4,7 @@ import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
 import { getCouponBalance } from '../services/couponLedger.js';
-import { getRewardProfile, updateBirthDate, RewardProfileError } from '../services/rewardProfile.js';
+import { getRewardProfile, updateBirthDate, updateCpf, computeMissingRewardProfileFields, maskCPF, RewardProfileError } from '../services/rewardProfile.js';
 
 const router = Router();
 
@@ -17,7 +17,7 @@ router.get('/', requireAuth, async (req, res) => {
     const userId = req.user.id;
     // busca no banco pra garantir dados atualizados
     const r = await query(
-      `select id, name, email, phone, birth_date, is_admin, winner_balance_cents, winner_balance_updated_at
+      `select id, name, email, phone, birth_date, cpf, is_admin, winner_balance_cents, winner_balance_updated_at
          from users
         where id = $1`,
       [userId]
@@ -31,11 +31,15 @@ router.get('/', requireAuth, async (req, res) => {
       is_admin: !!u.is_admin,
     };
 
-    // Completude de perfil para o resgate Loja NS (item 31 do pedido): a
-    // Tray exige birth_date pra criar Customer -- name/email a NewStore ja
-    // tem sempre (NOT NULL). Reusa este mesmo endpoint em vez de duplicar.
-    const missingRewardFields = u.birth_date ? [] : ["birth_date"];
+    // Completude de perfil para o resgate Loja NS: a Tray exige birth_date
+    // E cpf pra criar Customer nesta loja (item M7.1 -- cpf provado
+    // obrigatorio via teste controlado real) -- name/email a NewStore ja
+    // tem sempre (NOT NULL). Reusa a mesma logica de rewardProfile.js, nunca
+    // devolve cpf cru.
+    const missingRewardFields = computeMissingRewardProfileFields(u);
     user.birth_date = u.birth_date || null;
+    user.has_cpf = !!u.cpf;
+    user.cpf_masked = u.cpf ? maskCPF(u.cpf) : null;
     user.profile_complete_for_reward = missingRewardFields.length === 0;
     user.missing_reward_fields = missingRewardFields;
     const winnerBalanceCents = u.winner_balance_cents == null ? null : Number(u.winner_balance_cents);
@@ -161,6 +165,24 @@ router.patch('/birth-date', requireAuth, async (req, res) => {
     }
     console.error('[me/birth-date] error:', e);
     return res.status(500).json({ ok: false, error: 'birth_date_update_failed' });
+  }
+});
+
+/**
+ * PATCH /api/me/cpf
+ * Atualiza somente o CPF do usuario autenticado. Nunca aceita user_id do
+ * corpo -- JWT decide. Nunca loga o valor completo do CPF.
+ */
+router.patch('/cpf', requireAuth, async (req, res) => {
+  try {
+    const out = await updateCpf(req.user.id, req.body?.cpf);
+    return res.json({ ok: true, profile: out });
+  } catch (e) {
+    if (e instanceof RewardProfileError) {
+      return res.status(e.status).json({ ok: false, error: e.code });
+    }
+    console.error('[me/cpf] error:', e?.message || e);
+    return res.status(500).json({ ok: false, error: 'cpf_update_failed' });
   }
 });
 

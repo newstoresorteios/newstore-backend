@@ -15,9 +15,13 @@
 // Contrato de criação (skills/clientes/schemas/cliente.create.json,
 // curado pela própria Tray, required=["name","email","birth_date"]):
 // name/email a NewStore já tem sempre; birth_date é coletado no perfil
-// (ver rewardProfile.js) especificamente para isso. cpf/rg/gender são
-// OPCIONAIS nesse schema — nunca enviados (item 8: não coletar PII que a
-// Tray não exige).
+// (ver rewardProfile.js) especificamente para isso.
+//
+// M7.1: o teste controlado real (POST /customers contra a conta Tray real
+// desta loja) provou que cpf TAMBÉM é obrigatório para esta loja
+// especificamente — prevalece sobre o schema curado, que o classificava
+// como opcional. cpf agora faz parte do perfil exigido (rewardProfile.js).
+// rg/gender continuam OPCIONAIS e deliberadamente NÃO enviados (item 8).
 
 import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
 import { trayMutationRequest } from "./trayMutationClient.js";
@@ -55,7 +59,40 @@ export async function findTrayCustomerByEmail(email, options = {}) {
   }
 
   const match = matches[0];
-  return { id: String(match.id), name: match.name || null, email: normalized };
+  return { id: String(match.id), name: match.name || null, email: normalized, cpf: match.cpf ? String(match.cpf) : null };
+}
+
+/**
+ * Mesmo contrato de findTrayCustomerByEmail, buscando por cpf
+ * (GET /customers?cpf=<11 digitos>). cpf ja deve vir normalizado (sem
+ * pontuacao) -- ver rewardProfile.js.
+ *
+ * @returns {Promise<{id: string, name: string|null, email: string|null, cpf: string} | null>}
+ * @throws {TrayCatalogError} code="tray_customer_ambiguous" quando MAIS DE UM
+ *   cliente Tray tem exatamente esse cpf — nunca escolhe arbitrariamente.
+ */
+export async function findTrayCustomerByCpf(cpf, options = {}) {
+  const normalized = String(cpf || "").replace(/\D/g, "");
+  if (normalized.length !== 11) throw new TrayCatalogError("cpf_missing", { status: 400 });
+
+  const body = await trayCatalogGet("/customers", { cpf: normalized }, options);
+  const rows = unwrapCustomers(body);
+  if (!rows) throw new TrayCatalogError("tray_invalid_response", { status: 502 });
+  if (!rows.length) return null;
+
+  const matches = rows.filter((r) => String(r?.cpf || "").replace(/\D/g, "") === normalized && r?.id != null);
+  if (!matches.length) return null;
+  if (matches.length > 1) {
+    throw new TrayCatalogError("tray_customer_ambiguous", { status: 409, publicDetails: { count: matches.length } });
+  }
+
+  const match = matches[0];
+  return {
+    id: String(match.id),
+    name: match.name || null,
+    email: match.email ? String(match.email).trim().toLowerCase() : null,
+    cpf: normalized,
+  };
 }
 
 /**
@@ -67,24 +104,29 @@ export async function findTrayCustomerByEmail(email, options = {}) {
  * @param {string} profile.name
  * @param {string} profile.email
  * @param {string} profile.birthDate formato YYYY-MM-DD
+ * @param {string} profile.cpf 11 digitos, sem pontuacao (ja normalizado -- ver rewardProfile.js)
  * @param {string|null} [profile.phone]
  * @returns {Promise<{id: string}>}
  */
-export async function createTrayCustomer({ name, email, birthDate, phone = null }, options = {}) {
+export async function createTrayCustomer({ name, email, birthDate, cpf, phone = null }, options = {}) {
   const cleanName = String(name || "").trim();
   const cleanEmail = String(email || "").trim().toLowerCase();
   const cleanBirthDate = String(birthDate || "").trim();
+  const cleanCpf = String(cpf || "").replace(/\D/g, "");
 
   if (!cleanName) throw new TrayCatalogError("customer_name_missing", { status: 400 });
   if (!cleanEmail) throw new TrayCatalogError("customer_email_missing", { status: 400 });
   if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanBirthDate)) throw new TrayCatalogError("customer_birth_date_missing", { status: 400 });
+  // M7.1: provado obrigatorio via 400 real desta loja -- nunca inventar, nunca enviar vazio.
+  if (cleanCpf.length !== 11) throw new TrayCatalogError("customer_cpf_missing", { status: 400 });
 
   const body = {
     Customer: {
       name: cleanName,
       email: cleanEmail,
       birth_date: cleanBirthDate,
-      // cpf/rg/gender deliberadamente ausentes -- opcionais no schema oficial.
+      cpf: cleanCpf,
+      // rg/gender deliberadamente ausentes -- opcionais no schema oficial, YAGNI (item 8).
       ...(phone ? { phone: String(phone) } : {}),
     },
   };

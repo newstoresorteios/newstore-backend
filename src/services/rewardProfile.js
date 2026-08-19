@@ -5,9 +5,16 @@
 // birth_date (required no schema oficial curado pela propria Tray,
 // tray-tecnologia/tray-api-ai-plugin, skills/clientes/schemas/cliente.create.json).
 //
-// name/email a NewStore ja coleta no cadastro (NOT NULL em users). O UNICO
-// campo genuinamente faltante e birth_date. cpf/rg/gender sao OPCIONAIS
-// nesse schema -- deliberadamente NAO coletados aqui (item 8 do pedido:
+// M7.1: o teste controlado real (rodada anterior) provou que, para ESTA
+// loja Tray especifica, cpf tambem e obrigatorio na criacao de Customer
+// (HTTP 400 real: "Este campo nao pode ser deixado em branco"). Isso
+// prevalece sobre o schema curado, que o classificava como opcional --
+// e por isso cpf passa a fazer parte do perfil exigido, com o MESMO
+// tratamento de PII: nunca devolvido cru fora da tela de edicao que
+// realmente precisa, sempre mascarado em qualquer outro contexto.
+//
+// name/email a NewStore ja coleta no cadastro (NOT NULL em users). rg/gender
+// continuam OPCIONAIS no schema e deliberadamente NAO coletados (item 8:
 // nao coletar PII que a Tray nao exige, YAGNI).
 //
 // Mesmo padrao do telefone (users.phone): pede uma vez quando falta, valida,
@@ -62,14 +69,55 @@ export function validateBirthDate(raw) {
   return s;
 }
 
+/** Somente os digitos -- nunca usar Number (perde zeros a esquerda). */
+export function normalizeCPF(raw) {
+  return String(raw ?? "").replace(/\D/g, "");
+}
+
+/**
+ * Validacao real de CPF: 11 digitos, rejeita sequencias repetidas
+ * (000.000.000-00 .. 999.999.999-99, todas matematicamente "validas" pelo
+ * digito verificador mas nunca CPFs reais), e confere os dois digitos
+ * verificadores pelo algoritmo oficial.
+ */
+export function validateCPF(raw) {
+  const digits = normalizeCPF(raw);
+  if (digits.length !== 11) throw new RewardProfileError("invalid_cpf", { status: 400 });
+  if (/^(\d)\1{10}$/.test(digits)) throw new RewardProfileError("invalid_cpf", { status: 400 });
+
+  const nums = digits.split("").map(Number);
+
+  let sum = 0;
+  for (let i = 0; i < 9; i++) sum += nums[i] * (10 - i);
+  let rem = sum % 11;
+  const d10 = rem < 2 ? 0 : 11 - rem;
+  if (d10 !== nums[9]) throw new RewardProfileError("invalid_cpf", { status: 400 });
+
+  sum = 0;
+  for (let i = 0; i < 10; i++) sum += nums[i] * (11 - i);
+  rem = sum % 11;
+  const d11 = rem < 2 ? 0 : 11 - rem;
+  if (d11 !== nums[10]) throw new RewardProfileError("invalid_cpf", { status: 400 });
+
+  return digits;
+}
+
+/** ***.***.***-35 -- so os dois digitos verificadores ficam visiveis. */
+export function maskCPF(digits) {
+  const s = normalizeCPF(digits);
+  if (s.length !== 11) return null;
+  return `***.***.***-${s.slice(9)}`;
+}
+
 /**
  * Campos que faltam para a Tray conseguir criar um Customer para este
- * usuario. Hoje so birth_date -- name/email sao NOT NULL em users, sempre
+ * usuario. birth_date e cpf -- name/email sao NOT NULL em users, sempre
  * presentes.
  */
 export function computeMissingRewardProfileFields(user) {
   const missing = [];
   if (!user?.birth_date) missing.push("birth_date");
+  if (!user?.cpf) missing.push("cpf");
   return missing;
 }
 
@@ -77,26 +125,31 @@ export function isRewardProfileComplete(user) {
   return computeMissingRewardProfileFields(user).length === 0;
 }
 
-/** Le o perfil do usuario autenticado com os campos usados pelo resgate. */
-export async function getRewardProfile(userId, deps = {}) {
-  const d = resolveDeps(deps);
-  const id = parseUserId(userId);
-  const { rows } = await d.query(
-    `select id, name, email, phone, birth_date, tray_customer_id from public.users where id = $1`,
-    [id]
-  );
-  if (!rows.length) throw new RewardProfileError("user_not_found", { status: 404 });
-  const u = rows[0];
+function mapProfileRow(u) {
   const missing = computeMissingRewardProfileFields(u);
   return {
     name: u.name || null,
     email: u.email || null,
     phone: u.phone || null,
     birth_date: u.birth_date || null,
+    has_cpf: !!u.cpf,
+    cpf_masked: u.cpf ? maskCPF(u.cpf) : null,
     tray_customer_id: u.tray_customer_id || null,
     profile_complete_for_reward: missing.length === 0,
     missing_fields: missing,
   };
+}
+
+/** Le o perfil do usuario autenticado com os campos usados pelo resgate. Nunca devolve cpf cru. */
+export async function getRewardProfile(userId, deps = {}) {
+  const d = resolveDeps(deps);
+  const id = parseUserId(userId);
+  const { rows } = await d.query(
+    `select id, name, email, phone, birth_date, cpf, tray_customer_id from public.users where id = $1`,
+    [id]
+  );
+  if (!rows.length) throw new RewardProfileError("user_not_found", { status: 404 });
+  return mapProfileRow(rows[0]);
 }
 
 /** Atualiza somente birth_date do usuario autenticado. JWT decide o user_id, nunca o body. */
@@ -106,19 +159,32 @@ export async function updateBirthDate(userId, rawBirthDate, deps = {}) {
   const birthDate = validateBirthDate(rawBirthDate);
 
   const { rows } = await d.query(
-    `update public.users set birth_date = $2 where id = $1 returning id, name, email, phone, birth_date, tray_customer_id`,
+    `update public.users set birth_date = $2 where id = $1 returning id, name, email, phone, birth_date, cpf, tray_customer_id`,
     [id, birthDate]
   );
   if (!rows.length) throw new RewardProfileError("user_not_found", { status: 404 });
-  const u = rows[0];
-  const missing = computeMissingRewardProfileFields(u);
-  return {
-    name: u.name || null,
-    email: u.email || null,
-    phone: u.phone || null,
-    birth_date: u.birth_date || null,
-    tray_customer_id: u.tray_customer_id || null,
-    profile_complete_for_reward: missing.length === 0,
-    missing_fields: missing,
-  };
+  return mapProfileRow(rows[0]);
+}
+
+/**
+ * Atualiza somente cpf do usuario autenticado. JWT decide o user_id, nunca
+ * o body. Nunca sobrescreve silenciosamente um cpf ja salvo em outro
+ * usuario -- a UNIQUE parcial do banco (migration 035) e a garantia final,
+ * mas verificamos aqui primeiro para devolver um erro claro em vez de um
+ * erro de constraint cru.
+ */
+export async function updateCpf(userId, rawCpf, deps = {}) {
+  const d = resolveDeps(deps);
+  const id = parseUserId(userId);
+  const cpf = validateCPF(rawCpf);
+
+  const existing = await d.query(`select id from public.users where cpf = $1 and id <> $2 limit 1`, [cpf, id]);
+  if (existing.rows.length) throw new RewardProfileError("cpf_already_in_use", { status: 409 });
+
+  const { rows } = await d.query(
+    `update public.users set cpf = $2 where id = $1 returning id, name, email, phone, birth_date, cpf, tray_customer_id`,
+    [id, cpf]
+  );
+  if (!rows.length) throw new RewardProfileError("user_not_found", { status: 404 });
+  return mapProfileRow(rows[0]);
 }
