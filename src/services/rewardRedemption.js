@@ -33,6 +33,7 @@ import { validateCart } from "./rewardCartValidator.js";
 import { getCouponBalance, applyCouponLedgerEntry, CouponLedgerError } from "./couponLedger.js";
 import { getUserAddress } from "./userAddress.js";
 import { createTrayRedemptionOrder, TrayOrderNotImplementedError, TrayCustomerNotFoundError, TrayOrderAmbiguousError } from "./trayRedemptionOrder.js";
+import { ensureTrayCouponForUser } from "./trayCouponEnsure.js";
 
 export class RedemptionError extends Error {
   constructor(code, { status = 400, details = null } = {}) {
@@ -59,7 +60,25 @@ function resolveDeps(deps = {}) {
   return {
     ...resolveCartDeps(deps),
     createTrayRedemptionOrder: deps.createTrayRedemptionOrder || createTrayRedemptionOrder,
+    ensureTrayCouponForUser: deps.ensureTrayCouponForUser || ensureTrayCouponForUser,
   };
+}
+
+/**
+ * Fase F (item 33): mantem o cupom Tray sincronizado com
+ * users.coupon_value_cents IMEDIATAMENTE apos qualquer mudanca de saldo do
+ * resgate — nunca esperando o proximo login. Reusa ensureTrayCouponForUser
+ * (mesma funcao do gatilho de login), que ja le o saldo FRESCO do banco e e
+ * best-effort por design (nunca lanca, so loga e devolve status FAILED).
+ * Chamado depois que o saldo local ja mudou (debito ou compensacao) —
+ * nunca antes, e nunca dentro da transacao que move o saldo.
+ */
+async function syncTrayCouponBestEffort(userId, d) {
+  try {
+    await d.ensureTrayCouponForUser(userId);
+  } catch (e) {
+    console.warn("[reward.redemption] sync do cupom Tray pos-saldo falhou (nao bloqueia o resgate)", { userId, error: e?.message || String(e) });
+  }
 }
 
 async function loadValidCart(userId, deps) {
@@ -255,7 +274,14 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
   await setStatus(query, redemption.id, "credits_reserved", { coupon_value_after_cents: debit.balance_cents });
   await recordEvent(query, redemption.id, { from: "processing", to: "credits_reserved" });
 
-  // Passo 2: tentativa de pedido Tray real. BLOQUEADO hoje — ver relatorio.
+  // Fase F (item 33): saldo local ja mudou (debito) — sincroniza o cupom
+  // Tray IMEDIATAMENTE, antes mesmo de tentar o pedido. Erra do lado seguro:
+  // se o pedido falhar e compensarmos depois, o cupom Tray fica
+  // temporariamente MENOR que o saldo real (nunca maior) ate a segunda
+  // sincronizacao abaixo — nunca abre uma janela de double-spend.
+  await syncTrayCouponBestEffort(userId, d);
+
+  // Passo 2: tentativa de pedido Tray real.
   await setStatus(query, redemption.id, "tray_order_pending", { shipping_snapshot: shippingOption });
   await recordEvent(query, redemption.id, { from: "credits_reserved", to: "tray_order_pending" });
 
@@ -305,6 +331,11 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
         : "compensated";
     await setStatus(query, redemption.id, finalStatus, { coupon_value_after_cents: compensation.balance_cents, failure_reason: reason });
     await recordEvent(query, redemption.id, { from: "tray_order_pending", to: finalStatus, reason });
+
+    // Saldo local mudou de novo (compensacao) — resincroniza o cupom Tray
+    // para refletir o credito devolvido. So agora o valor volta a subir,
+    // nunca antes de termos certeza de que nenhum pedido foi criado.
+    await syncTrayCouponBestEffort(userId, d);
 
     return {
       replayed: false,

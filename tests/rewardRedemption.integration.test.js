@@ -79,6 +79,9 @@ before(async () => {
     // criado. Testes especificos (cliente nao encontrado, timeout ambiguo)
     // substituem este mock explicitamente.
     createTrayRedemptionOrder: async () => ({ orderId: "TEST-TRAY-ORDER-1" }),
+    // Fase F: sincronizacao do cupom Tray e SEMPRE mockada aqui — nunca
+    // toca rede/DB real de producao a partir de um teste de saga.
+    ensureTrayCouponForUser: async () => ({ ok: true, status: "SYNCED" }),
     // Kill-switch (item 24/25): estes testes cobrem o comportamento da saga
     // com o resgate LIGADO. O comportamento DESLIGADO (default de produção)
     // tem testes dedicados abaixo, sem essa flag.
@@ -196,6 +199,45 @@ test("cliente Tray nao mapeado por e-mail: compensa e fica blocked_tray_customer
   assert.equal(hist.rows[0].delta_cents, -150000);
   assert.equal(hist.rows[1].event_type, "REDEMPTION_COMPENSATION");
   assert.equal(hist.rows[1].delta_cents, 150000);
+});
+
+test("Fase F: cupom Tray e sincronizado logo apos o debito, no pedido confirmado", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  const syncCalls = [];
+  const trackedDeps = { ...deps, ensureTrayCouponForUser: async (uid) => { syncCalls.push(uid); return { ok: true, status: "SYNCED" }; } };
+
+  await confirmRedemption(userId, { addressId, idempotencyKey: `redeem-sync-${Date.now()}` }, trackedDeps);
+
+  assert.equal(syncCalls.length, 1, "sincroniza exatamente uma vez no caminho feliz (apos o debito)");
+  assert.equal(syncCalls[0], userId);
+});
+
+test("Fase F: cupom Tray e sincronizado duas vezes quando compensa (debito + devolucao)", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  const syncCalls = [];
+  const trackedDeps = {
+    ...deps,
+    createTrayRedemptionOrder: async () => { throw new TrayCustomerNotFoundError("tray_customer_not_found"); },
+    ensureTrayCouponForUser: async (uid) => { syncCalls.push(uid); return { ok: true, status: "SYNCED" }; },
+  };
+
+  await confirmRedemption(userId, { addressId, idempotencyKey: `redeem-sync-comp-${Date.now()}` }, trackedDeps);
+
+  assert.equal(syncCalls.length, 2, "sincroniza apos o debito E apos a compensacao");
+});
+
+test("Fase F: falha na sincronizacao do cupom Tray NUNCA bloqueia o resgate", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  const flakyDeps = { ...deps, ensureTrayCouponForUser: async () => { throw new Error("tray unreachable"); } };
+  const out = await confirmRedemption(userId, { addressId, idempotencyKey: `redeem-sync-fail-${Date.now()}` }, flakyDeps);
+
+  assert.equal(out.redemption.status, "confirmed", "resgate segue confirmado mesmo com a sincronizacao do cupom falhando");
 });
 
 test("idempotency_key repetida nao debita nem compensa duas vezes", skipOpts, async () => {
