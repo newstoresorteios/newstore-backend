@@ -2,11 +2,12 @@
 //
 // Resgate real da Loja de Premios — /api/store/redemptions/*
 //
-// FASE E BLOQUEADA (ver relatorio): todo /confirm hoje termina em
-// blocked_tray_contract_pending com os creditos devolvidos, porque o
-// contrato de pagamento do pedido Tray ainda nao foi decidido. As rotas
-// existem e sao seguras (nunca perdem credito do cliente), mas nenhum
-// resgate REAL (produto na porta de casa) acontece ainda.
+// /confirm cria um pedido Tray real (ver trayRedemptionOrder.js) quando o
+// cliente tem um customer_id Tray mapeado por e-mail; quando nao tem,
+// termina em blocked_tray_customer_unmapped com os creditos devolvidos —
+// nunca perde credito do cliente sem entregar nada. shipping_option segue
+// aceito no body so como metadado (shipping_snapshot); frete continua fora
+// do escopo desta fase e nunca influencia o pedido Tray em si.
 //
 // Todas as rotas exigem requireAuth. O user_id vem SEMPRE do token.
 
