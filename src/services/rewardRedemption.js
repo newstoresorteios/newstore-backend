@@ -18,7 +18,7 @@ import { resolveDeps as resolveCartDeps, findActiveCart, loadItems, buildCart } 
 import { validateCart } from "./rewardCartValidator.js";
 import { getCouponBalance, applyCouponLedgerEntry, CouponLedgerError } from "./couponLedger.js";
 import { getUserAddress } from "./userAddress.js";
-import { createTrayRedemptionOrder, TrayOrderNotImplementedError, TrayOrderAmbiguousError } from "./trayRedemptionOrder.js";
+import { createTrayRedemptionOrder, TrayOrderNotImplementedError, TrayCustomerNotFoundError, TrayOrderAmbiguousError } from "./trayRedemptionOrder.js";
 
 export class RedemptionError extends Error {
   constructor(code, { status = 400, details = null } = {}) {
@@ -198,6 +198,11 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
   const balance = await getCouponBalance(userId, deps);
   const creditsAmount = validated.cart.total_nscredits;
 
+  // Necessario para localizar o customer_id Tray (a Tray nao conhece
+  // users.id) — ver trayCustomerClient.js / trayRedemptionOrder.js.
+  const userRow = await query(`select email from public.users where id = $1`, [userId]);
+  const userEmail = userRow.rows[0]?.email || null;
+
   const redemption = await createRedemptionRow(query, {
     userId,
     cartId: validated.cart.id,
@@ -245,8 +250,7 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       redemptionId: redemption.id,
       idempotencyKey: key,
       items: validated.items,
-      address,
-      shippingOption,
+      userEmail,
       couponSnapshot: { coupon_code: balance.coupon_code, tray_coupon_id: balance.tray_coupon_id },
     });
 
@@ -264,9 +268,10 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       };
     }
 
-    // Deterministico (inclusive TrayOrderNotImplementedError): sabemos que
-    // nenhum pedido foi criado, entao compensar imediatamente e seguro.
-    const reason = e instanceof TrayOrderNotImplementedError ? e.code : "tray_order_failed";
+    // Deterministico (inclusive TrayOrderNotImplementedError e
+    // TrayCustomerNotFoundError): sabemos que nenhum pedido foi criado,
+    // entao compensar imediatamente e seguro.
+    const reason = e instanceof TrayOrderNotImplementedError || e instanceof TrayCustomerNotFoundError ? e.code : "tray_order_failed";
     const compensation = await applyCouponLedgerEntry(
       {
         userId,
@@ -279,7 +284,11 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       deps
     );
 
-    const finalStatus = e instanceof TrayOrderNotImplementedError ? "blocked_tray_contract_pending" : "compensated";
+    const finalStatus = e instanceof TrayOrderNotImplementedError
+      ? "blocked_tray_contract_pending"
+      : e instanceof TrayCustomerNotFoundError
+        ? "blocked_tray_customer_unmapped"
+        : "compensated";
     await setStatus(query, redemption.id, finalStatus, { coupon_value_after_cents: compensation.balance_cents, failure_reason: reason });
     await recordEvent(query, redemption.id, { from: "tray_order_pending", to: finalStatus, reason });
 

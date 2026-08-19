@@ -29,7 +29,9 @@ const READ_ONLY_METHODS = new Set(["GET"]);
  * uma liberacao geral de metodo.
  */
 const ALLOWED_MUTATIONS = new Map([
-  // "tray_order_create" -> new Set(["POST"])  // Fase E, quando desbloqueada.
+  // Fase 5 (fechamento do resgate): unica mutacao nova autorizada, e so essa.
+  // Nenhuma outra entra aqui sem decisao explicita — ver relatorio.
+  ["TRAY_ORDER_CREATE", new Set(["POST"])],
 ]);
 
 export class TrayCatalogError extends Error {

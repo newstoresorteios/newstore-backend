@@ -8,10 +8,11 @@
 // Sem TEST_DATABASE_URL os testes sao pulados (nunca usam banco de producao).
 //
 // A Tray (catalogo) e sempre um mock controlado. O passo de pedido Tray real
-// (createTrayRedemptionOrder) esta BLOQUEADO por decisao de produto — ver
-// relatorio da Fase E — entao aqui usamos o stub real de produção
-// (TrayOrderNotImplementedError) e um stub de teste para o caminho de
-// timeout ambiguo (item 34), que a produção ainda nao alcança.
+// (createTrayRedemptionOrder, em trayRedemptionOrder.js) tem cliente/cobertura
+// contratual PROPRIA em trayCustomerClient.test.js / trayOrderClient.test.js
+// / trayMutationClient.test.js — aqui a saga usa um MOCK dessa funcao
+// (nunca a rede/DB reais) para poder controlar deterministicamente cada
+// desfecho: sucesso, cliente Tray nao mapeado, timeout ambiguo.
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
@@ -19,7 +20,7 @@ import { prepareRedemption, confirmRedemption, getRedemption, RedemptionError } 
 import { addItem } from "../src/services/rewardCart.js";
 import { createUserAddress } from "../src/services/userAddress.js";
 import { applyCouponLedgerEntry, getCouponBalance } from "../src/services/couponLedger.js";
-import { TrayOrderAmbiguousError } from "../src/services/trayRedemptionOrder.js";
+import { TrayOrderAmbiguousError, TrayCustomerNotFoundError } from "../src/services/trayRedemptionOrder.js";
 
 const TEST_DB = process.env.TEST_DATABASE_URL || "";
 const SKIP = !TEST_DB;
@@ -74,6 +75,10 @@ before(async () => {
       }
     },
     getCatalogProduct: async () => JSON.parse(JSON.stringify(TRAY_PRODUCT)),
+    // Mock de sucesso — representa o cliente Tray ja mapeado e o pedido
+    // criado. Testes especificos (cliente nao encontrado, timeout ambiguo)
+    // substituem este mock explicitamente.
+    createTrayRedemptionOrder: async () => ({ orderId: "TEST-TRAY-ORDER-1" }),
     // Kill-switch (item 24/25): estes testes cobrem o comportamento da saga
     // com o resgate LIGADO. O comportamento DESLIGADO (default de produção)
     // tem testes dedicados abaixo, sem essa flag.
@@ -139,7 +144,7 @@ test("prepare NAO debita e devolve o resumo de confirmacao", skipOpts, async () 
   assert.equal((await getCouponBalance(userId, deps)).balance_cents, 200000, "prepare nao pode debitar");
 });
 
-test("confirm debita uma vez e, sem contrato Tray, compensa e fica blocked_tray_contract_pending", skipOpts, async () => {
+test("confirm debita uma vez e, com pedido Tray criado, fica confirmed", skipOpts, async () => {
   await creditUser(200000);
   await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps); // 1500
 
@@ -147,17 +152,42 @@ test("confirm debita uma vez e, sem contrato Tray, compensa e fica blocked_tray_
   const out = await confirmRedemption(userId, { addressId, idempotencyKey: key }, deps);
 
   assert.equal(out.replayed, false);
-  assert.equal(out.redemption.status, "blocked_tray_contract_pending");
-  assert.equal(out.redemption.failure_reason, "tray_order_contract_pending");
-  assert.equal(out.redemption.coupon_value_after_cents, 200000, "credito tem que voltar integralmente");
+  assert.equal(out.redemption.status, "confirmed");
+  assert.equal(out.redemption.tray_order_id, "TEST-TRAY-ORDER-1");
+  assert.equal(out.redemption.coupon_value_after_cents, 50000, "credito debitado permanece debitado quando o pedido e criado");
 
   const finalBalance = await getCouponBalance(userId, deps);
-  assert.equal(finalBalance.balance_cents, 200000, "saldo final tem que ser identico ao inicial (debito + compensacao)");
+  assert.equal(finalBalance.balance_cents, 50000);
 
   // creditUser() ja grava 1 linha (ADMIN_BALANCE_ADJUSTMENT) no MESMO ledger
   // unificado — filtramos pelos eventos do resgate, nao pelo total do usuario.
   const hist = await pool.query(
     // id e uuid (nao sequencial) — ordenar por created_at, nunca por id.
+    "select event_type, delta_cents from public.coupon_balance_history where user_id=$1 and event_type like 'REDEMPTION_%' order by created_at",
+    [userId]
+  );
+  assert.equal(hist.rows.length, 1);
+  assert.equal(hist.rows[0].event_type, "REDEMPTION_DEBIT");
+  assert.equal(hist.rows[0].delta_cents, -150000);
+});
+
+test("cliente Tray nao mapeado por e-mail: compensa e fica blocked_tray_customer_unmapped", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  const unmappedDeps = { ...deps, createTrayRedemptionOrder: async () => { throw new TrayCustomerNotFoundError("tray_customer_not_found"); } };
+  const key = `redeem-unmapped-${Date.now()}`;
+  const out = await confirmRedemption(userId, { addressId, idempotencyKey: key }, unmappedDeps);
+
+  assert.equal(out.replayed, false);
+  assert.equal(out.redemption.status, "blocked_tray_customer_unmapped");
+  assert.equal(out.redemption.failure_reason, "tray_customer_not_found");
+  assert.equal(out.redemption.coupon_value_after_cents, 200000, "credito tem que voltar integralmente");
+
+  const finalBalance = await getCouponBalance(userId, deps);
+  assert.equal(finalBalance.balance_cents, 200000, "saldo final tem que ser identico ao inicial (debito + compensacao)");
+
+  const hist = await pool.query(
     "select event_type, delta_cents from public.coupon_balance_history where user_id=$1 and event_type like 'REDEMPTION_%' order by created_at",
     [userId]
   );
@@ -181,9 +211,9 @@ test("idempotency_key repetida nao debita nem compensa duas vezes", skipOpts, as
   assert.equal(a.redemption.id, b.redemption.id);
 
   const hist = await pool.query("select count(*)::int as n from public.coupon_balance_history where user_id=$1 and event_type like 'REDEMPTION_%'", [userId]);
-  assert.equal(hist.rows[0].n, 2, "debito + compensacao, nunca mais que isso mesmo com retry");
+  assert.equal(hist.rows[0].n, 1, "so o debito, nunca reaplicado mesmo com retry");
 
-  assert.equal((await getCouponBalance(userId, deps)).balance_cents, 200000);
+  assert.equal((await getCouponBalance(userId, deps)).balance_cents, 50000);
 });
 
 test("saldo insuficiente falha ANTES de qualquer tentativa de pedido Tray", skipOpts, async () => {
@@ -249,7 +279,7 @@ test("historico de eventos registra cada transicao de estado", skipOpts, async (
   );
   assert.deepEqual(
     events.rows.map((r) => r.to_status),
-    ["processing", "credits_reserved", "tray_order_pending", "blocked_tray_contract_pending"]
+    ["processing", "credits_reserved", "tray_order_pending", "confirmed"]
   );
 });
 
