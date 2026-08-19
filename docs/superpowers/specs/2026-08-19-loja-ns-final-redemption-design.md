@@ -161,3 +161,65 @@ ou expandido. O código de cotação de frete da Fase Foundation
 (`checkoutShipping.js`/`trayShipping.js`) permanece isolado e intocado —
 `shipping_option` segue aceito no corpo de `/confirm` apenas como metadado
 (`shipping_snapshot`), nunca influenciando o pedido Tray.
+
+## Addendum (rodada 2 — "Reta Final Definitiva")
+
+### Duas formas documentadas de `POST /orders` — decisão confirmada
+
+Auditoria mais profunda (página real `developers.tray.com.br`, seção
+"Cadastrar Pedido#post", não só o schema resumido do `tray-api-ai-plugin`)
+revelou que a documentação real mostra um exemplo com `Order.Customer`
+inline (`CustomerAddress`/`ProductsSold` aninhados, payload
+`application/x-www-form-urlencoded`, sem `customer_id`), diferente do
+contrato `customer_id`+`products` (JSON, `additionalProperties:false`)
+citado pelo `pedido.create.json` do plugin.
+
+**Decisão confirmada com o solicitante**: manter `customer_id`+`products`
+— é o contrato curado e explicitamente validável (`required`,
+`additionalProperties:false`) que a própria Tray disponibiliza para
+consumo por agentes de IA, menor risco de campo rejeitado. A variante
+inline permanece documentada aqui como alternativa conhecida, não
+descartada por engano — se o teste controlado (M7) revelar que
+`customer_id`+`products` não é aceito na conta real, essa é a rota B
+já mapeada (ver exemplo completo abaixo).
+
+Exemplo real da variante inline (não usada, registrada por referência):
+
+```
+Order.point_sale, Order.session_id, Order.shipment, Order.shipment_value,
+Order.payment_form,
+Order.Customer.{type,name,cpf,email,rg,gender,phone},
+Order.Customer.CustomerAddress[0].{address,zip_code,number,complement,
+  neighborhood,city,state,country,type},
+Order.Customer.ProductsSold[0].{product_id,variant_id,price,original_price,quantity},
+Order.MarketplaceOrder.{...} (só para pedidos importados de marketplace —
+  Mercado Livre no exemplo oficial; não se aplica ao nosso caso)
+```
+
+### `notes` confirmado tanto em create quanto em update
+
+`pedido.update.json` (schema curado, `PUT /orders/:id`) usa o MESMO campo
+`notes` (não `store_note`/`customer_note`, que pertencem à nomenclatura
+mais antiga vista na página HTML). Como `notes` já é aceito no
+`POST /orders` (create), nenhuma chamada `PUT` extra foi adicionada só
+para identificação do resgate.
+
+### `variant_id` (P0 da rodada 1, corrigido)
+
+A mesma auditoria confirmou `product_id`/`variant_id` como campos
+SEPARADOS dentro de cada item de `ProductsSold`/`products` — nunca a
+variação substituindo o produto. `trayOrderClient.js` corrigido para
+enviar ambos quando o item tem variação.
+
+### `POST /customers` — campos reais vs. schema resumido
+
+A página real documenta bem mais campos opcionais que o
+`cliente.create.json` do plugin sugeria (`rg`, `cellphone`, `nickname`,
+`observation`, `type`, `company_name`, `cnpj`, `state_inscription`,
+`reseller`, `discount`, `blocked`, `credit_limit`, `indicator_id`,
+`profile_customer_id`, endereço embutido direto). O `required` continua
+confiável apenas via o schema curado (`name`, `email`, `birth_date`) —
+as tabelas da página real não marcam obrigatoriedade em nenhum campo.
+Deliberadamente enviamos SOMENTE `name`/`email`/`birth_date` (+`phone` se
+já presente) — YAGNI, item 8 do pedido: nunca coletar PII que a Tray não
+exige.
