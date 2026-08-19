@@ -2,14 +2,28 @@
 //
 // Saga do resgate real (Fase 5). Postgres + Tray NAO sao ACID (item 31 do
 // pedido original), entao cada passo e uma operacao local atomica propria,
-// com compensacao explicita quando o passo seguinte falha.
+// com compensacao explicita quando o passo seguinte falha — NUNCA uma
+// transacao Postgres aberta durante uma chamada HTTP a Tray (item 23):
 //
-// ESTADO ATUAL: a saga inteira roda e e testada de ponta a ponta, mas o
-// UNICO passo que fala com a Tray de verdade (createTrayRedemptionOrder,
-// em trayRedemptionOrder.js) esta deliberadamente bloqueado — ver o
-// relatorio da Fase E. Ate isso ser resolvido, todo confirm termina em
-// 'blocked_tray_contract_pending' com os creditos devolvidos, NUNCA com
-// o cliente perdendo credito sem receber nada.
+//   TX curta A -> applyCouponLedgerEntry(debit): abre sua PROPRIA
+//     transacao (SELECT ... FOR UPDATE + update + insert no ledger),
+//     comita e devolve. Nenhuma chamada de rede acontece dentro dela.
+//   Fora de transacao -> createTrayRedemptionOrder (rede real, sem lock
+//     nenhum seguro).
+//   TX curta B (se necessario) -> applyCouponLedgerEntry(credit) de
+//     compensacao, de novo em sua PROPRIA transacao isolada.
+//
+// Timeout/rede instavel na criacao do pedido vira TrayOrderAmbiguousError
+// (trayRedemptionOrder.js) -> status 'reconciliation_required', creditos
+// permanecem debitados, NUNCA compensa as cegas (item 34). GAP CONHECIDO,
+// documentado no relatorio: uma busca ATIVA do pedido na Tray (por
+// customer_id + notes, via GET /orders) antes de decidir confirmar ou
+// compensar nao foi implementada — a documentacao oficial auditada nao
+// confirma se `notes` e devolvido no GET apos a criacao, e nao ha ambiente
+// de homologacao Tray disponivel para verificar isso sem criar um pedido
+// real. Ate essa confirmacao, todo caso ambiguo fica em
+// 'reconciliation_required' para resolucao manual — nunca uma decisao
+// automatica sem evidencia.
 //
 // prepare NAO debita (item 39). Só confirm debita, e só uma vez por
 // idempotency_key (item 28).
