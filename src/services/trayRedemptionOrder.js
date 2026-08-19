@@ -1,21 +1,19 @@
 // src/services/trayRedemptionOrder.js
 //
 // UNICO ponto de integracao entre a saga de resgate (rewardRedemption.js) e
-// a Tray real. Fase D: implementado de verdade — sem inventar payment_type
-// nem frete (ver trayOrderClient.js para o contrato completo e a
-// justificativa documental).
+// a Tray real. Sem inventar payment_type nem frete (ver trayOrderClient.js
+// para o contrato completo e a justificativa documental).
 //
 // Passos:
-//   1. Resolver o customer_id Tray do usuario por e-mail (SOMENTE LEITURA,
-//      trayCustomerClient.js). Nunca cria um cliente novo aqui: criar
-//      cliente na Tray exige birth_date (POST /customers), campo que a
-//      NewStore nao coleta em nenhum lugar do cadastro. Ver
-//      TrayCustomerNotFoundError abaixo — bloqueio isolado e documentado,
-//      nao um bloqueio geral do resgate.
+//   1. Resolver o customer_id Tray do usuario (trayCustomerResolver.js):
+//      cache -> busca por e-mail -> cria (POST /customers) se o perfil
+//      estiver completo (birth_date). Bloqueio isolado e deterministico
+//      quando o perfil esta incompleto ou ha ambiguidade — nunca um
+//      bloqueio geral do resgate, nunca uma mutacao Tray sem necessidade.
 //   2. Criar o pedido real (trayOrderClient.js), identificando o resgate
 //      via o campo oficial `notes` — nunca via payment_method inventado.
 
-import { findTrayCustomerByEmail } from "./trayCustomerClient.js";
+import { resolveTrayCustomerId, TrayCustomerProfileIncompleteError } from "./trayCustomerResolver.js";
 import { createTrayOrder } from "./trayOrderClient.js";
 import { TrayCatalogError } from "./trayCatalogClient.js";
 
@@ -28,17 +26,17 @@ export class TrayOrderNotImplementedError extends Error {
   }
 }
 
+export { TrayCustomerProfileIncompleteError };
+
 /**
- * Bloqueio ISOLADO e deterministico: o usuario nao tem (ou nao pudemos
- * confirmar) um cliente Tray correspondente por e-mail. Nunca criamos um
- * cliente novo aqui — POST /customers exige birth_date, que a NewStore nao
- * coleta. Como nenhuma chamada de mutacao Tray ocorreu, e seguro compensar
- * (devolver os creditos) imediatamente.
+ * Bloqueio ISOLADO e deterministico: mais de um Customer Tray tem
+ * exatamente o mesmo e-mail. Nunca escolhe arbitrariamente (item 11).
+ * Nenhuma mutacao ocorreu, seguro compensar.
  */
-export class TrayCustomerNotFoundError extends Error {
-  constructor(reason = "tray_customer_not_found") {
+export class TrayCustomerAmbiguousError extends Error {
+  constructor(reason = "tray_customer_ambiguous") {
     super(reason);
-    this.name = "TrayCustomerNotFoundError";
+    this.name = "TrayCustomerAmbiguousError";
     this.code = reason;
     this.ambiguous = false;
   }
@@ -63,24 +61,35 @@ function buildNotes({ redemptionId, couponSnapshot }) {
 
 /**
  * @param {object} params
+ * @param {number} params.userId id NewStore do usuario (chave de cache/lock do customer_id Tray)
  * @param {string} params.redemptionId
- * @param {string} params.userEmail e-mail do usuario, usado para localizar o customer_id Tray
+ * @param {object} params.userProfile { name, email, birthDate, phone } — perfil NewStore completo
  * @param {Array<{tray_product_id:string, tray_variant_id?:string|null, quantity:number}>} params.items
  * @param {object} params.couponSnapshot { coupon_code, tray_coupon_id }
- * @throws {TrayCustomerNotFoundError} sem cliente Tray correspondente (bloqueio isolado, sem mutacao)
+ * @throws {TrayCustomerProfileIncompleteError} sem Customer existente e perfil sem birth_date
+ * @throws {TrayCustomerAmbiguousError} mais de um Customer Tray com o mesmo e-mail
  * @throws {TrayOrderAmbiguousError} timeout/rede instavel NA CRIACAO do pedido (nunca compensar sozinho)
  * @throws {TrayCatalogError} demais falhas deterministicas (400/401/404/5xx) — seguro compensar
  */
 export async function createTrayRedemptionOrder(params, options = {}) {
-  const { redemptionId, items, userEmail, couponSnapshot } = params || {};
+  const { userId, redemptionId, items, userProfile, couponSnapshot } = params || {};
 
-  const email = String(userEmail || "").trim();
-  if (!email) throw new TrayCustomerNotFoundError("tray_customer_email_missing");
+  const email = String(userProfile?.email || "").trim();
+  if (!email) throw new TrayCustomerProfileIncompleteError(["email"]);
 
-  // GET puro — nenhuma mutacao ocorre aqui, entao qualquer falha (inclusive
-  // timeout/rede) e deterministicamente segura de propagar e compensar.
-  const customer = await findTrayCustomerByEmail(email, options);
-  if (!customer) throw new TrayCustomerNotFoundError("tray_customer_not_found");
+  let customerId;
+  try {
+    customerId = await resolveTrayCustomerId(
+      userId,
+      { name: userProfile?.name || "", email, birthDate: userProfile?.birthDate || null, phone: userProfile?.phone || null },
+      options
+    );
+  } catch (e) {
+    if (e instanceof TrayCatalogError && e.code === "tray_customer_ambiguous") {
+      throw new TrayCustomerAmbiguousError(e.code);
+    }
+    throw e;
+  }
 
   const orderItems = (Array.isArray(items) ? items : []).map((item) => ({
     trayProductId: item.tray_product_id,
@@ -91,7 +100,7 @@ export async function createTrayRedemptionOrder(params, options = {}) {
   const notes = buildNotes({ redemptionId, couponSnapshot });
 
   try {
-    const result = await createTrayOrder({ customerId: customer.id, items: orderItems, notes }, options);
+    const result = await createTrayOrder({ customerId, items: orderItems, notes }, options);
     return { orderId: result.orderId };
   } catch (e) {
     if (e instanceof TrayCatalogError && (e.code === "tray_timeout" || e.code === "tray_unreachable")) {

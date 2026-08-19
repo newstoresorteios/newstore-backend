@@ -32,7 +32,13 @@ import { resolveDeps as resolveCartDeps, findActiveCart, loadItems, buildCart } 
 import { validateCart } from "./rewardCartValidator.js";
 import { getCouponBalance, applyCouponLedgerEntry, CouponLedgerError } from "./couponLedger.js";
 import { getUserAddress } from "./userAddress.js";
-import { createTrayRedemptionOrder, TrayOrderNotImplementedError, TrayCustomerNotFoundError, TrayOrderAmbiguousError } from "./trayRedemptionOrder.js";
+import {
+  createTrayRedemptionOrder,
+  TrayOrderNotImplementedError,
+  TrayCustomerProfileIncompleteError,
+  TrayCustomerAmbiguousError,
+  TrayOrderAmbiguousError,
+} from "./trayRedemptionOrder.js";
 import { ensureTrayCouponForUser } from "./trayCouponEnsure.js";
 
 export class RedemptionError extends Error {
@@ -231,10 +237,18 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
   const balance = await getCouponBalance(userId, deps);
   const creditsAmount = validated.cart.total_nscredits;
 
-  // Necessario para localizar o customer_id Tray (a Tray nao conhece
-  // users.id) — ver trayCustomerClient.js / trayRedemptionOrder.js.
-  const userRow = await query(`select email from public.users where id = $1`, [userId]);
-  const userEmail = userRow.rows[0]?.email || null;
+  // Necessario para resolver/criar o customer_id Tray (a Tray nao conhece
+  // users.id) — ver trayCustomerResolver.js / trayRedemptionOrder.js.
+  // birth_date so existe quando o usuario ja completou o perfil de
+  // resgate (rewardProfile.js) — null aqui e um estado valido, tratado
+  // como bloqueio isolado se um Customer novo precisar ser criado.
+  const userRow = await query(`select name, email, phone, birth_date from public.users where id = $1`, [userId]);
+  const userProfile = {
+    name: userRow.rows[0]?.name || null,
+    email: userRow.rows[0]?.email || null,
+    phone: userRow.rows[0]?.phone || null,
+    birthDate: userRow.rows[0]?.birth_date || null,
+  };
 
   const redemption = await createRedemptionRow(query, {
     userId,
@@ -287,10 +301,11 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
 
   try {
     const orderResult = await d.createTrayRedemptionOrder({
+      userId,
       redemptionId: redemption.id,
       idempotencyKey: key,
       items: validated.items,
-      userEmail,
+      userProfile,
       couponSnapshot: { coupon_code: balance.coupon_code, tray_coupon_id: balance.tray_coupon_id },
     });
 
@@ -308,10 +323,14 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       };
     }
 
-    // Deterministico (inclusive TrayOrderNotImplementedError e
-    // TrayCustomerNotFoundError): sabemos que nenhum pedido foi criado,
-    // entao compensar imediatamente e seguro.
-    const reason = e instanceof TrayOrderNotImplementedError || e instanceof TrayCustomerNotFoundError ? e.code : "tray_order_failed";
+    // Deterministico (inclusive TrayOrderNotImplementedError,
+    // TrayCustomerProfileIncompleteError e TrayCustomerAmbiguousError):
+    // sabemos que nenhum pedido foi criado, entao compensar imediatamente
+    // e seguro.
+    const reason =
+      e instanceof TrayOrderNotImplementedError || e instanceof TrayCustomerProfileIncompleteError || e instanceof TrayCustomerAmbiguousError
+        ? e.code
+        : "tray_order_failed";
     const compensation = await applyCouponLedgerEntry(
       {
         userId,
@@ -326,9 +345,11 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
 
     const finalStatus = e instanceof TrayOrderNotImplementedError
       ? "blocked_tray_contract_pending"
-      : e instanceof TrayCustomerNotFoundError
-        ? "blocked_tray_customer_unmapped"
-        : "compensated";
+      : e instanceof TrayCustomerProfileIncompleteError
+        ? "blocked_tray_profile_incomplete"
+        : e instanceof TrayCustomerAmbiguousError
+          ? "blocked_tray_customer_ambiguous"
+          : "compensated";
     await setStatus(query, redemption.id, finalStatus, { coupon_value_after_cents: compensation.balance_cents, failure_reason: reason });
     await recordEvent(query, redemption.id, { from: "tray_order_pending", to: finalStatus, reason });
 

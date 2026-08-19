@@ -18,13 +18,11 @@
 // pedido") — é onde a Loja NS se identifica para quem olhar o pedido na
 // Tray, sem usar nenhum campo fora do schema.
 //
-// PENDÊNCIA CONHECIDA (não inventada, documentada no relatório): o campo
-// exato de variação dentro de `products` não foi confirmado explicitamente
-// na documentação consultada. Usamos o id da própria variação como
-// product_id — é o padrão mais consistente com o modelo de catálogo Tray já
-// usado neste repositório (variantes são entidades endereçáveis própria
-// para estoque/preço), mas isso deve ser confirmado no primeiro teste
-// controlado antes de confiar nisso em volume.
+// Variação (P0 resolvido nesta rodada): a pagina real de docs
+// (developers.tray.com.br, secao "Cadastrar Pedido#post", exemplo
+// ProductsSold) confirma product_id e variant_id como campos SEPARADOS —
+// nunca a variacao substituindo o produto. Cada item de `products` envia
+// product_id sempre, e variant_id somente quando o item tem variacao.
 
 import { trayMutationRequest } from "./trayMutationClient.js";
 import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
@@ -43,11 +41,18 @@ export async function createTrayOrder({ customerId, items, notes }, options = {}
   if (!list.length) throw new TrayCatalogError("order_items_empty", { status: 400 });
 
   const products = list.map((item) => {
-    const productId = Number(item.trayVariantId || item.trayProductId);
+    const productId = Number(item.trayProductId);
     const quantity = Number(item.quantity);
     if (!Number.isFinite(productId) || productId <= 0) throw new TrayCatalogError("order_item_product_id_invalid", { status: 400 });
     if (!Number.isFinite(quantity) || quantity <= 0) throw new TrayCatalogError("order_item_quantity_invalid", { status: 400 });
-    return { product_id: productId, quantity };
+
+    const line = { product_id: productId, quantity };
+    if (item.trayVariantId != null && String(item.trayVariantId).trim() !== "") {
+      const variantId = Number(item.trayVariantId);
+      if (!Number.isFinite(variantId) || variantId <= 0) throw new TrayCatalogError("order_item_variant_id_invalid", { status: 400 });
+      line.variant_id = variantId;
+    }
+    return line;
   });
 
   const body = {

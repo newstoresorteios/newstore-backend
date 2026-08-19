@@ -91,7 +91,7 @@ test("pedido valido envia Order com customer_id/products/notes, sem payment_meth
   assert.equal(order.customer_id, 10);
   assert.deepEqual(order.products, [
     { product_id: 111, quantity: 2 },
-    { product_id: 333, quantity: 1 }, // variante prevalece sobre o produto pai
+    { product_id: 222, variant_id: 333, quantity: 1 }, // product_id e variant_id sao campos SEPARADOS
   ]);
   assert.equal(order.notes, "Resgate Loja NS / redemption_id=abc / coupon_code=XYZ");
   assert.equal("payment_method" in order, false);

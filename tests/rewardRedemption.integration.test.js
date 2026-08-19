@@ -20,7 +20,7 @@ import { prepareRedemption, confirmRedemption, getRedemption, RedemptionError } 
 import { addItem } from "../src/services/rewardCart.js";
 import { createUserAddress } from "../src/services/userAddress.js";
 import { applyCouponLedgerEntry, getCouponBalance } from "../src/services/couponLedger.js";
-import { TrayOrderAmbiguousError, TrayCustomerNotFoundError } from "../src/services/trayRedemptionOrder.js";
+import { TrayOrderAmbiguousError, TrayCustomerProfileIncompleteError } from "../src/services/trayRedemptionOrder.js";
 
 const TEST_DB = process.env.TEST_DATABASE_URL || "";
 const SKIP = !TEST_DB;
@@ -174,17 +174,17 @@ test("confirm debita uma vez e, com pedido Tray criado, fica confirmed", skipOpt
   assert.equal(hist.rows[0].delta_cents, -150000);
 });
 
-test("cliente Tray nao mapeado por e-mail: compensa e fica blocked_tray_customer_unmapped", skipOpts, async () => {
+test("perfil sem birth_date e nenhum customer Tray existente: compensa e fica blocked_tray_profile_incomplete", skipOpts, async () => {
   await creditUser(200000);
   await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
 
-  const unmappedDeps = { ...deps, createTrayRedemptionOrder: async () => { throw new TrayCustomerNotFoundError("tray_customer_not_found"); } };
-  const key = `redeem-unmapped-${Date.now()}`;
-  const out = await confirmRedemption(userId, { addressId, idempotencyKey: key }, unmappedDeps);
+  const incompleteDeps = { ...deps, createTrayRedemptionOrder: async () => { throw new TrayCustomerProfileIncompleteError(["birth_date"]); } };
+  const key = `redeem-incomplete-${Date.now()}`;
+  const out = await confirmRedemption(userId, { addressId, idempotencyKey: key }, incompleteDeps);
 
   assert.equal(out.replayed, false);
-  assert.equal(out.redemption.status, "blocked_tray_customer_unmapped");
-  assert.equal(out.redemption.failure_reason, "tray_customer_not_found");
+  assert.equal(out.redemption.status, "blocked_tray_profile_incomplete");
+  assert.equal(out.redemption.failure_reason, "tray_customer_profile_incomplete");
   assert.equal(out.redemption.coupon_value_after_cents, 200000, "credito tem que voltar integralmente");
 
   const finalBalance = await getCouponBalance(userId, deps);
@@ -221,7 +221,7 @@ test("Fase F: cupom Tray e sincronizado duas vezes quando compensa (debito + dev
   const syncCalls = [];
   const trackedDeps = {
     ...deps,
-    createTrayRedemptionOrder: async () => { throw new TrayCustomerNotFoundError("tray_customer_not_found"); },
+    createTrayRedemptionOrder: async () => { throw new TrayCustomerProfileIncompleteError(["birth_date"]); },
     ensureTrayCouponForUser: async (uid) => { syncCalls.push(uid); return { ok: true, status: "SYNCED" }; },
   };
 

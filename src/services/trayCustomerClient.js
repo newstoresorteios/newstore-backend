@@ -1,17 +1,26 @@
 // src/services/trayCustomerClient.js
 //
-// Resolução de identidade do cliente Tray — SOMENTE LEITURA (GET).
+// Resolução de identidade do cliente Tray.
 //
 // O pedido Tray exige customer_id (ID interno da Tray, nunca o nosso
-// users.id). Este arquivo só PROCURA um cliente Tray existente por e-mail —
-// nunca cria um novo (ver trayRedemptionOrder.js: criar cliente novo exige
-// birth_date, que a NewStore não coleta — bloqueio isolado ali, não aqui).
+// users.id). Este arquivo PROCURA um cliente Tray existente por e-mail
+// (GET, sempre seguro) e, se realmente necessário e autorizado pelo
+// chamador, CRIA um novo (POST /customers) — nunca sem antes procurar.
 //
-// Contrato: GET /customers?email=<email> — documentação oficial Tray
-// (skills/clientes, tray-tecnologia/tray-api-ai-plugin, mesma convenção de
-// envelope já usada pelo catálogo: coleção no plural, item singular dentro).
+// Contrato de busca: GET /customers?email=<email> — documentação oficial
+// Tray (skills/clientes, tray-tecnologia/tray-api-ai-plugin, mesma
+// convenção de envelope já usada pelo catálogo: coleção no plural, item
+// singular dentro).
+//
+// Contrato de criação (skills/clientes/schemas/cliente.create.json,
+// curado pela própria Tray, required=["name","email","birth_date"]):
+// name/email a NewStore já tem sempre; birth_date é coletado no perfil
+// (ver rewardProfile.js) especificamente para isso. cpf/rg/gender são
+// OPCIONAIS nesse schema — nunca enviados (item 8: não coletar PII que a
+// Tray não exige).
 
 import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
+import { trayMutationRequest } from "./trayMutationClient.js";
 
 function unwrapCustomers(body) {
   if (!body || typeof body !== "object") return null;
@@ -25,6 +34,8 @@ function unwrapCustomers(body) {
 /**
  * @returns {Promise<{id: string, name: string|null, email: string} | null>}
  *   null quando nenhum cliente Tray tem esse e-mail — nunca inventa um.
+ * @throws {TrayCatalogError} code="tray_customer_ambiguous" quando MAIS DE UM
+ *   cliente Tray tem exatamente esse e-mail — nunca escolhe arbitrariamente.
  */
 export async function findTrayCustomerByEmail(email, options = {}) {
   const normalized = String(email || "").trim().toLowerCase();
@@ -35,10 +46,52 @@ export async function findTrayCustomerByEmail(email, options = {}) {
   if (!rows) throw new TrayCatalogError("tray_invalid_response", { status: 502 });
   if (!rows.length) return null;
 
-  // Correspondência exata de e-mail — a Tray pode devolver resultados
+  // Correspondência EXATA de e-mail — a Tray pode devolver resultados
   // parciais/case-insensitive; nunca usar o primeiro item às cegas.
-  const match = rows.find((r) => String(r?.email || "").trim().toLowerCase() === normalized) || null;
-  if (!match?.id) return null;
+  const matches = rows.filter((r) => String(r?.email || "").trim().toLowerCase() === normalized && r?.id != null);
+  if (!matches.length) return null;
+  if (matches.length > 1) {
+    throw new TrayCatalogError("tray_customer_ambiguous", { status: 409, publicDetails: { count: matches.length } });
+  }
 
+  const match = matches[0];
   return { id: String(match.id), name: match.name || null, email: normalized };
+}
+
+/**
+ * Cria um Customer Tray novo. Chamador e responsavel por ja ter feito o
+ * lookup (findTrayCustomerByEmail) e confirmado que nao existe — esta
+ * funcao NUNCA verifica duplicidade sozinha, so cria.
+ *
+ * @param {object} profile
+ * @param {string} profile.name
+ * @param {string} profile.email
+ * @param {string} profile.birthDate formato YYYY-MM-DD
+ * @param {string|null} [profile.phone]
+ * @returns {Promise<{id: string}>}
+ */
+export async function createTrayCustomer({ name, email, birthDate, phone = null }, options = {}) {
+  const cleanName = String(name || "").trim();
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  const cleanBirthDate = String(birthDate || "").trim();
+
+  if (!cleanName) throw new TrayCatalogError("customer_name_missing", { status: 400 });
+  if (!cleanEmail) throw new TrayCatalogError("customer_email_missing", { status: 400 });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanBirthDate)) throw new TrayCatalogError("customer_birth_date_missing", { status: 400 });
+
+  const body = {
+    Customer: {
+      name: cleanName,
+      email: cleanEmail,
+      birth_date: cleanBirthDate,
+      // cpf/rg/gender deliberadamente ausentes -- opcionais no schema oficial.
+      ...(phone ? { phone: String(phone) } : {}),
+    },
+  };
+
+  const result = await trayMutationRequest("TRAY_CUSTOMER_CREATE", "POST", "/customers", body, options);
+  const id = result?.id ?? result?.Customer?.id ?? result?.customer?.id ?? null;
+  if (!id) throw new TrayCatalogError("tray_customer_id_missing", { status: 502, publicDetails: { tray_body: result } });
+
+  return { id: String(id) };
 }
