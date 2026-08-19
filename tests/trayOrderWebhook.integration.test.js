@@ -78,13 +78,13 @@ async function couponCodeFor(uid) {
   return rows[0].coupon_code;
 }
 
-test("gasto direto confirmado zera o saldo local e grava DIRECT_TRAY_SPEND", skipOpts, async () => {
+test("gasto direto confirmado debita EXATAMENTE o discount (integral == saldo neste caso) e grava DIRECT_TRAY_SPEND", skipOpts, async () => {
   await applyCouponLedgerEntry({ userId, operation: "credit", amountCents: 50000, eventType: "ADMIN_BALANCE_ADJUSTMENT" }, deps);
   const code = await couponCodeFor(userId);
 
   const out = await handleTrayOrderWebhook(
     { seller_id: "1", scope_id: "9001", scope_name: "order", act: "insert" },
-    { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 500 }) }
+    { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 500, discountCents: 50000 }) }
   );
 
   assert.equal(out.handled, true);
@@ -101,10 +101,76 @@ test("gasto direto confirmado zera o saldo local e grava DIRECT_TRAY_SPEND", ski
   assert.equal(rows[0].delta_cents, -50000);
 });
 
+test("gasto PARCIAL: discount menor que o saldo debita so o valor exato, nunca zera o resto", skipOpts, async () => {
+  await applyCouponLedgerEntry({ userId, operation: "credit", amountCents: 38100, eventType: "ADMIN_BALANCE_ADJUSTMENT" }, deps);
+  const code = await couponCodeFor(userId);
+
+  const out = await handleTrayOrderWebhook(
+    { seller_id: "1", scope_id: "9005", scope_name: "order", act: "insert" },
+    { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 50, discountCents: 5000 }) }
+  );
+
+  assert.equal(out.handled, true);
+  assert.equal(out.balance_cents, 33100, "38100 - 5000 = 33100, nunca zero");
+
+  const balance = await getCouponBalance(userId, deps);
+  assert.equal(balance.balance_cents, 33100);
+
+  const { rows } = await pool.query(
+    "select delta_cents from public.coupon_balance_history where user_id=$1 and event_type='DIRECT_TRAY_SPEND'",
+    [userId]
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].delta_cents, -5000);
+});
+
+test("dois gastos parciais em pedidos diferentes debitam cada um o seu valor exato", skipOpts, async () => {
+  await applyCouponLedgerEntry({ userId, operation: "credit", amountCents: 38100, eventType: "ADMIN_BALANCE_ADJUSTMENT" }, deps);
+  const code = await couponCodeFor(userId);
+  const webhookDeps = { query: deps.query, withTransaction: deps.withTransaction };
+
+  const a = await handleTrayOrderWebhook(
+    { seller_id: "1", scope_id: "9006", scope_name: "order", act: "insert" },
+    { ...webhookDeps, getTrayOrderFull: async () => ({ couponCode: code, discount: 50, discountCents: 5000 }) }
+  );
+  assert.equal(a.handled, true);
+  assert.equal(a.balance_cents, 33100);
+
+  const b = await handleTrayOrderWebhook(
+    { seller_id: "1", scope_id: "9007", scope_name: "order", act: "insert" },
+    { ...webhookDeps, getTrayOrderFull: async () => ({ couponCode: code, discount: 31, discountCents: 3100 }) }
+  );
+  assert.equal(b.handled, true);
+  assert.equal(b.balance_cents, 30000);
+
+  assert.equal((await getCouponBalance(userId, deps)).balance_cents, 30000);
+});
+
+test("discount MAIOR que o saldo local: ledger recusa (insufficient_balance), nunca mascara com Math.max, nao debita nada", skipOpts, async () => {
+  await applyCouponLedgerEntry({ userId, operation: "credit", amountCents: 3000, eventType: "ADMIN_BALANCE_ADJUSTMENT" }, deps);
+  const code = await couponCodeFor(userId);
+
+  const out = await handleTrayOrderWebhook(
+    { seller_id: "1", scope_id: "9008", scope_name: "order", act: "insert" },
+    { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 50, discountCents: 5000 }) }
+  );
+
+  assert.equal(out.handled, false);
+  assert.equal(out.reason, "balance_changed_concurrently");
+
+  // Saldo nunca e tocado quando ha inconsistencia -- fica exatamente como estava.
+  assert.equal((await getCouponBalance(userId, deps)).balance_cents, 3000);
+  const { rows } = await pool.query(
+    "select count(*)::int as n from public.coupon_balance_history where user_id=$1 and event_type='DIRECT_TRAY_SPEND'",
+    [userId]
+  );
+  assert.equal(rows[0].n, 0, "nenhum lancamento gravado quando a inconsistencia e detectada");
+});
+
 test("mesmo tray_order_id entregue duas vezes (retry do webhook) nao debita duas vezes", skipOpts, async () => {
   await applyCouponLedgerEntry({ userId, operation: "credit", amountCents: 30000, eventType: "ADMIN_BALANCE_ADJUSTMENT" }, deps);
   const code = await couponCodeFor(userId);
-  const webhookDeps = { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 300 }) };
+  const webhookDeps = { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 300, discountCents: 30000 }) };
   const payload = { seller_id: "1", scope_id: "9002", scope_name: "order", act: "insert" };
 
   const a = await handleTrayOrderWebhook(payload, webhookDeps);
@@ -131,7 +197,7 @@ test("mesmo tray_order_id entregue duas vezes (retry do webhook) nao debita duas
 test("retry chega DEPOIS de um credito legitimo novo: idempotency_key protege, nao debita o credito novo", skipOpts, async () => {
   await applyCouponLedgerEntry({ userId, operation: "credit", amountCents: 20000, eventType: "ADMIN_BALANCE_ADJUSTMENT" }, deps);
   const code = await couponCodeFor(userId);
-  const webhookDeps = { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 200 }) };
+  const webhookDeps = { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 200, discountCents: 20000 }) };
   const payload = { seller_id: "1", scope_id: "9004", scope_name: "order", act: "insert" };
 
   const a = await handleTrayOrderWebhook(payload, webhookDeps);
@@ -169,7 +235,7 @@ test("saldo ja alterado por outra operacao concorrente (ex.: resgate) nao quebra
 
   const out = await handleTrayOrderWebhook(
     { seller_id: "1", scope_id: "9003", scope_name: "order", act: "insert" },
-    { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 100 }) }
+    { query: deps.query, withTransaction: deps.withTransaction, getTrayOrderFull: async () => ({ couponCode: code, discount: 100, discountCents: 10000 }) }
   );
 
   assert.equal(out.handled, false);

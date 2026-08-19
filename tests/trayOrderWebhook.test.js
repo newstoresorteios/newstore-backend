@@ -68,7 +68,7 @@ test("coupon_code que nao pertence a nenhum usuario nosso e ignorado", async () 
     { seller_id: "1", scope_id: "2", scope_name: "order", act: "insert" },
     {
       query: async () => ({ rows: [] }),
-      getTrayOrderFull: async () => ({ couponCode: "OUTRO-CUPOM-GENERICO", discount: 50 }),
+      getTrayOrderFull: async () => ({ couponCode: "OUTRO-CUPOM-GENERICO", discount: 50, discountCents: 5000 }),
     }
   );
   assert.equal(out.handled, false);
@@ -80,9 +80,48 @@ test("saldo local ja zerado: no-op, nao tenta debitar", async () => {
     { seller_id: "1", scope_id: "2", scope_name: "order", act: "insert" },
     {
       query: async () => ({ rows: [{ id: 42, coupon_value_cents: 0 }] }),
-      getTrayOrderFull: async () => ({ couponCode: "NSU-0042-AB", discount: 100 }),
+      getTrayOrderFull: async () => ({ couponCode: "NSU-0042-AB", discount: 100, discountCents: 10000 }),
     }
   );
   assert.equal(out.handled, false);
   assert.equal(out.reason, "balance_already_zero");
 });
+
+test("discount informado mas discountCents nao parseavel: nunca adivinha, nunca toca o banco", async () => {
+  let queryCalled = false;
+  const out = await handleTrayOrderWebhook(
+    { seller_id: "1", scope_id: "2", scope_name: "order", act: "insert" },
+    {
+      query: async () => { queryCalled = true; },
+      getTrayOrderFull: async () => ({ couponCode: "NSU-0042-AB", discount: 50, discountCents: null }),
+    }
+  );
+  assert.equal(out.handled, false);
+  assert.equal(out.reason, "discount_unparseable");
+  assert.equal(out.anomaly, true);
+  assert.equal(queryCalled, false);
+});
+
+test("discount excede o saldo local: ledger recusa (insufficient_balance), nunca mascara com Math.max, nao debita", async () => {
+  const out = await handleTrayOrderWebhook(
+    { seller_id: "1", scope_id: "2", scope_name: "order", act: "insert" },
+    {
+      query: async (sql) => {
+        if (String(sql).includes("select id, coalesce")) return { rows: [{ id: 42, coupon_value_cents: 3000 }] };
+        throw new Error("unexpected query: " + sql);
+      },
+      withTransaction: async (fn) =>
+        fn({
+          query: async (sql) => {
+            if (String(sql).includes("idempotency_key = $1")) return { rows: [] };
+            if (String(sql).includes("for update")) return { rows: [{ id: 42, balance_cents: 3000, coupon_expires_at: null }] };
+            throw new Error("unexpected tx query: " + sql);
+          },
+        }),
+      getTrayOrderFull: async () => ({ couponCode: "NSU-0042-AB", discount: 50, discountCents: 5000 }),
+    }
+  );
+  assert.equal(out.handled, false);
+  assert.equal(out.reason, "balance_changed_concurrently");
+});
+

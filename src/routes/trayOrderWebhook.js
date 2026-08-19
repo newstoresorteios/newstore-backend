@@ -25,7 +25,14 @@ router.post("/order", async (req, res) => {
   // 1 escrita atomica, entao processamos antes de responder (sem fila).
   try {
     const result = await handleTrayOrderWebhook(req.body || {});
-    console.log("[tray.webhook.order]", { ...result });
+    if (result.anomaly) {
+      // Erro financeiro real (ex.: desconto > saldo conhecido) -- nunca
+      // mascarado. Log de alta visibilidade; 200 porque reenviar nao
+      // resolve, o problema precisa de investigacao manual, nao de retry.
+      console.error("[tray.webhook.order] ANOMALIA FINANCEIRA", { ...result });
+    } else {
+      console.log("[tray.webhook.order]", { ...result });
+    }
     return res.status(200).json({ ok: true, ...result });
   } catch (e) {
     if (e instanceof TrayWebhookError) {
