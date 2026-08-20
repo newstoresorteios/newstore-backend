@@ -430,3 +430,51 @@ test("kill-switch nao afeta prepare (somente leitura continua disponivel)", skip
   const out = await prepareRedemption(userId, { addressId }, disabledDeps);
   assert.equal(out.credits_amount, 1500);
 });
+
+test("400 definitivo da Tray: erro sanitizado vai pro meta do evento E o saldo e integralmente compensado", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  // Erro real como o trayMutationClient monta: publicDetails.tray_body.
+  // Inclui PII/segredo de proposito, pra provar que nao vazam no meta.
+  const trayError = Object.assign(new Error("tray_request_invalid"), {
+    code: "tray_request_invalid",
+    status: 400,
+    publicDetails: {
+      tray_body: {
+        code: 400,
+        name: "Bad Request",
+        causes: { Order: { payment_form: ["campo obrigatório"] } },
+        access_token: "APP_ID-7secret",
+        cpf: "10425415902",
+      },
+    },
+  });
+
+  const failingDeps = { ...deps, createTrayRedemptionOrder: async () => { throw trayError; } };
+  const key = `redeem-400-meta-${Date.now()}`;
+  const out = await confirmRedemption(userId, { addressId, idempotencyKey: key }, failingDeps);
+
+  assert.equal(out.redemption.status, "compensated");
+  assert.equal(out.redemption.failure_reason, "tray_order_failed");
+
+  // Saga preservada: compensacao integral.
+  const finalBalance = await getCouponBalance(userId, deps);
+  assert.equal(finalBalance.balance_cents, 200000, "saldo tem que voltar integralmente");
+
+  // Observabilidade: o meta permite descobrir QUAL campo a Tray rejeitou.
+  const ev = await pool.query(
+    "select meta from public.reward_redemption_events where redemption_id=$1 and to_status='compensated' order by created_at desc limit 1",
+    [out.redemption.id]
+  );
+  const meta = ev.rows[0].meta;
+  assert.equal(meta.http_status, 400);
+  assert.equal(meta.tray_error_code, "tray_request_invalid");
+  assert.deepEqual(meta.tray_body.causes.Order.payment_form, ["campo obrigatório"]);
+
+  // ...sem nunca carregar segredo/PII.
+  const serialized = JSON.stringify(meta).toLowerCase();
+  for (const forbidden of ["app_id-7secret", "10425415902"]) {
+    assert.equal(serialized.includes(forbidden), false, `vazou ${forbidden} no meta`);
+  }
+});
