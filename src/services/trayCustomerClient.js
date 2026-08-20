@@ -71,6 +71,41 @@ export async function findTrayCustomerByEmail(email, options = {}) {
  * @throws {TrayCatalogError} code="tray_customer_ambiguous" quando MAIS DE UM
  *   cliente Tray tem exatamente esse cpf — nunca escolhe arbitrariamente.
  */
+/**
+ * Customer CANONICO por id — a fonte de identidade do POST /orders quando
+ * users.tray_customer_id ja existe.
+ *
+ * Motivo (M7, prova real): o pedido valida Order.Customer como cadastro de
+ * cliente. Remontar essa identidade com os dados da NewStore faz a Tray achar
+ * que e um cliente novo (o e-mail diverge do cadastro dela) e recusar com
+ * cpf "Está em uso em outro cadastro.". Usando a identidade que a propria
+ * Tray tem, o cadastro descrito e o mesmo que ja existe.
+ *
+ * Devolve os campos crus da Tray (sem normalizar/mascarar): quem monta o DTO
+ * decide o que enviar. Nunca logar este retorno -- e PII.
+ */
+export async function getTrayCustomerById(customerId, options = {}) {
+  const id = String(customerId ?? "").trim();
+  if (!id) throw new TrayCatalogError("customer_id_invalid", { status: 400 });
+
+  const body = await trayCatalogGet(`/customers/${encodeURIComponent(id)}`, {}, options);
+  const c = body?.Customer ?? body?.customer ?? null;
+  if (!c || c.id == null) throw new TrayCatalogError("tray_invalid_response", { status: 502 });
+
+  return {
+    id: String(c.id),
+    type: c.type != null ? String(c.type) : null,
+    name: c.name ? String(c.name).trim() : null,
+    email: c.email ? String(c.email).trim() : null,
+    cpf: String(c.cpf || "").replace(/\D/g, "") || null,
+    birth_date: c.birth_date ? String(c.birth_date).slice(0, 10) : null,
+    phone: String(c.phone || "").replace(/\D/g, "") || null,
+    cellphone: String(c.cellphone || "").replace(/\D/g, "") || null,
+    rg: c.rg ? String(c.rg).trim() : null,
+    gender: c.gender ? String(c.gender).trim() : null,
+  };
+}
+
 export async function findTrayCustomerByCpf(cpf, options = {}) {
   const normalized = String(cpf || "").replace(/\D/g, "");
   if (normalized.length !== 11) throw new TrayCatalogError("cpf_missing", { status: 400 });

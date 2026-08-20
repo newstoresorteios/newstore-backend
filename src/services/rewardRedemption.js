@@ -53,6 +53,66 @@ export class RedemptionError extends Error {
 }
 
 /**
+ * Chaves que NUNCA podem ser persistidas em reward_redemption_events.meta:
+ * segredos e PII. O objetivo do meta e diagnosticar CONTRATO (qual campo a
+ * Tray rejeitou e por que), nunca guardar dado pessoal.
+ */
+const META_FORBIDDEN_KEYS =
+  /^(access_token|refresh_token|authorization|password|pass_hash|token|secret|cookie|database_url|cpf|birth_date|birthdate|phone|cellphone|email|address|zip_code|zipcode|number|complement|neighborhood|street)$/i;
+
+/** Valores que "parecem" segredo/PII mesmo fora de uma chave conhecida. */
+function scrubMetaValue(value) {
+  const s = String(value);
+  if (/\d{11,}/.test(s.replace(/\D/g, "")) && s.replace(/\D/g, "").length >= 11) return "[redacted]";
+  if (/@/.test(s)) return "[redacted]";
+  if (/access_token|refresh_token|bearer /i.test(s)) return "[redacted]";
+  return s.length > 500 ? `${s.slice(0, 500)}…` : s;
+}
+
+/**
+ * Sanitiza o corpo de erro da Tray para persistir em
+ * reward_redemption_events.meta. Preserva o que diagnostica contrato
+ * (campo rejeitado, mensagem de validacao, status/codigo) e descarta
+ * segredo/PII. Profundidade limitada para nunca gravar um blob gigante.
+ */
+export function sanitizeTrayErrorBody(value, depth = 0, inCauses = false) {
+  if (value == null) return null;
+  if (depth > 4) return "[truncated]";
+  if (Array.isArray(value)) return value.slice(0, 20).map((v) => sanitizeTrayErrorBody(v, depth + 1, inCauses));
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value).slice(0, 40)) {
+      // Dentro de `causes` o VALOR e a mensagem de validacao da Tray
+      // ("Este campo nao pode ser deixado em branco."), nunca o dado do
+      // usuario -- redigir por nome de chave ali apagava exatamente o que
+      // precisamos para corrigir o contrato. O scrub por conteudo continua
+      // valendo, entao um valor que realmente pareca PII ainda e removido.
+      const nextInCauses = inCauses || k === "causes";
+      if (!nextInCauses && META_FORBIDDEN_KEYS.test(k)) {
+        // Fora de `causes`, a CHAVE importa pro diagnostico e o VALOR nao.
+        out[k] = "[redacted]";
+        continue;
+      }
+      out[k] = sanitizeTrayErrorBody(v, depth + 1, nextInCauses);
+    }
+    return out;
+  }
+  if (typeof value === "string") return scrubMetaValue(value);
+  return value;
+}
+
+/** Monta o meta de observabilidade de uma falha definitiva da Tray. */
+export function buildTrayFailureMeta(e) {
+  if (!e) return null;
+  const body = e?.publicDetails?.tray_body ?? e?.publicDetails ?? null;
+  const meta = {};
+  if (e?.status != null) meta.http_status = e.status;
+  if (e?.code) meta.tray_error_code = e.code;
+  if (body != null) meta.tray_body = sanitizeTrayErrorBody(body);
+  return Object.keys(meta).length ? meta : null;
+}
+
+/**
  * Kill-switch de produção (item 24/25 do pedido): o botão CONTINUAR
  * desabilitado no frontend NAO e protecao suficiente — qualquer um pode
  * chamar a API diretamente. Default SEGURO e "false": so uma variavel de
@@ -309,6 +369,11 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       idempotencyKey: key,
       items: validated.items,
       userProfile,
+      // M7 (prova real): POST /orders exige CustomerAddress preenchido
+      // (address/number/neighborhood/city/state/zip_code/country). O endereco
+      // e o do proprio usuario (user_addresses), nunca inventado. Isso NAO e
+      // frete -- nenhum valor/transportadora e calculado aqui.
+      address,
       couponSnapshot: { coupon_code: balance.coupon_code, tray_coupon_id: balance.tray_coupon_id },
     });
 
@@ -319,7 +384,12 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
     if (e instanceof TrayOrderAmbiguousError) {
       // Item 34: timeout/resultado ambiguo NUNCA compensa automaticamente.
       await setStatus(query, redemption.id, "reconciliation_required", { failure_reason: e.code });
-      await recordEvent(query, redemption.id, { from: "tray_order_pending", to: "reconciliation_required", reason: e.code });
+      await recordEvent(query, redemption.id, {
+        from: "tray_order_pending",
+        to: "reconciliation_required",
+        reason: e.code,
+        meta: buildTrayFailureMeta(e),
+      });
       return {
         replayed: false,
         redemption: mapRedemption({ ...redemption, status: "reconciliation_required", coupon_value_after_cents: debit.balance_cents, failure_reason: e.code }),
@@ -363,7 +433,16 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
           ? "blocked_tray_customer_ambiguous"
           : "compensated";
     await setStatus(query, redemption.id, finalStatus, { coupon_value_after_cents: compensation.balance_cents, failure_reason: reason });
-    await recordEvent(query, redemption.id, { from: "tray_order_pending", to: finalStatus, reason });
+    // Observabilidade (M7): sem o corpo real do erro da Tray nao da pra saber
+    // QUAL requisito foi rejeitado, e descobrir isso via POST repetido custa
+    // uma mutation real a cada tentativa. Persistimos o erro sanitizado --
+    // contrato sim, PII/segredo nunca.
+    await recordEvent(query, redemption.id, {
+      from: "tray_order_pending",
+      to: finalStatus,
+      reason,
+      meta: buildTrayFailureMeta(e),
+    });
 
     // Saldo local mudou de novo (compensacao) — resincroniza o cupom Tray
     // para refletir o credito devolvido. So agora o valor volta a subir,

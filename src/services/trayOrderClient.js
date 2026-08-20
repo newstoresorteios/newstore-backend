@@ -27,13 +27,104 @@
 import { trayMutationRequest } from "./trayMutationClient.js";
 import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
 
+// Campos obrigatorios do Order descobertos empiricamente (400 real:
+// "Este campo nao pode ser deixado em branco" para shipment e point_sale).
+// Os valores abaixo sao DECISAO DE PRODUTO da Loja NS, nao invencao:
+//
+//   point_sale     origem factual do pedido (nao "PARTICULAR"/"LOJA VIRTUAL",
+//                  que sao so exemplos da doc).
+//   shipment       preenche o campo textual obrigatorio. NAO implementa frete:
+//                  transportadora/cotacao/prazo/etiqueta/valor efetivo seguem
+//                  sob responsabilidade da Tray.
+//   shipment_value a NewStore nao cobra nem calcula frete nesta integracao.
+//   payment_form   o beneficio foi quitado pelo saldo interno NSCreditos --
+//                  nunca um meio de pagamento ficticio (PIX/cartao/boleto).
+//
+// Limites da doc: point_sale 45, shipment 100, payment_form 50.
+// Auditoria read-only de 50 pedidos reais desta loja (total 707):
+//   point_sale: "LOJA VIRTUAL" (45), "PARTICULAR" (5) -- nenhuma convencao
+//               para pedido externo/API, entao usamos a origem factual.
+//   shipment:   "Sedex" (49), "" (1) -- nenhuma convencao de "pendente",
+//               entao usamos um rotulo explicito de logistica pendente.
+//   shipment_value: "0.00" aparece em pedidos reais -- valor aceito.
+export const LOJA_NS_ORDER_DEFAULTS = Object.freeze({
+  point_sale: "LOJA NS",
+  shipment: "PENDENTE TRAY",
+  shipment_value: "0.00",
+  payment_form: "NSCréditos",
+});
+
+// Tipo de pessoa no Customer da Tray. Confirmado lendo o Customer real
+// 24858 desta loja: type "0" + cnpj vazio = pessoa fisica. Enviar "1" faz a
+// Tray tratar como pessoa juridica e exigir cnpj (400 real observado).
+export const TRAY_CUSTOMER_TYPE_PF = "0";
+
+/**
+ * Brasil em ISO-3 ("BRA"), como a estrutura oficial de POST /orders usa.
+ * Aceita as variacoes que podem estar gravadas internamente (BR, Brasil,
+ * BRASIL). Qualquer outro valor passa adiante em maiusculas — nunca
+ * "adivinhamos" um pais diferente do que o usuario cadastrou.
+ */
+export function normalizeTrayCountry(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  if (/^(br|bra|brasil|brazil)$/i.test(s)) return "BRA";
+  return s.toUpperCase();
+}
+
 /**
  * @param {object} params
  * @param {string|number} params.customerId ID Tray do cliente (nunca users.id)
+ * @param {{name?:string, email?:string, cpf?:string}} [params.customer] dados factuais do cliente
  * @param {Array<{trayProductId:string, trayVariantId?:string|null, quantity:number}>} params.items
  * @param {string} params.notes texto livre identificando o resgate (redemption_id, coupon_code)
  */
-export async function createTrayOrder({ customerId, items, notes }, options = {}) {
+/**
+ * session_id estavel derivado do redemption: se o POST der timeout, existe
+ * uma identidade externa deterministica para procurar/reconciliar o pedido.
+ * NUNCA aleatorio/timestamp -- isso nao correlacionaria com nada. Sem PII:
+ * e so o UUID do redemption em hex. Pedidos reais desta loja usam 26 chars.
+ */
+/**
+ * birth_date no formato que a Tray documenta: YYYY-MM-DD. Aceita Date (o
+ * driver pg devolve Date para colunas `date`) ou string ja no formato.
+ * Devolve "" quando nao da pra derivar com seguranca -- nunca inventa data.
+ */
+export function normalizeTrayBirthDate(raw) {
+  if (!raw) return "";
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    // getUTC* evita que o fuso empurre a data um dia pra tras/frente.
+    const y = raw.getUTCFullYear();
+    const m = String(raw.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(raw.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  const s = String(raw).trim();
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : "";
+}
+
+/**
+ * Valor monetario no formato que a Tray aceita em ProductsSold ("299.99").
+ * A Tray recusa com "Por favor, forneça um valor monetário válido." quando o
+ * campo vem vazio/malformado. Devolve "" se nao der pra derivar com seguranca
+ * -- nunca inventa preco (preco errado corrompe o total de um pedido real).
+ */
+export function normalizeTrayMoney(raw) {
+  if (raw == null || raw === "") return "";
+  const s = String(raw).trim().replace(",", ".");
+  if (!/^\d+(\.\d{1,2})?$/.test(s)) return "";
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return "";
+  return n.toFixed(2);
+}
+
+export function buildTraySessionId(redemptionId) {
+  const hex = String(redemptionId ?? "").replace(/[^a-zA-Z0-9]/g, "");
+  return hex ? hex.slice(0, 26) : "";
+}
+
+export async function createTrayOrder({ customerId, customer, items, notes, address, sessionId }, options = {}) {
   const cid = Number(customerId);
   if (!Number.isFinite(cid) || cid <= 0) throw new TrayCatalogError("customer_id_invalid", { status: 400 });
 
@@ -46,7 +137,14 @@ export async function createTrayOrder({ customerId, items, notes }, options = {}
     if (!Number.isFinite(productId) || productId <= 0) throw new TrayCatalogError("order_item_product_id_invalid", { status: 400 });
     if (!Number.isFinite(quantity) || quantity <= 0) throw new TrayCatalogError("order_item_quantity_invalid", { status: 400 });
 
-    const line = { product_id: productId, quantity };
+    // M7 (prova real): a Tray exige price E original_price em cada item --
+    // "Por favor, forneça um valor monetário válido." quando ausentes. O valor
+    // e o preco monetario REAL do catalogo Tray (dominio separado dos
+    // NSCreditos), nunca convertido a partir do preco em creditos.
+    const price = normalizeTrayMoney(item.trayPrice);
+    if (!price) throw new TrayCatalogError("order_item_price_invalid", { status: 400, publicDetails: { product_id: productId } });
+
+    const line = { product_id: productId, quantity, price, original_price: price };
     if (item.trayVariantId != null && String(item.trayVariantId).trim() !== "") {
       const variantId = Number(item.trayVariantId);
       if (!Number.isFinite(variantId) || variantId <= 0) throw new TrayCatalogError("order_item_variant_id_invalid", { status: 400 });
@@ -55,12 +153,95 @@ export async function createTrayOrder({ customerId, items, notes }, options = {}
     return line;
   });
 
+  // ENDERECO DE ENTREGA DO RESGATE — quem manda e a NewStore.
+  //
+  // Regra de negocio: o pedido carrega o endereco que o cliente escolheu
+  // NAQUELE resgate (user_addresses), nao o que estiver cadastrado na Tray.
+  // Se o cliente mudou de endereco depois, o historico do pedido nao muda.
+  //
+  // Posicao provada empiricamente (M7):
+  //   Order.CustomerAddress          -> a Tray NAO le (reporta tudo em branco)
+  //   Order.Customer.CustomerAddress -> a Tray LE
+  //
+  // Mas o bloco Customer com dados de identidade (cpf/name/email/birth_date)
+  // faz a Tray tentar CADASTRAR o cliente e colidir:
+  //   causes.Customer.cpf = "Está em uso em outro cadastro."
+  //
+  // Solucao: Customer carrega SOMENTE o endereco. Sem identidade nao ha o que
+  // colidir, e o cliente segue identificado por Order.customer_id (o schema
+  // oficial de criacao exige exatamente customer_id, sem propriedade Customer).
+  // Cadastro de cliente continua exclusivo do resolver / POST /customers.
+  //
+  // Falhamos ANTES da rede se faltar campo obrigatorio -- nunca enviar em
+  // branco, nunca inventar endereco. Isso NAO e frete: nenhum valor ou
+  // transportadora e calculado aqui; a logistica fica com os vendedores.
+  const customerAddress = {
+    address: String(address?.street ?? "").trim(),
+    number: String(address?.number ?? "").trim(),
+    complement: String(address?.complement ?? "").trim(),
+    neighborhood: String(address?.neighborhood ?? "").trim(),
+    city: String(address?.city ?? "").trim(),
+    state: String(address?.state ?? "").trim(),
+    zip_code: String(address?.zipcode ?? "").replace(/\D/g, ""),
+    // ISO-3 so no boundary da Tray; user_addresses.country nao muda.
+    country: normalizeTrayCountry(address?.country),
+    // type "1" = endereco de entrega.
+    type: "1",
+  };
+  const missingAddress = ["address", "number", "neighborhood", "city", "state", "zip_code", "country"].filter(
+    (k) => !customerAddress[k]
+  );
+  if (missingAddress.length) {
+    throw new TrayCatalogError("order_address_incomplete", { status: 400, publicDetails: { missing: missingAddress } });
+  }
+
+  // IDENTIDADE vem da Tray (Customer canonico), ENDERECO vem da NewStore.
+  // Nao enviamos Order.customer_id junto: seria um segundo modelo de
+  // identidade no mesmo payload. O contrato documentado do POST /orders leva
+  // o Order.Customer completo, e o tray_customer_id serve internamente para
+  // localizar esse Customer canonico.
+  const phone = String(customer?.phone || "").replace(/\D/g, "");
+  const cellphone = String(customer?.cellphone || "").replace(/\D/g, "");
+  const trayPhone = phone || cellphone;
+
   const body = {
     Order: {
-      customer_id: cid,
-      products,
+      point_sale: LOJA_NS_ORDER_DEFAULTS.point_sale,
+      ...(sessionId ? { session_id: String(sessionId) } : {}),
+      shipment: LOJA_NS_ORDER_DEFAULTS.shipment,
+      shipment_value: LOJA_NS_ORDER_DEFAULTS.shipment_value,
+      payment_form: LOJA_NS_ORDER_DEFAULTS.payment_form,
+      Customer: {
+        ...(customer?.type ? { type: String(customer.type) } : { type: TRAY_CUSTOMER_TYPE_PF }),
+        ...(customer?.name ? { name: String(customer.name) } : {}),
+        ...(customer?.cpf ? { cpf: String(customer.cpf).replace(/\D/g, "") } : {}),
+        ...(customer?.email ? { email: String(customer.email) } : {}),
+        ...(customer?.birth_date ? { birth_date: normalizeTrayBirthDate(customer.birth_date) } : {}),
+        ...(trayPhone ? { phone: trayPhone } : {}),
+        // rg/gender so quando a propria Tray ja os tem -- nunca inventados.
+        ...(customer?.rg ? { rg: String(customer.rg) } : {}),
+        ...(customer?.gender ? { gender: String(customer.gender) } : {}),
+        CustomerAddress: [customerAddress],
+      },
+      // M7 (prova real): a chave do container de itens e `ProductsSold`, nao
+      // `products`. Enviando `products` a Tray responde 400 "Pedido nao tem
+      // produtos." — ela simplesmente nao encontra os itens. `ProductsSold` e
+      // o nome usado tanto no exemplo oficial de "Cadastrar Pedido#post"
+      // quanto no GET /orders/:id real desta loja. Fica em Order, NUNCA em
+      // Order.Customer.
+      ProductsSold: products,
+      // Identificacao do resgate. `notes` nunca foi recusado pela Tray, mas o
+      // GET /orders real desta loja expoe `store_note`/`customer_note` (nao
+      // `notes`) -- mandamos os dois para que a Loja NS seja realmente
+      // identificavel no painel. Sem PII: so origem + redemption_id.
       notes: String(notes || "").slice(0, 1000),
-      // Deliberadamente ausentes (não inventados): payment_method, shipping_method, shipping_cost.
+      store_note: String(notes || "").slice(0, 1000),
+      // Deliberadamente ausentes (nunca preventivos): partner_id
+      // -- a Tray ainda nao o exigiu. Tambem ausentes price/original_price
+      // nos itens: a Tray nunca os pediu e mandar um preco errado corromperia
+      // o total de um pedido real; sem eles ela usa o preco do proprio
+      // catalogo. Se qualquer um passar a ser exigido, o meta sanitizado do
+      // evento mostra o campo exato — nunca fabricar valor.
     },
   };
 

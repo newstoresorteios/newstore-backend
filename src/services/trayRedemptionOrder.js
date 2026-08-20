@@ -16,8 +16,10 @@
 //      via o campo oficial `notes` — nunca via payment_method inventado.
 
 import { resolveTrayCustomerId, TrayCustomerProfileIncompleteError, TrayCustomerIdentityConflictError } from "./trayCustomerResolver.js";
-import { createTrayOrder } from "./trayOrderClient.js";
+import { createTrayOrder, buildTraySessionId } from "./trayOrderClient.js";
+import { getTrayCustomerById } from "./trayCustomerClient.js";
 import { TrayCatalogError } from "./trayCatalogClient.js";
+import { fetchTrayProduct, fetchTrayVariants } from "./trayCatalogClient.js";
 
 export class TrayOrderNotImplementedError extends Error {
   constructor(reason = "tray_order_contract_pending") {
@@ -75,7 +77,7 @@ function buildNotes({ redemptionId, couponSnapshot }) {
  * @throws {TrayCatalogError} demais falhas deterministicas (400/401/404/5xx) — seguro compensar
  */
 export async function createTrayRedemptionOrder(params, options = {}) {
-  const { userId, redemptionId, items, userProfile, couponSnapshot } = params || {};
+  const { userId, redemptionId, items, userProfile, couponSnapshot, address } = params || {};
 
   const email = String(userProfile?.email || "").trim();
   if (!email) throw new TrayCustomerProfileIncompleteError(["email"]);
@@ -100,16 +102,63 @@ export async function createTrayRedemptionOrder(params, options = {}) {
     throw e;
   }
 
-  const orderItems = (Array.isArray(items) ? items : []).map((item) => ({
-    trayProductId: item.tray_product_id,
-    trayVariantId: item.tray_variant_id,
-    quantity: item.quantity,
-  }));
+  // Preco monetario REAL da Tray para cada item. Dominio totalmente separado
+  // dos NSCreditos: nunca convertemos credito em reais. Lido live do catalogo
+  // (GET) imediatamente antes do pedido -- se a Tray nao devolver um preco
+  // utilizavel, o createTrayOrder falha ANTES da rede em vez de inventar.
+  const orderItems = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const trayProduct = await fetchTrayProduct(item.tray_product_id, options);
+    let trayPrice = trayProduct?.price;
+
+    if (item.tray_variant_id != null && String(item.tray_variant_id).trim() !== "") {
+      const variants = await fetchTrayVariants(item.tray_product_id, options).catch(() => []);
+      const variant = (Array.isArray(variants) ? variants : []).find(
+        (v) => String(v?.id) === String(item.tray_variant_id)
+      );
+      // A variacao manda no preco quando ela existe e tem preco proprio.
+      if (variant?.price != null && String(variant.price).trim() !== "") trayPrice = variant.price;
+    }
+
+    orderItems.push({
+      trayProductId: item.tray_product_id,
+      trayVariantId: item.tray_variant_id,
+      quantity: item.quantity,
+      trayPrice,
+    });
+  }
 
   const notes = buildNotes({ redemptionId, couponSnapshot });
 
+  // IDENTIDADE CANONICA: quando ja existe um Customer Tray, a identidade do
+  // Order.Customer vem da PROPRIA Tray, nunca remontada com os dados da
+  // NewStore. Remontar faz a Tray enxergar um cadastro novo (o e-mail diverge
+  // do dela) e recusar com cpf "Está em uso em outro cadastro.".
+  // O endereco de entrega continua sendo o escolhido na NewStore.
+  const canonical = await getTrayCustomerById(customerId, options);
+
+  // Gate de identidade: o CPF tem que ser o mesmo dos dois lados. E-mail pode
+  // divergir -- o vinculo users.tray_customer_id ja foi reconciliado
+  // explicitamente (ver trayCustomerResolver). CPF diferente significa que o
+  // mapeamento esta errado: aborta ANTES de qualquer mutation.
+  const localCpf = String(userProfile?.cpf || "").replace(/\D/g, "");
+  if (!canonical.cpf || !localCpf || canonical.cpf !== localCpf) {
+    throw new TrayCustomerIdentityConflictError("tray_customer_cpf_mismatch", { customerId: String(customerId) });
+  }
+
   try {
-    const result = await createTrayOrder({ customerId, items: orderItems, notes }, options);
+    const result = await createTrayOrder(
+      {
+        customerId,
+        customer: canonical,
+        items: orderItems,
+        notes,
+        address,
+        // Correlacao estavel para reconciliacao em caso de timeout.
+        sessionId: buildTraySessionId(redemptionId),
+      },
+      options
+    );
     return { orderId: result.orderId };
   } catch (e) {
     if (e instanceof TrayCatalogError && (e.code === "tray_timeout" || e.code === "tray_unreachable")) {
