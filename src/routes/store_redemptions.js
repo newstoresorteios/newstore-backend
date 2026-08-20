@@ -3,9 +3,10 @@
 // Resgate real da Loja de Premios — /api/store/redemptions/*
 //
 // /confirm cria um pedido Tray real (ver trayRedemptionOrder.js) quando o
-// cliente tem um customer_id Tray mapeado por e-mail; quando nao tem,
-// termina em blocked_tray_customer_unmapped com os creditos devolvidos —
-// nunca perde credito do cliente sem entregar nada. shipping_option segue
+// cliente tem (ou o resolver consegue mapear/criar) um customer_id Tray;
+// quando nao da pra resolver, termina em blocked_tray_profile_incomplete
+// ou blocked_tray_customer_ambiguous com os creditos devolvidos — nunca
+// perde credito do cliente sem entregar nada. shipping_option segue
 // aceito no body so como metadado (shipping_snapshot); frete continua fora
 // do escopo desta fase e nunca influencia o pedido Tray em si.
 //

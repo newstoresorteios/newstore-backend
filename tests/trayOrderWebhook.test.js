@@ -124,4 +124,3 @@ test("discount excede o saldo local: ledger recusa (insufficient_balance), nunca
   assert.equal(out.handled, false);
   assert.equal(out.reason, "balance_changed_concurrently");
 });
-
