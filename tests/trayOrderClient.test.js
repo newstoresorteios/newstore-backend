@@ -2,7 +2,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createTrayOrder, getTrayOrderFull, parseMoneyStringToCents, buildTraySessionId, normalizeTrayBirthDate } from "../src/services/trayOrderClient.js";
+import {
+  createTrayOrder,
+  getTrayOrderFull,
+  parseMoneyStringToCents,
+  buildTraySessionId,
+  normalizeTrayBirthDate,
+  normalizeTrayCountry,
+} from "../src/services/trayOrderClient.js";
 import { TrayCatalogError } from "../src/services/trayCatalogClient.js";
 
 const API_BASE = "https://www.exemplo-loja.com.br/web_api";
@@ -33,6 +40,8 @@ function makeDeps(handler) {
   };
 }
 
+/* ─────────────────────────── validacoes pre-rede ─────────────────────────── */
+
 test("customer_id ausente/invalido nunca chega a rede", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({}));
   await assert.rejects(
@@ -51,7 +60,7 @@ test("carrinho vazio nunca chega a rede", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("item sem product_id/variant valido nunca chega a rede", async () => {
+test("item sem product_id valido nunca chega a rede", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({}));
   await assert.rejects(
     () => createTrayOrder({ customerId: 10, items: [{ trayProductId: null, quantity: 1 }], notes: "x" }, { deps }),
@@ -69,28 +78,19 @@ test("quantidade invalida nunca chega a rede", async () => {
   assert.equal(calls.length, 0);
 });
 
-const ADDRESS = {
-  street: "Rua Um",
-  number: "100",
-  complement: "Ap 2",
-  neighborhood: "Centro",
-  city: "Conselheiro Mairinck",
-  state: "PR",
-  zipcode: "86480-000",
-  country: "BR",
-};
+/* ─────────── contrato: pedido REFERENCIA cliente existente ─────────── */
 
-test("pedido valido envia Order com customer_id/ProductsSold/CustomerAddress/notes, sem payment_method/shipping", async () => {
+test("pedido referencia o cliente por customer_id e NUNCA manda Customer inline", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 4321 } }));
   const out = await createTrayOrder(
     {
-      customerId: "10",
+      customerId: "24858",
       items: [
         { trayProductId: "111", quantity: 2 },
         { trayProductId: "222", trayVariantId: "333", quantity: 1 },
       ],
-      notes: "Resgate Loja NS / redemption_id=abc / coupon_code=XYZ",
-      address: ADDRESS,
+      notes: "LOJA NS / redemption_id=abc",
+      sessionId: buildTraySessionId("2612b836-a0bd-4e74-b952-7620c8564e7c"),
     },
     { deps }
   );
@@ -100,57 +100,149 @@ test("pedido valido envia Order com customer_id/ProductsSold/CustomerAddress/not
   assert.ok(calls[0].url.includes("/orders?access_token=token-abc"));
 
   const order = calls[0].body.Order;
-  assert.equal(order.customer_id, 10);
-  // Container de itens e `ProductsSold` (prova real M7: `products` faz a Tray
-  // responder 400 "Pedido nao tem produtos.").
-  assert.equal("products" in order, false);
-  assert.deepEqual(order.ProductsSold, [
-    { product_id: 111, quantity: 2 },
-    { product_id: 222, variant_id: 333, quantity: 1 }, // product_id e variant_id sao campos SEPARADOS
-  ]);
-  // Estrutura oficial: o endereco vive em Order.Customer.CustomerAddress[],
-  // NUNCA em Order.CustomerAddress (posicao testada e recusada pela Tray).
+  assert.equal(order.customer_id, 24858);
+
+  // O cadastro de cliente acontece SO no resolver/POST /customers.
+  // Mandar estes blocos aqui faz a Tray tentar cadastrar e colidir o CPF.
+  assert.equal("Customer" in order, false);
   assert.equal("CustomerAddress" in order, false);
-  assert.equal("ProductsSold" in order.Customer, false);
-  assert.ok(Array.isArray(order.Customer.CustomerAddress));
-  assert.equal(order.Customer.CustomerAddress.length, 1);
-  assert.deepEqual(order.Customer.CustomerAddress[0], {
-    address: "Rua Um",
-    number: "100",
-    complement: "Ap 2",
-    neighborhood: "Centro",
-    city: "Conselheiro Mairinck",
-    state: "PR",
-    zip_code: "86480000",
-    country: "BRA", // ISO-3 no boundary da Tray
-    type: "1",
-  });
-  assert.equal(order.notes, "Resgate Loja NS / redemption_id=abc / coupon_code=XYZ");
-  assert.equal("payment_method" in order, false);
-  assert.equal("shipping_method" in order, false);
-  assert.equal("shipping_cost" in order, false);
+
+  // ...e portanto nenhum dado de identidade vaza no pedido.
+  const serialized = JSON.stringify(calls[0].body);
+  for (const forbidden of ["cpf", "birth_date", "cnpj"]) {
+    assert.equal(serialized.includes(forbidden), false, `nao pode ir ${forbidden} no POST /orders`);
+  }
 
   assert.deepEqual(out, { orderId: "4321", raw: { id: 4321 } });
 });
 
+test("itens vao em ProductsSold (nunca products) com product_id/variant_id separados", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      items: [
+        { trayProductId: "111", quantity: 2 },
+        { trayProductId: "222", trayVariantId: "333", quantity: 1 },
+      ],
+      notes: "x",
+    },
+    { deps }
+  );
+  const order = calls[0].body.Order;
+  assert.equal("products" in order, false);
+  assert.deepEqual(order.ProductsSold, [
+    { product_id: 111, quantity: 2 },
+    { product_id: 222, variant_id: 333, quantity: 1 },
+  ]);
+  // preco nunca e inventado: sem price/original_price a Tray usa o catalogo
+  assert.equal("price" in order.ProductsSold[0], false);
+  assert.equal("original_price" in order.ProductsSold[0], false);
+});
+
+test("Order carrega os campos obrigatorios da Loja NS (decisao de produto)", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 555 } }));
+  await createTrayOrder(
+    { customerId: 24858, items: [{ trayProductId: "14518", quantity: 1 }], notes: "LOJA NS", sessionId: "abc123" },
+    { deps }
+  );
+
+  const order = calls[0].body.Order;
+  assert.equal(order.point_sale, "LOJA NS");
+  assert.equal(order.shipment, "PENDENTE TRAY");
+  assert.equal(order.shipment_value, "0.00");
+  assert.equal(order.payment_form, "NSCréditos");
+  assert.equal(order.session_id, "abc123");
+
+  // limites documentados
+  assert.ok(order.point_sale.length <= 45);
+  assert.ok(order.shipment.length <= 100);
+  assert.ok(order.payment_form.length <= 50);
+
+  // nunca um meio de pagamento ficticio, nunca campos preventivos
+  const serialized = JSON.stringify(order).toLowerCase();
+  for (const fake of ["pix", "boleto", "cartao", "cartão", "credit_card", "dinheiro"]) {
+    assert.equal(serialized.includes(fake), false, `meio de pagamento ficticio: ${fake}`);
+  }
+  assert.equal("partner_id" in order, false);
+  assert.equal("MarketplaceOrder" in order, false);
+});
+
+test("identificacao do resgate vai em notes E store_note, sem PII", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 556 } }));
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      items: [{ trayProductId: "14518", quantity: 1 }],
+      notes: "LOJA NS / redemption_id=abc / coupon_code=NSU-0418-Q4",
+    },
+    { deps }
+  );
+  const order = calls[0].body.Order;
+  assert.ok(String(order.notes).includes("LOJA NS"));
+  assert.equal(order.store_note, order.notes);
+  for (const pii of ["10425415902", "jp@newstore.com", "43998640480", "86480"]) {
+    assert.equal(String(order.store_note).includes(pii), false, `PII em store_note: ${pii}`);
+  }
+});
+
+test("payload do pedido nunca carrega password/secret/token", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 9 } }));
+  await createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "LOJA NS" }, { deps });
+  const serialized = JSON.stringify(calls[0].body).toLowerCase();
+  for (const forbidden of ["password", "pass_hash", "authorization", "refresh_token", "access_token", "database_url", "coupon_value_cents"]) {
+    assert.equal(serialized.includes(forbidden), false, `vazou ${forbidden}`);
+  }
+});
+
+/* ─────────────────────────── session_id ─────────────────────────── */
+
+test("session_id e estavel e derivado do redemption, nunca aleatorio", () => {
+  const rid = "2612b836-a0bd-4e74-b952-7620c8564e7c";
+  assert.equal(buildTraySessionId(rid), buildTraySessionId(rid));
+  assert.ok(buildTraySessionId(rid).length > 0 && buildTraySessionId(rid).length <= 26);
+  assert.match(buildTraySessionId(rid), /^[a-zA-Z0-9]+$/);
+  assert.notEqual(buildTraySessionId(rid), buildTraySessionId("11111111-2222-3333-4444-555555555555"));
+  assert.equal(buildTraySessionId(null), "");
+});
+
+/* ───────────────── helpers preservados (perfil/endereco) ───────────────── */
+
+test("normalizeTrayBirthDate: YYYY-MM-DD, sem deslocamento de fuso", () => {
+  assert.equal(normalizeTrayBirthDate("2007-09-25"), "2007-09-25");
+  assert.equal(normalizeTrayBirthDate("2007-09-25T03:00:00.000Z"), "2007-09-25");
+  assert.equal(normalizeTrayBirthDate(new Date(Date.UTC(2007, 8, 25))), "2007-09-25");
+  assert.equal(normalizeTrayBirthDate("25/09/2007"), "", "formato nao reconhecido nunca vira data inventada");
+  assert.equal(normalizeTrayBirthDate(null), "");
+});
+
+test("normalizeTrayCountry: Brasil vira ISO-3 BRA", () => {
+  for (const raw of ["BR", "Brasil", "BRASIL", "brazil", "bra"]) {
+    assert.equal(normalizeTrayCountry(raw), "BRA", `country=${raw}`);
+  }
+  assert.equal(normalizeTrayCountry(""), "");
+});
+
+/* ─────────────────────────── respostas da Tray ─────────────────────────── */
+
 test("resposta sem id identificavel falha alto (nunca finge sucesso)", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: { status: "ok" } }));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS }, { deps }),
+    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps }),
     (e) => e.code === "tray_order_id_missing"
   );
 });
 
 test("id aninhado em Order.id tambem e reconhecido", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: { Order: { id: 77 } } }));
-  const out = await createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS }, { deps });
+  const out = await createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps });
   assert.equal(out.orderId, "77");
 });
 
 test("400 da Tray propaga tray_request_invalid com corpo preservado", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 400, body: { message: "customer_id invalido" } }));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS }, { deps }),
+    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps }),
     (e) => e.code === "tray_request_invalid" && e.publicDetails?.tray_body?.message === "customer_id invalido"
   );
 });
@@ -173,7 +265,7 @@ test("parseMoneyStringToCents: formato invalido devolve null, nunca 0 silencioso
   assert.equal(parseMoneyStringToCents(""), null);
   assert.equal(parseMoneyStringToCents(null), null);
   assert.equal(parseMoneyStringToCents(undefined), null);
-  assert.equal(parseMoneyStringToCents("1.234"), null); // 3 casas decimais nao e formato monetario valido
+  assert.equal(parseMoneyStringToCents("1.234"), null);
 });
 
 /* ─────────────────────────── getTrayOrderFull ─────────────────────────── */
@@ -197,267 +289,4 @@ test("getTrayOrderFull sem desconto: discount=0, discountCents=0, coupon_code nu
 test("getTrayOrderFull sem Order na resposta falha alto", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: {} }));
   await assert.rejects(() => getTrayOrderFull("1", { deps }), (e) => e.code === "tray_invalid_response");
-});
-
-test("endereco incompleto nunca chega a rede (Tray exige CustomerAddress)", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
-  await assert.rejects(
-    () =>
-      createTrayOrder(
-        {
-          customerId: 10,
-          items: [{ trayProductId: "1", quantity: 1 }],
-          notes: "x",
-          address: { ...ADDRESS, city: "", zipcode: "" },
-        },
-        { deps }
-      ),
-    (e) => e.code === "order_address_incomplete"
-  );
-  assert.equal(calls.length, 0);
-});
-
-test("endereco ausente nunca chega a rede", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
-  await assert.rejects(
-    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps }),
-    (e) => e.code === "order_address_incomplete"
-  );
-  assert.equal(calls.length, 0);
-});
-
-test("country e normalizado para ISO-3 (BRA) so no boundary da Tray", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 9 } }));
-  for (const raw of ["BR", "Brasil", "BRASIL", "brazil"]) {
-    calls.length = 0;
-    await createTrayOrder(
-      {
-        customerId: 10,
-        items: [{ trayProductId: "1", quantity: 1 }],
-        notes: "x",
-        address: { ...ADDRESS, country: raw },
-      },
-      { deps }
-    );
-    assert.equal(calls[0].body.Order.Customer.CustomerAddress[0].country, "BRA", `country=${raw}`);
-  }
-});
-
-test("payload do pedido nunca carrega password/secret/token do usuario", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 9 } }));
-  await createTrayOrder(
-    {
-      customerId: 10,
-      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
-      items: [{ trayProductId: "1", quantity: 1 }],
-      notes: "LOJA NS",
-      address: ADDRESS,
-    },
-    { deps }
-  );
-  const serialized = JSON.stringify(calls[0].body);
-  for (const forbidden of ["password", "pass_hash", "authorization", "refresh_token", "access_token", "DATABASE_URL", "coupon_value_cents"]) {
-    assert.equal(serialized.toLowerCase().includes(forbidden.toLowerCase()), false, `vazou ${forbidden}`);
-  }
-});
-
-test("Order carrega os campos obrigatorios da Loja NS (decisao de produto)", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 555 } }));
-  await createTrayOrder(
-    {
-      customerId: 24858,
-      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
-      items: [{ trayProductId: "14518", quantity: 1 }],
-      notes: "LOJA NS / redemption_id=abc",
-      address: ADDRESS,
-    },
-    { deps }
-  );
-
-  const order = calls[0].body.Order;
-  assert.equal(order.point_sale, "LOJA NS");
-  assert.equal(order.shipment, "PENDENTE TRAY");
-  assert.equal(order.shipment_value, "0.00");
-  assert.equal(order.payment_form, "NSCréditos");
-
-  // Limites documentados: point_sale 45, shipment 100, payment_form 50.
-  assert.ok(order.point_sale.length <= 45);
-  assert.ok(order.shipment.length <= 100);
-  assert.ok(order.payment_form.length <= 50);
-
-  // Estrutura que ja avancou na API real permanece.
-  assert.ok(Array.isArray(order.Customer.CustomerAddress));
-  assert.ok(Array.isArray(order.ProductsSold));
-
-  // Nunca um meio de pagamento ficticio.
-  const serialized = JSON.stringify(order).toLowerCase();
-  for (const fake of ["pix", "boleto", "cartao", "cartão", "credit_card", "dinheiro"]) {
-    assert.equal(serialized.includes(fake), false, `meio de pagamento ficticio: ${fake}`);
-  }
-
-  // Nao adicionamos preventivamente o que a Tray nunca pediu.
-  assert.equal("partner_id" in order, false);
-  assert.equal("session_id" in order, false);
-  assert.equal("price" in order.ProductsSold[0], false);
-  assert.equal("original_price" in order.ProductsSold[0], false);
-});
-
-test("notes do pedido nunca carrega PII", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 556 } }));
-  await createTrayOrder(
-    {
-      customerId: 24858,
-      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
-      items: [{ trayProductId: "14518", quantity: 1 }],
-      notes: "LOJA NS / redemption_id=abc / coupon_code=NSU-0418-Q4",
-      address: ADDRESS,
-    },
-    { deps }
-  );
-  const notes = String(calls[0].body.Order.notes);
-  for (const pii of ["10425415902", "jp@newstore.com", "43998640480", "86480"]) {
-    assert.equal(notes.includes(pii), false, `PII em notes: ${pii}`);
-  }
-});
-
-test("Customer.type = 0 (pessoa fisica): enviar 1 faz a Tray exigir cnpj", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 777 } }));
-  await createTrayOrder(
-    {
-      customerId: 24858,
-      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
-      items: [{ trayProductId: "14518", quantity: 1 }],
-      notes: "LOJA NS",
-      address: ADDRESS,
-    },
-    { deps }
-  );
-  const order = calls[0].body.Order;
-  assert.equal(order.Customer.type, "0");
-  assert.equal("cnpj" in order.Customer, false);
-});
-
-test("session_id e estavel e derivado do redemption, nunca aleatorio", () => {
-  const rid = "2612b836-a0bd-4e74-b952-7620c8564e7c";
-  const a = buildTraySessionId(rid);
-  const b = buildTraySessionId(rid);
-  assert.equal(a, b, "mesmo redemption -> mesmo session_id");
-  assert.ok(a.length > 0 && a.length <= 26);
-  assert.match(a, /^[a-zA-Z0-9]+$/);
-  assert.notEqual(a, buildTraySessionId("11111111-2222-3333-4444-555555555555"));
-  assert.equal(buildTraySessionId(null), "");
-});
-
-test("contrato final: nada de partner_id/MarketplaceOrder e nesting correto", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 888 } }));
-  await createTrayOrder(
-    {
-      customerId: 24858,
-      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
-      items: [{ trayProductId: "14518", quantity: 1 }],
-      notes: "LOJA NS / redemption_id=abc",
-      address: ADDRESS,
-      sessionId: buildTraySessionId("2612b836-a0bd-4e74-b952-7620c8564e7c"),
-    },
-    { deps }
-  );
-  const order = calls[0].body.Order;
-
-  assert.ok(order.point_sale && order.point_sale.length > 0);
-  assert.ok(order.shipment && order.shipment.length > 0);
-  assert.equal(order.shipment_value, "0.00");
-  assert.equal(order.payment_form, "NSCréditos");
-  assert.ok(order.session_id && order.session_id.length > 0);
-
-  assert.ok(Array.isArray(order.Customer.CustomerAddress));
-  assert.ok(Array.isArray(order.ProductsSold));
-  assert.equal("ProductsSold" in order.Customer, false);
-  assert.equal("CustomerAddress" in order, false);
-
-  assert.equal("partner_id" in order, false);
-  assert.equal("MarketplaceOrder" in order, false);
-
-  // session_id nao pode carregar PII/segredo
-  const sid = String(order.session_id);
-  for (const pii of ["10425415902", "jp@newstore.com", "43998640480"]) {
-    assert.equal(sid.includes(pii), false);
-  }
-});
-
-test("Customer inline leva cpf (11 digitos, nunca mascarado) e birth_date YYYY-MM-DD", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 991 } }));
-  await createTrayOrder(
-    {
-      customerId: 24858,
-      customer: {
-        name: "jpjp",
-        email: "jp@newstore.com",
-        cpf: "104.254.159-02", // com pontuacao de proposito
-        birthDate: new Date(Date.UTC(2007, 8, 25)), // driver pg devolve Date
-        phone: "43998640480",
-      },
-      items: [{ trayProductId: "14518", quantity: 1 }],
-      notes: "LOJA NS",
-      address: ADDRESS,
-    },
-    { deps }
-  );
-  const C = calls[0].body.Order.Customer;
-
-  assert.equal(typeof C.cpf, "string");
-  assert.equal(C.cpf.length, 11);
-  assert.match(C.cpf, /^[0-9]{11}$/);
-  assert.equal(C.cpf.includes("*"), false, "CPF nunca pode ir mascarado pra Tray");
-
-  assert.equal(C.birth_date, "2007-09-25");
-  assert.match(C.birth_date, /^\d{4}-\d{2}-\d{2}$/);
-  assert.equal(C.type, "0");
-  assert.equal(C.phone, "43998640480");
-});
-
-test("birth_date aceita string ja no formato e ignora hora/fuso", () => {
-  assert.equal(normalizeTrayBirthDate("2007-09-25"), "2007-09-25");
-  assert.equal(normalizeTrayBirthDate("2007-09-25T03:00:00.000Z"), "2007-09-25");
-  assert.equal(normalizeTrayBirthDate(new Date(Date.UTC(2007, 8, 25))), "2007-09-25");
-  assert.equal(normalizeTrayBirthDate(null), "");
-  assert.equal(normalizeTrayBirthDate(""), "");
-});
-
-test("birth_date impossivel de derivar falha ANTES da rede (nunca inventa data)", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
-  await assert.rejects(
-    () =>
-      createTrayOrder(
-        {
-          customerId: 24858,
-          customer: { name: "x", email: "x@y.com", cpf: "10425415902", birthDate: "25/09/2007" },
-          items: [{ trayProductId: "1", quantity: 1 }],
-          notes: "x",
-          address: ADDRESS,
-        },
-        { deps }
-      ),
-    (e) => e.code === "order_customer_birth_date_invalid"
-  );
-  assert.equal(calls.length, 0);
-});
-
-test("a sanitizacao de logs NUNCA altera o payload real enviado a Tray", async () => {
-  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 992 } }));
-  const cpf = "10425415902";
-  await createTrayOrder(
-    {
-      customerId: 24858,
-      customer: { name: "jpjp", email: "jp@newstore.com", cpf, birthDate: "2007-09-25", phone: "43998640480" },
-      items: [{ trayProductId: "14518", quantity: 1 }],
-      notes: "LOJA NS",
-      address: ADDRESS,
-    },
-    { deps }
-  );
-  // O que foi pra rede tem o dado REAL, nao o redigido.
-  const sent = calls[0].body.Order.Customer;
-  assert.equal(sent.cpf, cpf);
-  assert.equal(sent.birth_date, "2007-09-25");
-  assert.equal(JSON.stringify(calls[0].body).includes("[redacted]"), false);
 });

@@ -131,44 +131,22 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
     return line;
   });
 
-  // M7 (prova real): a Tray recusa o pedido com 400 e
-  // causes.CustomerAddress[campo]="Este campo nao pode ser deixado em branco"
-  // quando o bloco de endereco nao chega onde ela espera. O JSON oficial de
-  // POST /orders aninha o endereco em Order.Customer.CustomerAddress[] --
-  // NAO em Order.CustomerAddress (essa posicao foi testada e a Tray continua
-  // reportando os campos como em branco).
-  // Falhamos ANTES da rede se algum campo obrigatorio estiver vazio -- nunca
-  // enviar em branco, nunca inventar valor. Isso NAO e frete: nenhum
-  // valor/transportadora e calculado aqui.
-  const customerAddress = {
-    address: String(address?.street ?? "").trim(),
-    number: String(address?.number ?? "").trim(),
-    complement: String(address?.complement ?? "").trim(),
-    neighborhood: String(address?.neighborhood ?? "").trim(),
-    city: String(address?.city ?? "").trim(),
-    state: String(address?.state ?? "").trim(),
-    zip_code: String(address?.zipcode ?? "").replace(/\D/g, ""),
-    // O JSON oficial usa ISO-3 ("BRA"). Normalizamos SO no boundary da Tray:
-    // o armazenamento interno (user_addresses.country) continua como esta.
-    country: normalizeTrayCountry(address?.country),
-    // type "1" = endereco de entrega, conforme a estrutura oficial.
-    type: "1",
-  };
-  const missingAddress = ["address", "number", "neighborhood", "city", "state", "zip_code", "country", "type"].filter(
-    (k) => !customerAddress[k]
-  );
-  if (missingAddress.length) {
-    throw new TrayCatalogError("order_address_incomplete", { status: 400, publicDetails: { missing: missingAddress } });
-  }
-
-  // birth_date e exigido pela Tray no Customer inline. Falha ANTES da rede se
-  // o perfil nao tiver uma data utilizavel -- nunca inventar/estimar.
-  const customerBirthDate = normalizeTrayBirthDate(customer?.birthDate);
-  if (customer?.birthDate && !customerBirthDate) {
-    throw new TrayCatalogError("order_customer_birth_date_invalid", { status: 400 });
-  }
-  const customerPhone = String(customer?.phone ?? "").replace(/\D/g, "");
-
+  // CLIENTE JA EXISTENTE — decisao de arquitetura (M7, prova real):
+  //
+  // Mandar Order.Customer inline faz a Tray tratar o bloco como CADASTRO de
+  // cliente. Como o CPF ja pertence ao Customer resolvido, ela recusa com
+  // causes.Customer.cpf = "Está em uso em outro cadastro." Enviar
+  // Order.Customer.id = <id> tambem foi testado e NAO evita esse caminho.
+  //
+  // O schema oficial de criacao (tray-api-ai-plugin,
+  // skills/pedidos/schemas/pedido.create.json) exige exatamente
+  // ["customer_id", "products"] e nao tem nenhuma propriedade Customer --
+  // ou seja, o pedido REFERENCIA um cliente que ja existe, nunca o cadastra.
+  //
+  // Portanto: cadastro de cliente acontece SO em trayCustomerResolver /
+  // POST /customers; aqui mandamos apenas a referencia. O endereco de
+  // entrega e o que ja esta vinculado ao Customer na Tray -- nao recriamos
+  // endereco a cada pedido.
   const body = {
     Order: {
       customer_id: cid,
@@ -177,18 +155,6 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
       shipment: LOJA_NS_ORDER_DEFAULTS.shipment,
       shipment_value: LOJA_NS_ORDER_DEFAULTS.shipment_value,
       payment_form: LOJA_NS_ORDER_DEFAULTS.payment_form,
-      Customer: {
-        ...(customer?.name ? { name: String(customer.name).trim() } : {}),
-        ...(customer?.email ? { email: String(customer.email).trim().toLowerCase() } : {}),
-        // M7 (prova real): a Tray valida cpf E birth_date no Customer inline
-        // do POST /orders. customer_id sozinho NAO substitui esses campos --
-        // o contrato documentado de criacao leva o Customer completo.
-        ...(customer?.cpf ? { cpf: String(customer.cpf).replace(/\D/g, "") } : {}),
-        ...(customerBirthDate ? { birth_date: customerBirthDate } : {}),
-        ...(customerPhone ? { phone: customerPhone } : {}),
-        type: TRAY_CUSTOMER_TYPE_PF,
-        CustomerAddress: [customerAddress],
-      },
       // M7 (prova real): a chave do container de itens e `ProductsSold`, nao
       // `products`. Enviando `products` a Tray responde 400 "Pedido nao tem
       // produtos." — ela simplesmente nao encontra os itens. `ProductsSold` e
@@ -196,9 +162,14 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
       // quanto no GET /orders/:id real desta loja. Fica em Order, NUNCA em
       // Order.Customer.
       ProductsSold: products,
+      // Identificacao do resgate. `notes` nunca foi recusado pela Tray, mas o
+      // GET /orders real desta loja expoe `store_note`/`customer_note` (nao
+      // `notes`) -- mandamos os dois para que a Loja NS seja realmente
+      // identificavel no painel. Sem PII: so origem + redemption_id.
       notes: String(notes || "").slice(0, 1000),
-      // Deliberadamente ausentes (nunca preventivos): partner_id e session_id
-      // -- a Tray ainda nao os exigiu. Tambem ausentes price/original_price
+      store_note: String(notes || "").slice(0, 1000),
+      // Deliberadamente ausentes (nunca preventivos): partner_id
+      // -- a Tray ainda nao o exigiu. Tambem ausentes price/original_price
       // nos itens: a Tray nunca os pediu e mandar um preco errado corromperia
       // o total de um pedido real; sem eles ela usa o preco do proprio
       // catalogo. Se qualquer um passar a ser exigido, o meta sanitizado do
