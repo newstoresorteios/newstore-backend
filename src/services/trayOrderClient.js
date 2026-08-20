@@ -104,6 +104,21 @@ export function normalizeTrayBirthDate(raw) {
   return m ? m[1] : "";
 }
 
+/**
+ * Valor monetario no formato que a Tray aceita em ProductsSold ("299.99").
+ * A Tray recusa com "Por favor, forneça um valor monetário válido." quando o
+ * campo vem vazio/malformado. Devolve "" se nao der pra derivar com seguranca
+ * -- nunca inventa preco (preco errado corrompe o total de um pedido real).
+ */
+export function normalizeTrayMoney(raw) {
+  if (raw == null || raw === "") return "";
+  const s = String(raw).trim().replace(",", ".");
+  if (!/^\d+(\.\d{1,2})?$/.test(s)) return "";
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return "";
+  return n.toFixed(2);
+}
+
 export function buildTraySessionId(redemptionId) {
   const hex = String(redemptionId ?? "").replace(/[^a-zA-Z0-9]/g, "");
   return hex ? hex.slice(0, 26) : "";
@@ -122,7 +137,14 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
     if (!Number.isFinite(productId) || productId <= 0) throw new TrayCatalogError("order_item_product_id_invalid", { status: 400 });
     if (!Number.isFinite(quantity) || quantity <= 0) throw new TrayCatalogError("order_item_quantity_invalid", { status: 400 });
 
-    const line = { product_id: productId, quantity };
+    // M7 (prova real): a Tray exige price E original_price em cada item --
+    // "Por favor, forneça um valor monetário válido." quando ausentes. O valor
+    // e o preco monetario REAL do catalogo Tray (dominio separado dos
+    // NSCreditos), nunca convertido a partir do preco em creditos.
+    const price = normalizeTrayMoney(item.trayPrice);
+    if (!price) throw new TrayCatalogError("order_item_price_invalid", { status: 400, publicDetails: { product_id: productId } });
+
+    const line = { product_id: productId, quantity, price, original_price: price };
     if (item.trayVariantId != null && String(item.trayVariantId).trim() !== "") {
       const variantId = Number(item.trayVariantId);
       if (!Number.isFinite(variantId) || variantId <= 0) throw new TrayCatalogError("order_item_variant_id_invalid", { status: 400 });

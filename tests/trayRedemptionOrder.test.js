@@ -50,6 +50,16 @@ function makeOptions(trayCustomer, onPost) {
               text: async () => "{}",
             };
           }
+          // GET /products/:id -> preco monetario real do catalogo
+          if (/\/products\//.test(String(url))) {
+            return {
+              ok: true,
+              status: 200,
+              headers: { get: () => "application/json" },
+              json: async () => ({ Product: { id: 14518, price: "299.99", available: "1", has_variation: "0", stock: "10" } }),
+              text: async () => "{}",
+            };
+          }
           return {
             ok: true,
             status: 200,

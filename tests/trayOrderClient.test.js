@@ -11,6 +11,7 @@ import {
   normalizeTrayCountry,
 } from "../src/services/trayOrderClient.js";
 import { TrayCatalogError } from "../src/services/trayCatalogClient.js";
+import { normalizeTrayMoney } from "../src/services/trayOrderClient.js";
 
 const TRAY_CUSTOMER = {
   id: "24858",
@@ -69,7 +70,7 @@ function makeDeps(handler) {
 test("customer_id ausente/invalido nunca chega a rede", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({}));
   await assert.rejects(
-    () => createTrayOrder({ customerId: null, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps }),
+    () => createTrayOrder({ customerId: null, items: [{ trayProductId: "1", quantity: 1, trayPrice: "9.99" }], notes: "x" }, { deps }),
     (e) => e instanceof TrayCatalogError && e.code === "customer_id_invalid"
   );
   assert.equal(calls.length, 0);
@@ -87,7 +88,7 @@ test("carrinho vazio nunca chega a rede", async () => {
 test("item sem product_id valido nunca chega a rede", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({}));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: null, quantity: 1 }], notes: "x" }, { deps }),
+    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: null, quantity: 1, trayPrice: "9.99" }], notes: "x" }, { deps }),
     (e) => e.code === "order_item_product_id_invalid"
   );
   assert.equal(calls.length, 0);
@@ -96,7 +97,7 @@ test("item sem product_id valido nunca chega a rede", async () => {
 test("quantidade invalida nunca chega a rede", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({}));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 0 }], notes: "x" }, { deps }),
+    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 0, trayPrice: "9.99" }], notes: "x" }, { deps }),
     (e) => e.code === "order_item_quantity_invalid"
   );
   assert.equal(calls.length, 0);
@@ -110,8 +111,8 @@ test("identidade vem da Tray, endereco vem da NewStore, sem customer_id duplicad
     {
       customerId: "24858",
       items: [
-        { trayProductId: "111", quantity: 2 },
-        { trayProductId: "222", trayVariantId: "333", quantity: 1 },
+        { trayProductId: "111", quantity: 2, trayPrice: "10.00" },
+        { trayProductId: "222", trayVariantId: "333", quantity: 1, trayPrice: "20.50" },
       ],
       customer: TRAY_CUSTOMER,
       notes: "LOJA NS / redemption_id=abc",
@@ -154,8 +155,8 @@ test("itens vao em ProductsSold (nunca products) com product_id/variant_id separ
     {
       customerId: 24858,
       items: [
-        { trayProductId: "111", quantity: 2 },
-        { trayProductId: "222", trayVariantId: "333", quantity: 1 },
+        { trayProductId: "111", quantity: 2, trayPrice: "10.00" },
+        { trayProductId: "222", trayVariantId: "333", quantity: 1, trayPrice: "20.50" },
       ],
       notes: "x",
       address: ADDRESS,
@@ -166,18 +167,15 @@ test("itens vao em ProductsSold (nunca products) com product_id/variant_id separ
   const order = calls[0].body.Order;
   assert.equal("products" in order, false);
   assert.deepEqual(order.ProductsSold, [
-    { product_id: 111, quantity: 2 },
-    { product_id: 222, variant_id: 333, quantity: 1 },
+    { product_id: 111, quantity: 2, price: "10.00", original_price: "10.00" },
+    { product_id: 222, quantity: 1, price: "20.50", original_price: "20.50", variant_id: 333 },
   ]);
-  // preco nunca e inventado: sem price/original_price a Tray usa o catalogo
-  assert.equal("price" in order.ProductsSold[0], false);
-  assert.equal("original_price" in order.ProductsSold[0], false);
 });
 
 test("Order carrega os campos obrigatorios da Loja NS (decisao de produto)", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 555 } }));
   await createTrayOrder(
-    { customerId: 24858, items: [{ trayProductId: "14518", quantity: 1 }], notes: "LOJA NS", sessionId: "abc123", address: ADDRESS, customer: TRAY_CUSTOMER },
+    { customerId: 24858, items: [{ trayProductId: "14518", quantity: 1, trayPrice: "299.99" }], notes: "LOJA NS", sessionId: "abc123", address: ADDRESS, customer: TRAY_CUSTOMER },
     { deps }
   );
 
@@ -207,7 +205,7 @@ test("identificacao do resgate vai em notes E store_note, sem PII", async () => 
   await createTrayOrder(
     {
       customerId: 24858,
-      items: [{ trayProductId: "14518", quantity: 1 }],
+      items: [{ trayProductId: "14518", quantity: 1, trayPrice: "299.99" }],
       notes: "LOJA NS / redemption_id=abc / coupon_code=NSU-0418-Q4",
       address: ADDRESS,
       customer: TRAY_CUSTOMER,
@@ -224,7 +222,7 @@ test("identificacao do resgate vai em notes E store_note, sem PII", async () => 
 
 test("payload do pedido nunca carrega password/secret/token", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 9 } }));
-  await createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "LOJA NS", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps });
+  await createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1, trayPrice: "9.99" }], notes: "LOJA NS", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps });
   const serialized = JSON.stringify(calls[0].body).toLowerCase();
   for (const forbidden of ["password", "pass_hash", "authorization", "refresh_token", "access_token", "database_url", "coupon_value_cents"]) {
     assert.equal(serialized.includes(forbidden), false, `vazou ${forbidden}`);
@@ -264,21 +262,21 @@ test("normalizeTrayCountry: Brasil vira ISO-3 BRA", () => {
 test("resposta sem id identificavel falha alto (nunca finge sucesso)", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: { status: "ok" } }));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps }),
+    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1, trayPrice: "9.99" }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps }),
     (e) => e.code === "tray_order_id_missing"
   );
 });
 
 test("id aninhado em Order.id tambem e reconhecido", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: { Order: { id: 77 } } }));
-  const out = await createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps });
+  const out = await createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1, trayPrice: "9.99" }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps });
   assert.equal(out.orderId, "77");
 });
 
 test("400 da Tray propaga tray_request_invalid com corpo preservado", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 400, body: { message: "customer_id invalido" } }));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps }),
+    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1, trayPrice: "9.99" }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER }, { deps }),
     (e) => e.code === "tray_request_invalid" && e.publicDetails?.tray_body?.message === "customer_id invalido"
   );
 });
@@ -330,7 +328,7 @@ test("getTrayOrderFull sem Order na resposta falha alto", async () => {
 test("endereco do resgate vai em Order.Customer.CustomerAddress[] normalizado", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
   await createTrayOrder(
-    { customerId: 24858, items: [{ trayProductId: "14518", quantity: 1 }], notes: "LOJA NS", address: ADDRESS, customer: TRAY_CUSTOMER },
+    { customerId: 24858, items: [{ trayProductId: "14518", quantity: 1, trayPrice: "299.99" }], notes: "LOJA NS", address: ADDRESS, customer: TRAY_CUSTOMER },
     { deps }
   );
   const list = calls[0].body.Order.Customer.CustomerAddress;
@@ -354,14 +352,49 @@ test("endereco incompleto/ausente nunca chega a rede (nunca inventa endereco)", 
   await assert.rejects(
     () =>
       createTrayOrder(
-        { customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", customer: TRAY_CUSTOMER, address: { ...ADDRESS, city: "", zipcode: "" } },
+        { customerId: 24858, items: [{ trayProductId: "1", quantity: 1, trayPrice: "9.99" }], notes: "x", customer: TRAY_CUSTOMER, address: { ...ADDRESS, city: "", zipcode: "" } },
         { deps }
       ),
     (e) => e.code === "order_address_incomplete"
   );
   await assert.rejects(
-    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", customer: TRAY_CUSTOMER }, { deps }),
+    () => createTrayOrder({ customerId: 24858, items: [{ trayProductId: "1", quantity: 1, trayPrice: "9.99" }], notes: "x", customer: TRAY_CUSTOMER }, { deps }),
     (e) => e.code === "order_address_incomplete"
   );
   assert.equal(calls.length, 0);
+});
+
+test("preco monetario da Tray e obrigatorio e nunca inventado", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
+  // sem trayPrice -> falha ANTES da rede
+  await assert.rejects(
+    () =>
+      createTrayOrder(
+        { customerId: 24858, items: [{ trayProductId: "14518", quantity: 1 }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER },
+        { deps }
+      ),
+    (e) => e.code === "order_item_price_invalid"
+  );
+  // preco malformado tambem
+  await assert.rejects(
+    () =>
+      createTrayOrder(
+        { customerId: 24858, items: [{ trayProductId: "14518", quantity: 1, trayPrice: "abc" }], notes: "x", address: ADDRESS, customer: TRAY_CUSTOMER },
+        { deps }
+      ),
+    (e) => e.code === "order_item_price_invalid"
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("normalizeTrayMoney: formato monetario valido, sem float ingenuo", () => {
+  assert.equal(normalizeTrayMoney("299.99"), "299.99");
+  assert.equal(normalizeTrayMoney("299,99"), "299.99");
+  assert.equal(normalizeTrayMoney("300"), "300.00");
+  assert.equal(normalizeTrayMoney("0.00"), "0.00");
+  assert.equal(normalizeTrayMoney("abc"), "");
+  assert.equal(normalizeTrayMoney(""), "");
+  assert.equal(normalizeTrayMoney(null), "");
+  assert.equal(normalizeTrayMoney("-5.00"), "");
+  assert.equal(normalizeTrayMoney("1.234"), "");
 });
