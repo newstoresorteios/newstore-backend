@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createTrayOrder, getTrayOrderFull, parseMoneyStringToCents, buildTraySessionId } from "../src/services/trayOrderClient.js";
+import { createTrayOrder, getTrayOrderFull, parseMoneyStringToCents, buildTraySessionId, normalizeTrayBirthDate } from "../src/services/trayOrderClient.js";
 import { TrayCatalogError } from "../src/services/trayCatalogClient.js";
 
 const API_BASE = "https://www.exemplo-loja.com.br/web_api";
@@ -382,4 +382,82 @@ test("contrato final: nada de partner_id/MarketplaceOrder e nesting correto", as
   for (const pii of ["10425415902", "jp@newstore.com", "43998640480"]) {
     assert.equal(sid.includes(pii), false);
   }
+});
+
+test("Customer inline leva cpf (11 digitos, nunca mascarado) e birth_date YYYY-MM-DD", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 991 } }));
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      customer: {
+        name: "jpjp",
+        email: "jp@newstore.com",
+        cpf: "104.254.159-02", // com pontuacao de proposito
+        birthDate: new Date(Date.UTC(2007, 8, 25)), // driver pg devolve Date
+        phone: "43998640480",
+      },
+      items: [{ trayProductId: "14518", quantity: 1 }],
+      notes: "LOJA NS",
+      address: ADDRESS,
+    },
+    { deps }
+  );
+  const C = calls[0].body.Order.Customer;
+
+  assert.equal(typeof C.cpf, "string");
+  assert.equal(C.cpf.length, 11);
+  assert.match(C.cpf, /^[0-9]{11}$/);
+  assert.equal(C.cpf.includes("*"), false, "CPF nunca pode ir mascarado pra Tray");
+
+  assert.equal(C.birth_date, "2007-09-25");
+  assert.match(C.birth_date, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(C.type, "0");
+  assert.equal(C.phone, "43998640480");
+});
+
+test("birth_date aceita string ja no formato e ignora hora/fuso", () => {
+  assert.equal(normalizeTrayBirthDate("2007-09-25"), "2007-09-25");
+  assert.equal(normalizeTrayBirthDate("2007-09-25T03:00:00.000Z"), "2007-09-25");
+  assert.equal(normalizeTrayBirthDate(new Date(Date.UTC(2007, 8, 25))), "2007-09-25");
+  assert.equal(normalizeTrayBirthDate(null), "");
+  assert.equal(normalizeTrayBirthDate(""), "");
+});
+
+test("birth_date impossivel de derivar falha ANTES da rede (nunca inventa data)", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
+  await assert.rejects(
+    () =>
+      createTrayOrder(
+        {
+          customerId: 24858,
+          customer: { name: "x", email: "x@y.com", cpf: "10425415902", birthDate: "25/09/2007" },
+          items: [{ trayProductId: "1", quantity: 1 }],
+          notes: "x",
+          address: ADDRESS,
+        },
+        { deps }
+      ),
+    (e) => e.code === "order_customer_birth_date_invalid"
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("a sanitizacao de logs NUNCA altera o payload real enviado a Tray", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 992 } }));
+  const cpf = "10425415902";
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      customer: { name: "jpjp", email: "jp@newstore.com", cpf, birthDate: "2007-09-25", phone: "43998640480" },
+      items: [{ trayProductId: "14518", quantity: 1 }],
+      notes: "LOJA NS",
+      address: ADDRESS,
+    },
+    { deps }
+  );
+  // O que foi pra rede tem o dado REAL, nao o redigido.
+  const sent = calls[0].body.Order.Customer;
+  assert.equal(sent.cpf, cpf);
+  assert.equal(sent.birth_date, "2007-09-25");
+  assert.equal(JSON.stringify(calls[0].body).includes("[redacted]"), false);
 });

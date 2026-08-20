@@ -85,6 +85,25 @@ export function normalizeTrayCountry(raw) {
  * NUNCA aleatorio/timestamp -- isso nao correlacionaria com nada. Sem PII:
  * e so o UUID do redemption em hex. Pedidos reais desta loja usam 26 chars.
  */
+/**
+ * birth_date no formato que a Tray documenta: YYYY-MM-DD. Aceita Date (o
+ * driver pg devolve Date para colunas `date`) ou string ja no formato.
+ * Devolve "" quando nao da pra derivar com seguranca -- nunca inventa data.
+ */
+export function normalizeTrayBirthDate(raw) {
+  if (!raw) return "";
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    // getUTC* evita que o fuso empurre a data um dia pra tras/frente.
+    const y = raw.getUTCFullYear();
+    const m = String(raw.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(raw.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  const s = String(raw).trim();
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : "";
+}
+
 export function buildTraySessionId(redemptionId) {
   const hex = String(redemptionId ?? "").replace(/[^a-zA-Z0-9]/g, "");
   return hex ? hex.slice(0, 26) : "";
@@ -142,6 +161,14 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
     throw new TrayCatalogError("order_address_incomplete", { status: 400, publicDetails: { missing: missingAddress } });
   }
 
+  // birth_date e exigido pela Tray no Customer inline. Falha ANTES da rede se
+  // o perfil nao tiver uma data utilizavel -- nunca inventar/estimar.
+  const customerBirthDate = normalizeTrayBirthDate(customer?.birthDate);
+  if (customer?.birthDate && !customerBirthDate) {
+    throw new TrayCatalogError("order_customer_birth_date_invalid", { status: 400 });
+  }
+  const customerPhone = String(customer?.phone ?? "").replace(/\D/g, "");
+
   const body = {
     Order: {
       customer_id: cid,
@@ -153,7 +180,12 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
       Customer: {
         ...(customer?.name ? { name: String(customer.name).trim() } : {}),
         ...(customer?.email ? { email: String(customer.email).trim().toLowerCase() } : {}),
+        // M7 (prova real): a Tray valida cpf E birth_date no Customer inline
+        // do POST /orders. customer_id sozinho NAO substitui esses campos --
+        // o contrato documentado de criacao leva o Customer completo.
         ...(customer?.cpf ? { cpf: String(customer.cpf).replace(/\D/g, "") } : {}),
+        ...(customerBirthDate ? { birth_date: customerBirthDate } : {}),
+        ...(customerPhone ? { phone: customerPhone } : {}),
         type: TRAY_CUSTOMER_TYPE_PF,
         CustomerAddress: [customerAddress],
       },

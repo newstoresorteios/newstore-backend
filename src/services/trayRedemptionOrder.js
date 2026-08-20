@@ -114,7 +114,13 @@ export async function createTrayRedemptionOrder(params, options = {}) {
         customerId,
         // Order.Customer exige os dados factuais do cliente junto do endereco.
         // Sao os mesmos ja resolvidos/validados no perfil — nada inventado.
-        customer: { name: userProfile?.name, email, cpf: userProfile?.cpf },
+        customer: {
+          name: userProfile?.name,
+          email,
+          cpf: userProfile?.cpf,
+          birthDate: userProfile?.birthDate,
+          phone: userProfile?.phone,
+        },
         items: orderItems,
         notes,
         address,
