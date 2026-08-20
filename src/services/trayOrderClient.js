@@ -173,17 +173,34 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
     throw new TrayCatalogError("order_address_incomplete", { status: 400, publicDetails: { missing: missingAddress } });
   }
 
+  // IDENTIDADE vem da Tray (Customer canonico), ENDERECO vem da NewStore.
+  // Nao enviamos Order.customer_id junto: seria um segundo modelo de
+  // identidade no mesmo payload. O contrato documentado do POST /orders leva
+  // o Order.Customer completo, e o tray_customer_id serve internamente para
+  // localizar esse Customer canonico.
+  const phone = String(customer?.phone || "").replace(/\D/g, "");
+  const cellphone = String(customer?.cellphone || "").replace(/\D/g, "");
+  const trayPhone = phone || cellphone;
+
   const body = {
     Order: {
-      customer_id: cid,
       point_sale: LOJA_NS_ORDER_DEFAULTS.point_sale,
       ...(sessionId ? { session_id: String(sessionId) } : {}),
       shipment: LOJA_NS_ORDER_DEFAULTS.shipment,
       shipment_value: LOJA_NS_ORDER_DEFAULTS.shipment_value,
       payment_form: LOJA_NS_ORDER_DEFAULTS.payment_form,
-      // SOMENTE o endereco. Nenhum campo de identidade aqui -- ver comentario
-      // acima: identidade neste bloco faz a Tray tentar cadastrar o cliente.
-      Customer: { CustomerAddress: [customerAddress] },
+      Customer: {
+        ...(customer?.type ? { type: String(customer.type) } : { type: TRAY_CUSTOMER_TYPE_PF }),
+        ...(customer?.name ? { name: String(customer.name) } : {}),
+        ...(customer?.cpf ? { cpf: String(customer.cpf).replace(/\D/g, "") } : {}),
+        ...(customer?.email ? { email: String(customer.email) } : {}),
+        ...(customer?.birth_date ? { birth_date: normalizeTrayBirthDate(customer.birth_date) } : {}),
+        ...(trayPhone ? { phone: trayPhone } : {}),
+        // rg/gender so quando a propria Tray ja os tem -- nunca inventados.
+        ...(customer?.rg ? { rg: String(customer.rg) } : {}),
+        ...(customer?.gender ? { gender: String(customer.gender) } : {}),
+        CustomerAddress: [customerAddress],
+      },
       // M7 (prova real): a chave do container de itens e `ProductsSold`, nao
       // `products`. Enviando `products` a Tray responde 400 "Pedido nao tem
       // produtos." — ela simplesmente nao encontra os itens. `ProductsSold` e

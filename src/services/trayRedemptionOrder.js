@@ -17,6 +17,7 @@
 
 import { resolveTrayCustomerId, TrayCustomerProfileIncompleteError, TrayCustomerIdentityConflictError } from "./trayCustomerResolver.js";
 import { createTrayOrder, buildTraySessionId } from "./trayOrderClient.js";
+import { getTrayCustomerById } from "./trayCustomerClient.js";
 import { TrayCatalogError } from "./trayCatalogClient.js";
 
 export class TrayOrderNotImplementedError extends Error {
@@ -108,19 +109,27 @@ export async function createTrayRedemptionOrder(params, options = {}) {
 
   const notes = buildNotes({ redemptionId, couponSnapshot });
 
+  // IDENTIDADE CANONICA: quando ja existe um Customer Tray, a identidade do
+  // Order.Customer vem da PROPRIA Tray, nunca remontada com os dados da
+  // NewStore. Remontar faz a Tray enxergar um cadastro novo (o e-mail diverge
+  // do dela) e recusar com cpf "Está em uso em outro cadastro.".
+  // O endereco de entrega continua sendo o escolhido na NewStore.
+  const canonical = await getTrayCustomerById(customerId, options);
+
+  // Gate de identidade: o CPF tem que ser o mesmo dos dois lados. E-mail pode
+  // divergir -- o vinculo users.tray_customer_id ja foi reconciliado
+  // explicitamente (ver trayCustomerResolver). CPF diferente significa que o
+  // mapeamento esta errado: aborta ANTES de qualquer mutation.
+  const localCpf = String(userProfile?.cpf || "").replace(/\D/g, "");
+  if (!canonical.cpf || !localCpf || canonical.cpf !== localCpf) {
+    throw new TrayCustomerIdentityConflictError("tray_customer_cpf_mismatch", { customerId: String(customerId) });
+  }
+
   try {
     const result = await createTrayOrder(
       {
         customerId,
-        // Order.Customer exige os dados factuais do cliente junto do endereco.
-        // Sao os mesmos ja resolvidos/validados no perfil — nada inventado.
-        customer: {
-          name: userProfile?.name,
-          email,
-          cpf: userProfile?.cpf,
-          birthDate: userProfile?.birthDate,
-          phone: userProfile?.phone,
-        },
+        customer: canonical,
         items: orderItems,
         notes,
         address,
