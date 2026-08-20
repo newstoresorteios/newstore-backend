@@ -260,3 +260,62 @@ test("payload do pedido nunca carrega password/secret/token do usuario", async (
     assert.equal(serialized.toLowerCase().includes(forbidden.toLowerCase()), false, `vazou ${forbidden}`);
   }
 });
+
+test("Order carrega os campos obrigatorios da Loja NS (decisao de produto)", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 555 } }));
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
+      items: [{ trayProductId: "14518", quantity: 1 }],
+      notes: "LOJA NS / redemption_id=abc",
+      address: ADDRESS,
+    },
+    { deps }
+  );
+
+  const order = calls[0].body.Order;
+  assert.equal(order.point_sale, "LOJA NS");
+  assert.equal(order.shipment, "A DEFINIR PELA TRAY");
+  assert.equal(order.shipment_value, "0.00");
+  assert.equal(order.payment_form, "NSCréditos");
+
+  // Limites documentados: point_sale 45, shipment 100, payment_form 50.
+  assert.ok(order.point_sale.length <= 45);
+  assert.ok(order.shipment.length <= 100);
+  assert.ok(order.payment_form.length <= 50);
+
+  // Estrutura que ja avancou na API real permanece.
+  assert.ok(Array.isArray(order.Customer.CustomerAddress));
+  assert.ok(Array.isArray(order.ProductsSold));
+
+  // Nunca um meio de pagamento ficticio.
+  const serialized = JSON.stringify(order).toLowerCase();
+  for (const fake of ["pix", "boleto", "cartao", "cartão", "credit_card", "dinheiro"]) {
+    assert.equal(serialized.includes(fake), false, `meio de pagamento ficticio: ${fake}`);
+  }
+
+  // Nao adicionamos preventivamente o que a Tray nunca pediu.
+  assert.equal("partner_id" in order, false);
+  assert.equal("session_id" in order, false);
+  assert.equal("price" in order.ProductsSold[0], false);
+  assert.equal("original_price" in order.ProductsSold[0], false);
+});
+
+test("notes do pedido nunca carrega PII", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 556 } }));
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
+      items: [{ trayProductId: "14518", quantity: 1 }],
+      notes: "LOJA NS / redemption_id=abc / coupon_code=NSU-0418-Q4",
+      address: ADDRESS,
+    },
+    { deps }
+  );
+  const notes = String(calls[0].body.Order.notes);
+  for (const pii of ["10425415902", "jp@newstore.com", "43998640480", "86480"]) {
+    assert.equal(notes.includes(pii), false, `PII em notes: ${pii}`);
+  }
+});

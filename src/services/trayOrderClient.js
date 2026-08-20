@@ -27,6 +27,27 @@
 import { trayMutationRequest } from "./trayMutationClient.js";
 import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
 
+// Campos obrigatorios do Order descobertos empiricamente (400 real:
+// "Este campo nao pode ser deixado em branco" para shipment e point_sale).
+// Os valores abaixo sao DECISAO DE PRODUTO da Loja NS, nao invencao:
+//
+//   point_sale     origem factual do pedido (nao "PARTICULAR"/"LOJA VIRTUAL",
+//                  que sao so exemplos da doc).
+//   shipment       preenche o campo textual obrigatorio. NAO implementa frete:
+//                  transportadora/cotacao/prazo/etiqueta/valor efetivo seguem
+//                  sob responsabilidade da Tray.
+//   shipment_value a NewStore nao cobra nem calcula frete nesta integracao.
+//   payment_form   o beneficio foi quitado pelo saldo interno NSCreditos --
+//                  nunca um meio de pagamento ficticio (PIX/cartao/boleto).
+//
+// Limites da doc: point_sale 45, shipment 100, payment_form 50.
+export const LOJA_NS_ORDER_DEFAULTS = Object.freeze({
+  point_sale: "LOJA NS",
+  shipment: "A DEFINIR PELA TRAY",
+  shipment_value: "0.00",
+  payment_form: "NSCréditos",
+});
+
 /**
  * Brasil em ISO-3 ("BRA"), como a estrutura oficial de POST /orders usa.
  * Aceita as variacoes que podem estar gravadas internamente (BR, Brasil,
@@ -102,6 +123,10 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
   const body = {
     Order: {
       customer_id: cid,
+      point_sale: LOJA_NS_ORDER_DEFAULTS.point_sale,
+      shipment: LOJA_NS_ORDER_DEFAULTS.shipment,
+      shipment_value: LOJA_NS_ORDER_DEFAULTS.shipment_value,
+      payment_form: LOJA_NS_ORDER_DEFAULTS.payment_form,
       Customer: {
         ...(customer?.name ? { name: String(customer.name).trim() } : {}),
         ...(customer?.email ? { email: String(customer.email).trim().toLowerCase() } : {}),
@@ -118,9 +143,12 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
       // Order.Customer.
       ProductsSold: products,
       notes: String(notes || "").slice(0, 1000),
-      // Deliberadamente ausentes (não inventados): payment_form, shipment,
-      // shipment_value. Se a API real exigir algum deles, isso e um requisito
-      // factual novo a reportar — nunca um valor fabricado.
+      // Deliberadamente ausentes (nunca preventivos): partner_id e session_id
+      // -- a Tray ainda nao os exigiu. Tambem ausentes price/original_price
+      // nos itens: a Tray nunca os pediu e mandar um preco errado corromperia
+      // o total de um pedido real; sem eles ela usa o preco do proprio
+      // catalogo. Se qualquer um passar a ser exigido, o meta sanitizado do
+      // evento mostra o campo exato — nunca fabricar valor.
     },
   };
 
