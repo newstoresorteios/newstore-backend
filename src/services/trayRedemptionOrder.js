@@ -16,7 +16,7 @@
 //      via o campo oficial `notes` — nunca via payment_method inventado.
 
 import { resolveTrayCustomerId, TrayCustomerProfileIncompleteError, TrayCustomerIdentityConflictError } from "./trayCustomerResolver.js";
-import { createTrayOrder } from "./trayOrderClient.js";
+import { createTrayOrder, buildTraySessionId } from "./trayOrderClient.js";
 import { TrayCatalogError } from "./trayCatalogClient.js";
 
 export class TrayOrderNotImplementedError extends Error {
@@ -118,6 +118,8 @@ export async function createTrayRedemptionOrder(params, options = {}) {
         items: orderItems,
         notes,
         address,
+        // Correlacao estavel para reconciliacao em caso de timeout.
+        sessionId: buildTraySessionId(redemptionId),
       },
       options
     );

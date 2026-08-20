@@ -41,12 +41,23 @@ import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
 //                  nunca um meio de pagamento ficticio (PIX/cartao/boleto).
 //
 // Limites da doc: point_sale 45, shipment 100, payment_form 50.
+// Auditoria read-only de 50 pedidos reais desta loja (total 707):
+//   point_sale: "LOJA VIRTUAL" (45), "PARTICULAR" (5) -- nenhuma convencao
+//               para pedido externo/API, entao usamos a origem factual.
+//   shipment:   "Sedex" (49), "" (1) -- nenhuma convencao de "pendente",
+//               entao usamos um rotulo explicito de logistica pendente.
+//   shipment_value: "0.00" aparece em pedidos reais -- valor aceito.
 export const LOJA_NS_ORDER_DEFAULTS = Object.freeze({
   point_sale: "LOJA NS",
-  shipment: "A DEFINIR PELA TRAY",
+  shipment: "PENDENTE TRAY",
   shipment_value: "0.00",
   payment_form: "NSCréditos",
 });
+
+// Tipo de pessoa no Customer da Tray. Confirmado lendo o Customer real
+// 24858 desta loja: type "0" + cnpj vazio = pessoa fisica. Enviar "1" faz a
+// Tray tratar como pessoa juridica e exigir cnpj (400 real observado).
+export const TRAY_CUSTOMER_TYPE_PF = "0";
 
 /**
  * Brasil em ISO-3 ("BRA"), como a estrutura oficial de POST /orders usa.
@@ -68,7 +79,18 @@ export function normalizeTrayCountry(raw) {
  * @param {Array<{trayProductId:string, trayVariantId?:string|null, quantity:number}>} params.items
  * @param {string} params.notes texto livre identificando o resgate (redemption_id, coupon_code)
  */
-export async function createTrayOrder({ customerId, customer, items, notes, address }, options = {}) {
+/**
+ * session_id estavel derivado do redemption: se o POST der timeout, existe
+ * uma identidade externa deterministica para procurar/reconciliar o pedido.
+ * NUNCA aleatorio/timestamp -- isso nao correlacionaria com nada. Sem PII:
+ * e so o UUID do redemption em hex. Pedidos reais desta loja usam 26 chars.
+ */
+export function buildTraySessionId(redemptionId) {
+  const hex = String(redemptionId ?? "").replace(/[^a-zA-Z0-9]/g, "");
+  return hex ? hex.slice(0, 26) : "";
+}
+
+export async function createTrayOrder({ customerId, customer, items, notes, address, sessionId }, options = {}) {
   const cid = Number(customerId);
   if (!Number.isFinite(cid) || cid <= 0) throw new TrayCatalogError("customer_id_invalid", { status: 400 });
 
@@ -124,6 +146,7 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
     Order: {
       customer_id: cid,
       point_sale: LOJA_NS_ORDER_DEFAULTS.point_sale,
+      ...(sessionId ? { session_id: String(sessionId) } : {}),
       shipment: LOJA_NS_ORDER_DEFAULTS.shipment,
       shipment_value: LOJA_NS_ORDER_DEFAULTS.shipment_value,
       payment_form: LOJA_NS_ORDER_DEFAULTS.payment_form,
@@ -131,8 +154,7 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
         ...(customer?.name ? { name: String(customer.name).trim() } : {}),
         ...(customer?.email ? { email: String(customer.email).trim().toLowerCase() } : {}),
         ...(customer?.cpf ? { cpf: String(customer.cpf).replace(/\D/g, "") } : {}),
-        // type "1" = pessoa fisica, conforme a estrutura oficial.
-        type: "1",
+        type: TRAY_CUSTOMER_TYPE_PF,
         CustomerAddress: [customerAddress],
       },
       // M7 (prova real): a chave do container de itens e `ProductsSold`, nao

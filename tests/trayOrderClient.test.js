@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createTrayOrder, getTrayOrderFull, parseMoneyStringToCents } from "../src/services/trayOrderClient.js";
+import { createTrayOrder, getTrayOrderFull, parseMoneyStringToCents, buildTraySessionId } from "../src/services/trayOrderClient.js";
 import { TrayCatalogError } from "../src/services/trayCatalogClient.js";
 
 const API_BASE = "https://www.exemplo-loja.com.br/web_api";
@@ -276,7 +276,7 @@ test("Order carrega os campos obrigatorios da Loja NS (decisao de produto)", asy
 
   const order = calls[0].body.Order;
   assert.equal(order.point_sale, "LOJA NS");
-  assert.equal(order.shipment, "A DEFINIR PELA TRAY");
+  assert.equal(order.shipment, "PENDENTE TRAY");
   assert.equal(order.shipment_value, "0.00");
   assert.equal(order.payment_form, "NSCréditos");
 
@@ -317,5 +317,69 @@ test("notes do pedido nunca carrega PII", async () => {
   const notes = String(calls[0].body.Order.notes);
   for (const pii of ["10425415902", "jp@newstore.com", "43998640480", "86480"]) {
     assert.equal(notes.includes(pii), false, `PII em notes: ${pii}`);
+  }
+});
+
+test("Customer.type = 0 (pessoa fisica): enviar 1 faz a Tray exigir cnpj", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 777 } }));
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
+      items: [{ trayProductId: "14518", quantity: 1 }],
+      notes: "LOJA NS",
+      address: ADDRESS,
+    },
+    { deps }
+  );
+  const order = calls[0].body.Order;
+  assert.equal(order.Customer.type, "0");
+  assert.equal("cnpj" in order.Customer, false);
+});
+
+test("session_id e estavel e derivado do redemption, nunca aleatorio", () => {
+  const rid = "2612b836-a0bd-4e74-b952-7620c8564e7c";
+  const a = buildTraySessionId(rid);
+  const b = buildTraySessionId(rid);
+  assert.equal(a, b, "mesmo redemption -> mesmo session_id");
+  assert.ok(a.length > 0 && a.length <= 26);
+  assert.match(a, /^[a-zA-Z0-9]+$/);
+  assert.notEqual(a, buildTraySessionId("11111111-2222-3333-4444-555555555555"));
+  assert.equal(buildTraySessionId(null), "");
+});
+
+test("contrato final: nada de partner_id/MarketplaceOrder e nesting correto", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 888 } }));
+  await createTrayOrder(
+    {
+      customerId: 24858,
+      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
+      items: [{ trayProductId: "14518", quantity: 1 }],
+      notes: "LOJA NS / redemption_id=abc",
+      address: ADDRESS,
+      sessionId: buildTraySessionId("2612b836-a0bd-4e74-b952-7620c8564e7c"),
+    },
+    { deps }
+  );
+  const order = calls[0].body.Order;
+
+  assert.ok(order.point_sale && order.point_sale.length > 0);
+  assert.ok(order.shipment && order.shipment.length > 0);
+  assert.equal(order.shipment_value, "0.00");
+  assert.equal(order.payment_form, "NSCréditos");
+  assert.ok(order.session_id && order.session_id.length > 0);
+
+  assert.ok(Array.isArray(order.Customer.CustomerAddress));
+  assert.ok(Array.isArray(order.ProductsSold));
+  assert.equal("ProductsSold" in order.Customer, false);
+  assert.equal("CustomerAddress" in order, false);
+
+  assert.equal("partner_id" in order, false);
+  assert.equal("MarketplaceOrder" in order, false);
+
+  // session_id nao pode carregar PII/segredo
+  const sid = String(order.session_id);
+  for (const pii of ["10425415902", "jp@newstore.com", "43998640480"]) {
+    assert.equal(sid.includes(pii), false);
   }
 });
