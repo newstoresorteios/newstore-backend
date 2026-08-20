@@ -80,3 +80,32 @@ test("erro sem publicDetails nao inventa meta", () => {
   assert.equal(buildTrayFailureMeta(null), null);
   assert.equal(buildTrayFailureMeta(Object.assign(new Error("x"), {})), null);
 });
+
+test("dentro de causes a MENSAGEM de validacao sobrevive, mesmo em campo sensivel", () => {
+  // Regressao real do M7: redigir por nome de chave dentro de `causes`
+  // apagava justamente o que dizia como corrigir o contrato.
+  const body = {
+    causes: {
+      Customer: {
+        cpf: ["Este campo não pode ser deixado em branco."],
+        birth_date: ["Este campo não pode ser deixado em branco."],
+      },
+    },
+  };
+  const out = sanitizeTrayErrorBody(body);
+  assert.deepEqual(out.causes.Customer.cpf, ["Este campo não pode ser deixado em branco."]);
+  assert.deepEqual(out.causes.Customer.birth_date, ["Este campo não pode ser deixado em branco."]);
+});
+
+test("mesmo dentro de causes, um valor que e PII de verdade continua removido", () => {
+  const out = sanitizeTrayErrorBody({ causes: { Customer: { cpf: ["10425415902"], email: ["jp@newstore.com"] } } });
+  assert.deepEqual(out.causes.Customer.cpf, ["[redacted]"]);
+  assert.deepEqual(out.causes.Customer.email, ["[redacted]"]);
+});
+
+test("fora de causes, valor de campo sensivel continua redigido", () => {
+  const out = sanitizeTrayErrorBody({ cpf: "10425415902", access_token: "APP_ID-7", causes: { Order: { shipment: ["obrigatório"] } } });
+  assert.equal(out.cpf, "[redacted]");
+  assert.equal(out.access_token, "[redacted]");
+  assert.deepEqual(out.causes.Order.shipment, ["obrigatório"]);
+});

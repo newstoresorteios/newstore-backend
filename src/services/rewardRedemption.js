@@ -75,20 +75,25 @@ function scrubMetaValue(value) {
  * (campo rejeitado, mensagem de validacao, status/codigo) e descarta
  * segredo/PII. Profundidade limitada para nunca gravar um blob gigante.
  */
-export function sanitizeTrayErrorBody(value, depth = 0) {
+export function sanitizeTrayErrorBody(value, depth = 0, inCauses = false) {
   if (value == null) return null;
   if (depth > 4) return "[truncated]";
-  if (Array.isArray(value)) return value.slice(0, 20).map((v) => sanitizeTrayErrorBody(v, depth + 1));
+  if (Array.isArray(value)) return value.slice(0, 20).map((v) => sanitizeTrayErrorBody(v, depth + 1, inCauses));
   if (typeof value === "object") {
     const out = {};
     for (const [k, v] of Object.entries(value).slice(0, 40)) {
-      if (META_FORBIDDEN_KEYS.test(k)) {
-        // A CHAVE importa pro diagnostico (ex.: "cpf: campo obrigatorio"),
-        // o VALOR nao. Preserva o nome do campo, nunca o conteudo.
+      // Dentro de `causes` o VALOR e a mensagem de validacao da Tray
+      // ("Este campo nao pode ser deixado em branco."), nunca o dado do
+      // usuario -- redigir por nome de chave ali apagava exatamente o que
+      // precisamos para corrigir o contrato. O scrub por conteudo continua
+      // valendo, entao um valor que realmente pareca PII ainda e removido.
+      const nextInCauses = inCauses || k === "causes";
+      if (!nextInCauses && META_FORBIDDEN_KEYS.test(k)) {
+        // Fora de `causes`, a CHAVE importa pro diagnostico e o VALOR nao.
         out[k] = "[redacted]";
         continue;
       }
-      out[k] = sanitizeTrayErrorBody(v, depth + 1);
+      out[k] = sanitizeTrayErrorBody(v, depth + 1, nextInCauses);
     }
     return out;
   }
