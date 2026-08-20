@@ -69,7 +69,18 @@ test("quantidade invalida nunca chega a rede", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("pedido valido envia Order com customer_id/products/notes, sem payment_method/shipping", async () => {
+const ADDRESS = {
+  street: "Rua Um",
+  number: "100",
+  complement: "Ap 2",
+  neighborhood: "Centro",
+  city: "Conselheiro Mairinck",
+  state: "PR",
+  zipcode: "86480-000",
+  country: "BR",
+};
+
+test("pedido valido envia Order com customer_id/ProductsSold/CustomerAddress/notes, sem payment_method/shipping", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 4321 } }));
   const out = await createTrayOrder(
     {
@@ -79,6 +90,7 @@ test("pedido valido envia Order com customer_id/products/notes, sem payment_meth
         { trayProductId: "222", trayVariantId: "333", quantity: 1 },
       ],
       notes: "Resgate Loja NS / redemption_id=abc / coupon_code=XYZ",
+      address: ADDRESS,
     },
     { deps }
   );
@@ -89,10 +101,30 @@ test("pedido valido envia Order com customer_id/products/notes, sem payment_meth
 
   const order = calls[0].body.Order;
   assert.equal(order.customer_id, 10);
-  assert.deepEqual(order.products, [
+  // Container de itens e `ProductsSold` (prova real M7: `products` faz a Tray
+  // responder 400 "Pedido nao tem produtos.").
+  assert.equal("products" in order, false);
+  assert.deepEqual(order.ProductsSold, [
     { product_id: 111, quantity: 2 },
     { product_id: 222, variant_id: 333, quantity: 1 }, // product_id e variant_id sao campos SEPARADOS
   ]);
+  // Estrutura oficial: o endereco vive em Order.Customer.CustomerAddress[],
+  // NUNCA em Order.CustomerAddress (posicao testada e recusada pela Tray).
+  assert.equal("CustomerAddress" in order, false);
+  assert.equal("ProductsSold" in order.Customer, false);
+  assert.ok(Array.isArray(order.Customer.CustomerAddress));
+  assert.equal(order.Customer.CustomerAddress.length, 1);
+  assert.deepEqual(order.Customer.CustomerAddress[0], {
+    address: "Rua Um",
+    number: "100",
+    complement: "Ap 2",
+    neighborhood: "Centro",
+    city: "Conselheiro Mairinck",
+    state: "PR",
+    zip_code: "86480000",
+    country: "BRA", // ISO-3 no boundary da Tray
+    type: "1",
+  });
   assert.equal(order.notes, "Resgate Loja NS / redemption_id=abc / coupon_code=XYZ");
   assert.equal("payment_method" in order, false);
   assert.equal("shipping_method" in order, false);
@@ -104,21 +136,21 @@ test("pedido valido envia Order com customer_id/products/notes, sem payment_meth
 test("resposta sem id identificavel falha alto (nunca finge sucesso)", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: { status: "ok" } }));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps }),
+    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS }, { deps }),
     (e) => e.code === "tray_order_id_missing"
   );
 });
 
 test("id aninhado em Order.id tambem e reconhecido", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: { Order: { id: 77 } } }));
-  const out = await createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps });
+  const out = await createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS }, { deps });
   assert.equal(out.orderId, "77");
 });
 
 test("400 da Tray propaga tray_request_invalid com corpo preservado", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 400, body: { message: "customer_id invalido" } }));
   await assert.rejects(
-    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps }),
+    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x", address: ADDRESS }, { deps }),
     (e) => e.code === "tray_request_invalid" && e.publicDetails?.tray_body?.message === "customer_id invalido"
   );
 });
@@ -165,4 +197,66 @@ test("getTrayOrderFull sem desconto: discount=0, discountCents=0, coupon_code nu
 test("getTrayOrderFull sem Order na resposta falha alto", async () => {
   const { deps } = makeDeps(() => makeResponse({ status: 200, body: {} }));
   await assert.rejects(() => getTrayOrderFull("1", { deps }), (e) => e.code === "tray_invalid_response");
+});
+
+test("endereco incompleto nunca chega a rede (Tray exige CustomerAddress)", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
+  await assert.rejects(
+    () =>
+      createTrayOrder(
+        {
+          customerId: 10,
+          items: [{ trayProductId: "1", quantity: 1 }],
+          notes: "x",
+          address: { ...ADDRESS, city: "", zipcode: "" },
+        },
+        { deps }
+      ),
+    (e) => e.code === "order_address_incomplete"
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("endereco ausente nunca chega a rede", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 1 } }));
+  await assert.rejects(
+    () => createTrayOrder({ customerId: 10, items: [{ trayProductId: "1", quantity: 1 }], notes: "x" }, { deps }),
+    (e) => e.code === "order_address_incomplete"
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("country e normalizado para ISO-3 (BRA) so no boundary da Tray", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 9 } }));
+  for (const raw of ["BR", "Brasil", "BRASIL", "brazil"]) {
+    calls.length = 0;
+    await createTrayOrder(
+      {
+        customerId: 10,
+        items: [{ trayProductId: "1", quantity: 1 }],
+        notes: "x",
+        address: { ...ADDRESS, country: raw },
+      },
+      { deps }
+    );
+    assert.equal(calls[0].body.Order.Customer.CustomerAddress[0].country, "BRA", `country=${raw}`);
+  }
+});
+
+test("payload do pedido nunca carrega password/secret/token do usuario", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 9 } }));
+  await createTrayOrder(
+    {
+      customerId: 10,
+      customer: { name: "jpjp", email: "jp@newstore.com", cpf: "10425415902" },
+      items: [{ trayProductId: "1", quantity: 1 }],
+      notes: "LOJA NS",
+      address: ADDRESS,
+    },
+    { deps }
+  );
+  const serialized = JSON.stringify(calls[0].body);
+  for (const forbidden of ["password", "pass_hash", "authorization", "refresh_token", "access_token", "DATABASE_URL", "coupon_value_cents"]) {
+    assert.equal(serialized.toLowerCase().includes(forbidden.toLowerCase()), false, `vazou ${forbidden}`);
+  }
 });

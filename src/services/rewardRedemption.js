@@ -309,6 +309,11 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       idempotencyKey: key,
       items: validated.items,
       userProfile,
+      // M7 (prova real): POST /orders exige CustomerAddress preenchido
+      // (address/number/neighborhood/city/state/zip_code/country). O endereco
+      // e o do proprio usuario (user_addresses), nunca inventado. Isso NAO e
+      // frete -- nenhum valor/transportadora e calculado aqui.
+      address,
       couponSnapshot: { coupon_code: balance.coupon_code, tray_coupon_id: balance.tray_coupon_id },
     });
 

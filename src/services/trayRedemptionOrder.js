@@ -75,7 +75,7 @@ function buildNotes({ redemptionId, couponSnapshot }) {
  * @throws {TrayCatalogError} demais falhas deterministicas (400/401/404/5xx) — seguro compensar
  */
 export async function createTrayRedemptionOrder(params, options = {}) {
-  const { userId, redemptionId, items, userProfile, couponSnapshot } = params || {};
+  const { userId, redemptionId, items, userProfile, couponSnapshot, address } = params || {};
 
   const email = String(userProfile?.email || "").trim();
   if (!email) throw new TrayCustomerProfileIncompleteError(["email"]);
@@ -109,7 +109,18 @@ export async function createTrayRedemptionOrder(params, options = {}) {
   const notes = buildNotes({ redemptionId, couponSnapshot });
 
   try {
-    const result = await createTrayOrder({ customerId, items: orderItems, notes }, options);
+    const result = await createTrayOrder(
+      {
+        customerId,
+        // Order.Customer exige os dados factuais do cliente junto do endereco.
+        // Sao os mesmos ja resolvidos/validados no perfil — nada inventado.
+        customer: { name: userProfile?.name, email, cpf: userProfile?.cpf },
+        items: orderItems,
+        notes,
+        address,
+      },
+      options
+    );
     return { orderId: result.orderId };
   } catch (e) {
     if (e instanceof TrayCatalogError && (e.code === "tray_timeout" || e.code === "tray_unreachable")) {

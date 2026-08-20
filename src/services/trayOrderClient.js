@@ -28,12 +28,26 @@ import { trayMutationRequest } from "./trayMutationClient.js";
 import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
 
 /**
+ * Brasil em ISO-3 ("BRA"), como a estrutura oficial de POST /orders usa.
+ * Aceita as variacoes que podem estar gravadas internamente (BR, Brasil,
+ * BRASIL). Qualquer outro valor passa adiante em maiusculas — nunca
+ * "adivinhamos" um pais diferente do que o usuario cadastrou.
+ */
+export function normalizeTrayCountry(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  if (/^(br|bra|brasil|brazil)$/i.test(s)) return "BRA";
+  return s.toUpperCase();
+}
+
+/**
  * @param {object} params
  * @param {string|number} params.customerId ID Tray do cliente (nunca users.id)
+ * @param {{name?:string, email?:string, cpf?:string}} [params.customer] dados factuais do cliente
  * @param {Array<{trayProductId:string, trayVariantId?:string|null, quantity:number}>} params.items
  * @param {string} params.notes texto livre identificando o resgate (redemption_id, coupon_code)
  */
-export async function createTrayOrder({ customerId, items, notes }, options = {}) {
+export async function createTrayOrder({ customerId, customer, items, notes, address }, options = {}) {
   const cid = Number(customerId);
   if (!Number.isFinite(cid) || cid <= 0) throw new TrayCatalogError("customer_id_invalid", { status: 400 });
 
@@ -55,12 +69,58 @@ export async function createTrayOrder({ customerId, items, notes }, options = {}
     return line;
   });
 
+  // M7 (prova real): a Tray recusa o pedido com 400 e
+  // causes.CustomerAddress[campo]="Este campo nao pode ser deixado em branco"
+  // quando o bloco de endereco nao chega onde ela espera. O JSON oficial de
+  // POST /orders aninha o endereco em Order.Customer.CustomerAddress[] --
+  // NAO em Order.CustomerAddress (essa posicao foi testada e a Tray continua
+  // reportando os campos como em branco).
+  // Falhamos ANTES da rede se algum campo obrigatorio estiver vazio -- nunca
+  // enviar em branco, nunca inventar valor. Isso NAO e frete: nenhum
+  // valor/transportadora e calculado aqui.
+  const customerAddress = {
+    address: String(address?.street ?? "").trim(),
+    number: String(address?.number ?? "").trim(),
+    complement: String(address?.complement ?? "").trim(),
+    neighborhood: String(address?.neighborhood ?? "").trim(),
+    city: String(address?.city ?? "").trim(),
+    state: String(address?.state ?? "").trim(),
+    zip_code: String(address?.zipcode ?? "").replace(/\D/g, ""),
+    // O JSON oficial usa ISO-3 ("BRA"). Normalizamos SO no boundary da Tray:
+    // o armazenamento interno (user_addresses.country) continua como esta.
+    country: normalizeTrayCountry(address?.country),
+    // type "1" = endereco de entrega, conforme a estrutura oficial.
+    type: "1",
+  };
+  const missingAddress = ["address", "number", "neighborhood", "city", "state", "zip_code", "country", "type"].filter(
+    (k) => !customerAddress[k]
+  );
+  if (missingAddress.length) {
+    throw new TrayCatalogError("order_address_incomplete", { status: 400, publicDetails: { missing: missingAddress } });
+  }
+
   const body = {
     Order: {
       customer_id: cid,
-      products,
+      Customer: {
+        ...(customer?.name ? { name: String(customer.name).trim() } : {}),
+        ...(customer?.email ? { email: String(customer.email).trim().toLowerCase() } : {}),
+        ...(customer?.cpf ? { cpf: String(customer.cpf).replace(/\D/g, "") } : {}),
+        // type "1" = pessoa fisica, conforme a estrutura oficial.
+        type: "1",
+        CustomerAddress: [customerAddress],
+      },
+      // M7 (prova real): a chave do container de itens e `ProductsSold`, nao
+      // `products`. Enviando `products` a Tray responde 400 "Pedido nao tem
+      // produtos." — ela simplesmente nao encontra os itens. `ProductsSold` e
+      // o nome usado tanto no exemplo oficial de "Cadastrar Pedido#post"
+      // quanto no GET /orders/:id real desta loja. Fica em Order, NUNCA em
+      // Order.Customer.
+      ProductsSold: products,
       notes: String(notes || "").slice(0, 1000),
-      // Deliberadamente ausentes (não inventados): payment_method, shipping_method, shipping_cost.
+      // Deliberadamente ausentes (não inventados): payment_form, shipment,
+      // shipment_value. Se a API real exigir algum deles, isso e um requisito
+      // factual novo a reportar — nunca um valor fabricado.
     },
   };
 
