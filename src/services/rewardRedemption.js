@@ -2,14 +2,28 @@
 //
 // Saga do resgate real (Fase 5). Postgres + Tray NAO sao ACID (item 31 do
 // pedido original), entao cada passo e uma operacao local atomica propria,
-// com compensacao explicita quando o passo seguinte falha.
+// com compensacao explicita quando o passo seguinte falha — NUNCA uma
+// transacao Postgres aberta durante uma chamada HTTP a Tray (item 23):
 //
-// ESTADO ATUAL: a saga inteira roda e e testada de ponta a ponta, mas o
-// UNICO passo que fala com a Tray de verdade (createTrayRedemptionOrder,
-// em trayRedemptionOrder.js) esta deliberadamente bloqueado — ver o
-// relatorio da Fase E. Ate isso ser resolvido, todo confirm termina em
-// 'blocked_tray_contract_pending' com os creditos devolvidos, NUNCA com
-// o cliente perdendo credito sem receber nada.
+//   TX curta A -> applyCouponLedgerEntry(debit): abre sua PROPRIA
+//     transacao (SELECT ... FOR UPDATE + update + insert no ledger),
+//     comita e devolve. Nenhuma chamada de rede acontece dentro dela.
+//   Fora de transacao -> createTrayRedemptionOrder (rede real, sem lock
+//     nenhum seguro).
+//   TX curta B (se necessario) -> applyCouponLedgerEntry(credit) de
+//     compensacao, de novo em sua PROPRIA transacao isolada.
+//
+// Timeout/rede instavel na criacao do pedido vira TrayOrderAmbiguousError
+// (trayRedemptionOrder.js) -> status 'reconciliation_required', creditos
+// permanecem debitados, NUNCA compensa as cegas (item 34). GAP CONHECIDO,
+// documentado no relatorio: uma busca ATIVA do pedido na Tray (por
+// customer_id + notes, via GET /orders) antes de decidir confirmar ou
+// compensar nao foi implementada — a documentacao oficial auditada nao
+// confirma se `notes` e devolvido no GET apos a criacao, e nao ha ambiente
+// de homologacao Tray disponivel para verificar isso sem criar um pedido
+// real. Ate essa confirmacao, todo caso ambiguo fica em
+// 'reconciliation_required' para resolucao manual — nunca uma decisao
+// automatica sem evidencia.
 //
 // prepare NAO debita (item 39). Só confirm debita, e só uma vez por
 // idempotency_key (item 28).
@@ -18,7 +32,15 @@ import { resolveDeps as resolveCartDeps, findActiveCart, loadItems, buildCart } 
 import { validateCart } from "./rewardCartValidator.js";
 import { getCouponBalance, applyCouponLedgerEntry, CouponLedgerError } from "./couponLedger.js";
 import { getUserAddress } from "./userAddress.js";
-import { createTrayRedemptionOrder, TrayOrderNotImplementedError, TrayOrderAmbiguousError } from "./trayRedemptionOrder.js";
+import {
+  createTrayRedemptionOrder,
+  TrayOrderNotImplementedError,
+  TrayCustomerProfileIncompleteError,
+  TrayCustomerAmbiguousError,
+  TrayCustomerIdentityConflictError,
+  TrayOrderAmbiguousError,
+} from "./trayRedemptionOrder.js";
+import { ensureTrayCouponForUser } from "./trayCouponEnsure.js";
 
 export class RedemptionError extends Error {
   constructor(code, { status = 400, details = null } = {}) {
@@ -45,7 +67,25 @@ function resolveDeps(deps = {}) {
   return {
     ...resolveCartDeps(deps),
     createTrayRedemptionOrder: deps.createTrayRedemptionOrder || createTrayRedemptionOrder,
+    ensureTrayCouponForUser: deps.ensureTrayCouponForUser || ensureTrayCouponForUser,
   };
+}
+
+/**
+ * Fase F (item 33): mantem o cupom Tray sincronizado com
+ * users.coupon_value_cents IMEDIATAMENTE apos qualquer mudanca de saldo do
+ * resgate — nunca esperando o proximo login. Reusa ensureTrayCouponForUser
+ * (mesma funcao do gatilho de login), que ja le o saldo FRESCO do banco e e
+ * best-effort por design (nunca lanca, so loga e devolve status FAILED).
+ * Chamado depois que o saldo local ja mudou (debito ou compensacao) —
+ * nunca antes, e nunca dentro da transacao que move o saldo.
+ */
+async function syncTrayCouponBestEffort(userId, d) {
+  try {
+    await d.ensureTrayCouponForUser(userId);
+  } catch (e) {
+    console.warn("[reward.redemption] sync do cupom Tray pos-saldo falhou (nao bloqueia o resgate)", { userId, error: e?.message || String(e) });
+  }
 }
 
 async function loadValidCart(userId, deps) {
@@ -198,6 +238,21 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
   const balance = await getCouponBalance(userId, deps);
   const creditsAmount = validated.cart.total_nscredits;
 
+  // Necessario para resolver/criar o customer_id Tray (a Tray nao conhece
+  // users.id) — ver trayCustomerResolver.js / trayRedemptionOrder.js.
+  // birth_date/cpf so existem quando o usuario ja completou o perfil de
+  // resgate (rewardProfile.js) — null aqui e um estado valido, tratado
+  // como bloqueio isolado se um Customer novo precisar ser criado. cpf
+  // nunca e logado (PII) — so passa pelo resolver/DTO Tray.
+  const userRow = await query(`select name, email, phone, birth_date, cpf from public.users where id = $1`, [userId]);
+  const userProfile = {
+    name: userRow.rows[0]?.name || null,
+    email: userRow.rows[0]?.email || null,
+    phone: userRow.rows[0]?.phone || null,
+    birthDate: userRow.rows[0]?.birth_date || null,
+    cpf: userRow.rows[0]?.cpf || null,
+  };
+
   const redemption = await createRedemptionRow(query, {
     userId,
     cartId: validated.cart.id,
@@ -236,17 +291,24 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
   await setStatus(query, redemption.id, "credits_reserved", { coupon_value_after_cents: debit.balance_cents });
   await recordEvent(query, redemption.id, { from: "processing", to: "credits_reserved" });
 
-  // Passo 2: tentativa de pedido Tray real. BLOQUEADO hoje — ver relatorio.
+  // Fase F (item 33): saldo local ja mudou (debito) — sincroniza o cupom
+  // Tray IMEDIATAMENTE, antes mesmo de tentar o pedido. Erra do lado seguro:
+  // se o pedido falhar e compensarmos depois, o cupom Tray fica
+  // temporariamente MENOR que o saldo real (nunca maior) ate a segunda
+  // sincronizacao abaixo — nunca abre uma janela de double-spend.
+  await syncTrayCouponBestEffort(userId, d);
+
+  // Passo 2: tentativa de pedido Tray real.
   await setStatus(query, redemption.id, "tray_order_pending", { shipping_snapshot: shippingOption });
   await recordEvent(query, redemption.id, { from: "credits_reserved", to: "tray_order_pending" });
 
   try {
     const orderResult = await d.createTrayRedemptionOrder({
+      userId,
       redemptionId: redemption.id,
       idempotencyKey: key,
       items: validated.items,
-      address,
-      shippingOption,
+      userProfile,
       couponSnapshot: { coupon_code: balance.coupon_code, tray_coupon_id: balance.tray_coupon_id },
     });
 
@@ -264,9 +326,17 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       };
     }
 
-    // Deterministico (inclusive TrayOrderNotImplementedError): sabemos que
-    // nenhum pedido foi criado, entao compensar imediatamente e seguro.
-    const reason = e instanceof TrayOrderNotImplementedError ? e.code : "tray_order_failed";
+    // Deterministico (inclusive TrayOrderNotImplementedError,
+    // TrayCustomerProfileIncompleteError, TrayCustomerAmbiguousError e
+    // TrayCustomerIdentityConflictError): sabemos que nenhum pedido foi
+    // criado, entao compensar imediatamente e seguro.
+    const reason =
+      e instanceof TrayOrderNotImplementedError ||
+      e instanceof TrayCustomerProfileIncompleteError ||
+      e instanceof TrayCustomerAmbiguousError ||
+      e instanceof TrayCustomerIdentityConflictError
+        ? e.code
+        : "tray_order_failed";
     const compensation = await applyCouponLedgerEntry(
       {
         userId,
@@ -279,9 +349,26 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       deps
     );
 
-    const finalStatus = e instanceof TrayOrderNotImplementedError ? "blocked_tray_contract_pending" : "compensated";
+    // M7.1: conflito de identidade (e-mail x cpf apontando pra Customers
+    // Tray incompativeis) reusa o status blocked_tray_customer_ambiguous
+    // -- mesma familia semantica ("resolucao de Customer Tray bloqueada,
+    // precisa de auditoria humana, nunca escolhida as cegas"); o motivo
+    // especifico (tray_customer_identity_conflict + reason detalhado) fica
+    // em failure_reason, sem exigir uma nova migration so pra este status.
+    const finalStatus = e instanceof TrayOrderNotImplementedError
+      ? "blocked_tray_contract_pending"
+      : e instanceof TrayCustomerProfileIncompleteError
+        ? "blocked_tray_profile_incomplete"
+        : e instanceof TrayCustomerAmbiguousError || e instanceof TrayCustomerIdentityConflictError
+          ? "blocked_tray_customer_ambiguous"
+          : "compensated";
     await setStatus(query, redemption.id, finalStatus, { coupon_value_after_cents: compensation.balance_cents, failure_reason: reason });
     await recordEvent(query, redemption.id, { from: "tray_order_pending", to: finalStatus, reason });
+
+    // Saldo local mudou de novo (compensacao) — resincroniza o cupom Tray
+    // para refletir o credito devolvido. So agora o valor volta a subir,
+    // nunca antes de termos certeza de que nenhum pedido foi criado.
+    await syncTrayCouponBestEffort(userId, d);
 
     return {
       replayed: false,

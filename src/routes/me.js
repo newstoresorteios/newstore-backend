@@ -4,6 +4,7 @@ import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getTicketPriceCents } from '../services/config.js';
 import { getCouponBalance } from '../services/couponLedger.js';
+import { getRewardProfile, updateBirthDate, updateCpf, computeMissingRewardProfileFields, maskCPF, RewardProfileError } from '../services/rewardProfile.js';
 
 const router = Router();
 
@@ -16,7 +17,7 @@ router.get('/', requireAuth, async (req, res) => {
     const userId = req.user.id;
     // busca no banco pra garantir dados atualizados
     const r = await query(
-      `select id, name, email, phone, is_admin, winner_balance_cents, winner_balance_updated_at
+      `select id, name, email, phone, birth_date, cpf, is_admin, winner_balance_cents, winner_balance_updated_at
          from users
         where id = $1`,
       [userId]
@@ -29,6 +30,18 @@ router.get('/', requireAuth, async (req, res) => {
       phone: u.phone || null,
       is_admin: !!u.is_admin,
     };
+
+    // Completude de perfil para o resgate Loja NS: a Tray exige birth_date
+    // E cpf pra criar Customer nesta loja (item M7.1 -- cpf provado
+    // obrigatorio via teste controlado real) -- name/email a NewStore ja
+    // tem sempre (NOT NULL). Reusa a mesma logica de rewardProfile.js, nunca
+    // devolve cpf cru.
+    const missingRewardFields = computeMissingRewardProfileFields(u);
+    user.birth_date = u.birth_date || null;
+    user.has_cpf = !!u.cpf;
+    user.cpf_masked = u.cpf ? maskCPF(u.cpf) : null;
+    user.profile_complete_for_reward = missingRewardFields.length === 0;
+    user.missing_reward_fields = missingRewardFields;
     const winnerBalanceCents = u.winner_balance_cents == null ? null : Number(u.winner_balance_cents);
     if (Number.isFinite(winnerBalanceCents) && winnerBalanceCents > 0) {
       user.winner_balance_cents = winnerBalanceCents;
@@ -134,6 +147,42 @@ router.patch('/phone', requireAuth, async (req, res) => {
   } catch (e) {
     console.error('[me/phone] error:', e);
     return res.status(500).json({ ok: false, error: 'phone_update_failed' });
+  }
+});
+
+/**
+ * PATCH /api/me/birth-date
+ * Atualiza somente a data de nascimento do usuario autenticado.
+ * Mesmo padrao de /api/me/phone: pede uma vez, valida, salva no perfil.
+ */
+router.patch('/birth-date', requireAuth, async (req, res) => {
+  try {
+    const out = await updateBirthDate(req.user.id, req.body?.birth_date);
+    return res.json({ ok: true, profile: out });
+  } catch (e) {
+    if (e instanceof RewardProfileError) {
+      return res.status(e.status).json({ ok: false, error: e.code });
+    }
+    console.error('[me/birth-date] error:', e);
+    return res.status(500).json({ ok: false, error: 'birth_date_update_failed' });
+  }
+});
+
+/**
+ * PATCH /api/me/cpf
+ * Atualiza somente o CPF do usuario autenticado. Nunca aceita user_id do
+ * corpo -- JWT decide. Nunca loga o valor completo do CPF.
+ */
+router.patch('/cpf', requireAuth, async (req, res) => {
+  try {
+    const out = await updateCpf(req.user.id, req.body?.cpf);
+    return res.json({ ok: true, profile: out });
+  } catch (e) {
+    if (e instanceof RewardProfileError) {
+      return res.status(e.status).json({ ok: false, error: e.code });
+    }
+    console.error('[me/cpf] error:', e?.message || e);
+    return res.status(500).json({ ok: false, error: 'cpf_update_failed' });
   }
 });
 

@@ -29,7 +29,13 @@ const READ_ONLY_METHODS = new Set(["GET"]);
  * uma liberacao geral de metodo.
  */
 const ALLOWED_MUTATIONS = new Map([
-  // "tray_order_create" -> new Set(["POST"])  // Fase E, quando desbloqueada.
+  // Fase 5 (fechamento do resgate): mutacoes novas autorizadas, e so essas.
+  // Nenhuma outra entra aqui sem decisao explicita — ver relatorio.
+  ["TRAY_ORDER_CREATE", new Set(["POST"])],
+  // Reta final (perfil + Customer real): so cria Customer quando o
+  // lookup por e-mail nao encontra nenhum e o perfil esta completo
+  // (birth_date) — nunca um PUT/PATCH em Customer existente.
+  ["TRAY_CUSTOMER_CREATE", new Set(["POST"])],
 ]);
 
 export class TrayCatalogError extends Error {
