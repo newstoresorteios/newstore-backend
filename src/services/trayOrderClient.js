@@ -131,22 +131,48 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
     return line;
   });
 
-  // CLIENTE JA EXISTENTE — decisao de arquitetura (M7, prova real):
+  // ENDERECO DE ENTREGA DO RESGATE — quem manda e a NewStore.
   //
-  // Mandar Order.Customer inline faz a Tray tratar o bloco como CADASTRO de
-  // cliente. Como o CPF ja pertence ao Customer resolvido, ela recusa com
-  // causes.Customer.cpf = "Está em uso em outro cadastro." Enviar
-  // Order.Customer.id = <id> tambem foi testado e NAO evita esse caminho.
+  // Regra de negocio: o pedido carrega o endereco que o cliente escolheu
+  // NAQUELE resgate (user_addresses), nao o que estiver cadastrado na Tray.
+  // Se o cliente mudou de endereco depois, o historico do pedido nao muda.
   //
-  // O schema oficial de criacao (tray-api-ai-plugin,
-  // skills/pedidos/schemas/pedido.create.json) exige exatamente
-  // ["customer_id", "products"] e nao tem nenhuma propriedade Customer --
-  // ou seja, o pedido REFERENCIA um cliente que ja existe, nunca o cadastra.
+  // Posicao provada empiricamente (M7):
+  //   Order.CustomerAddress          -> a Tray NAO le (reporta tudo em branco)
+  //   Order.Customer.CustomerAddress -> a Tray LE
   //
-  // Portanto: cadastro de cliente acontece SO em trayCustomerResolver /
-  // POST /customers; aqui mandamos apenas a referencia. O endereco de
-  // entrega e o que ja esta vinculado ao Customer na Tray -- nao recriamos
-  // endereco a cada pedido.
+  // Mas o bloco Customer com dados de identidade (cpf/name/email/birth_date)
+  // faz a Tray tentar CADASTRAR o cliente e colidir:
+  //   causes.Customer.cpf = "Está em uso em outro cadastro."
+  //
+  // Solucao: Customer carrega SOMENTE o endereco. Sem identidade nao ha o que
+  // colidir, e o cliente segue identificado por Order.customer_id (o schema
+  // oficial de criacao exige exatamente customer_id, sem propriedade Customer).
+  // Cadastro de cliente continua exclusivo do resolver / POST /customers.
+  //
+  // Falhamos ANTES da rede se faltar campo obrigatorio -- nunca enviar em
+  // branco, nunca inventar endereco. Isso NAO e frete: nenhum valor ou
+  // transportadora e calculado aqui; a logistica fica com os vendedores.
+  const customerAddress = {
+    address: String(address?.street ?? "").trim(),
+    number: String(address?.number ?? "").trim(),
+    complement: String(address?.complement ?? "").trim(),
+    neighborhood: String(address?.neighborhood ?? "").trim(),
+    city: String(address?.city ?? "").trim(),
+    state: String(address?.state ?? "").trim(),
+    zip_code: String(address?.zipcode ?? "").replace(/\D/g, ""),
+    // ISO-3 so no boundary da Tray; user_addresses.country nao muda.
+    country: normalizeTrayCountry(address?.country),
+    // type "1" = endereco de entrega.
+    type: "1",
+  };
+  const missingAddress = ["address", "number", "neighborhood", "city", "state", "zip_code", "country"].filter(
+    (k) => !customerAddress[k]
+  );
+  if (missingAddress.length) {
+    throw new TrayCatalogError("order_address_incomplete", { status: 400, publicDetails: { missing: missingAddress } });
+  }
+
   const body = {
     Order: {
       customer_id: cid,
@@ -155,6 +181,9 @@ export async function createTrayOrder({ customerId, customer, items, notes, addr
       shipment: LOJA_NS_ORDER_DEFAULTS.shipment,
       shipment_value: LOJA_NS_ORDER_DEFAULTS.shipment_value,
       payment_form: LOJA_NS_ORDER_DEFAULTS.payment_form,
+      // SOMENTE o endereco. Nenhum campo de identidade aqui -- ver comentario
+      // acima: identidade neste bloco faz a Tray tentar cadastrar o cliente.
+      Customer: { CustomerAddress: [customerAddress] },
       // M7 (prova real): a chave do container de itens e `ProductsSold`, nao
       // `products`. Enviando `products` a Tray responde 400 "Pedido nao tem
       // produtos." — ela simplesmente nao encontra os itens. `ProductsSold` e
