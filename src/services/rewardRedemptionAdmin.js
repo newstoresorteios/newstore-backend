@@ -15,7 +15,8 @@
 
 import { query as defaultQuery } from "../db.js";
 import { sanitizeTrayErrorBody } from "./rewardRedemption.js";
-import { getTrayOrderFull } from "./trayOrderClient.js";
+import { getTrayOrder } from "./trayOrderClient.js";
+import { buildAdminTrayOrderView } from "./trayOrderLogistics.js";
 
 const MAX_PAGE_SIZE = 100;
 
@@ -192,7 +193,7 @@ export function describeRedemptionStatus(status) {
 function resolveDeps(deps = {}) {
   return {
     query: deps.query || defaultQuery,
-    getTrayOrderFull: deps.getTrayOrderFull || getTrayOrderFull,
+    getTrayOrder: deps.getTrayOrder || getTrayOrder,
   };
 }
 
@@ -635,45 +636,16 @@ export async function getAdminRedemptionDetail(redemptionId, deps = {}) {
 
 /* ─────────────────────────── Pedido Tray (READ-ONLY) ─────────────────────────── */
 
-function pickString(raw, ...keys) {
-  for (const key of keys) {
-    const value = raw?.[key];
-    if (value == null) continue;
-    const s = String(value).trim();
-    if (s) return s;
-  }
-  return null;
-}
-
 /**
- * Campos uteis do pedido Tray. Somente o que a Tray REALMENTE devolveu —
- * nenhum campo e preenchido com valor padrao, e rastreio so aparece quando
- * a propria Tray manda (nunca inventamos tracking).
+ * Visao administrativa do pedido Tray.
+ *
+ * Delega ao normalizador COMPARTILHADO (trayOrderLogistics.js), construido a
+ * partir dos campos comprovados numa auditoria read-only de pedidos reais --
+ * os mesmos campos que alimentam o acompanhamento do cliente. Admin e cliente
+ * compartilham a normalizacao, nunca a autorizacao.
  */
 export function mapTrayOrderForAdmin(raw) {
-  if (!raw || typeof raw !== "object") return null;
-
-  const trackingCode = pickString(raw, "tracking_code", "shipment_code", "shipping_code");
-  const trackingUrl = pickString(raw, "tracking_url", "shipment_url");
-  const trackingCarrier = pickString(raw, "shipment_company", "shipment_carrier");
-
-  return {
-    tray_order_id: pickString(raw, "id", "order_id"),
-    status: pickString(raw, "status"),
-    payment_method: pickString(raw, "payment_method", "payment_form"),
-    point_sale: pickString(raw, "point_sale"),
-    shipment: pickString(raw, "shipment", "shipping_method"),
-    shipment_value: pickString(raw, "shipment_value", "shipping_cost"),
-    total: pickString(raw, "total"),
-    discount: pickString(raw, "discount"),
-    coupon_code: pickString(raw, "coupon_code"),
-    created_at: pickString(raw, "date", "created_at"),
-    updated_at: pickString(raw, "modified", "updated_at"),
-    tracking:
-      trackingCode || trackingUrl || trackingCarrier
-        ? { code: trackingCode, url: trackingUrl, carrier: trackingCarrier }
-        : null,
-  };
+  return buildAdminTrayOrderView(raw);
 }
 
 /**
@@ -694,7 +666,9 @@ export async function getAdminRedemptionTrayOrder(redemptionId, deps = {}) {
   const trayOrderId = rows[0].tray_order_id || null;
   if (!trayOrderId) throw new RedemptionAdminError("tray_order_not_created", { status: 409 });
 
-  const full = await d.getTrayOrderFull(trayOrderId);
+  // getTrayOrder (GET /orders/:id): `/orders/:id/full` responde 404 nesta
+  // loja -- ver o achado documentado em trayOrderClient.js.
+  const full = await d.getTrayOrder(trayOrderId);
   return {
     tray_order_id: String(trayOrderId),
     order: mapTrayOrderForAdmin(full?.raw),

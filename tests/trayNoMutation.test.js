@@ -27,6 +27,9 @@ const LOJA_MODULE_FILES = [
   join(SRC, "routes", "store.js"),
   // Read model administrativo do resgate: le o pedido na Tray, nunca escreve.
   join(SRC, "services", "rewardRedemptionAdmin.js"),
+  // Acompanhamento logistico: projecao read-only do pedido Tray.
+  join(SRC, "services", "trayOrderLogistics.js"),
+  join(SRC, "services", "rewardRedemptionTracking.js"),
 ];
 
 const RAW_PRODUCT = {
@@ -256,14 +259,46 @@ test("o modulo Loja de Premios nao importa o servico de escrita de cupons da Tra
 test("o read model administrativo do resgate so usa leitura de pedido da Tray", () => {
   const source = readFileSync(join(SRC, "services", "rewardRedemptionAdmin.js"), "utf8");
 
-  // Unica funcao da Tray importada: o GET /orders/:id/full ja existente.
+  // Do dominio Tray so entram LEITURA de pedido e normalizacao — nunca
+  // criacao/alteracao de pedido, cliente, cupom ou estoque.
   const trayImports = [...source.matchAll(/import\s+\{([^}]+)\}\s+from\s+["'][^"']*tray[^"']*["']/gi)]
     .flatMap((m) => m[1].split(",").map((s) => s.trim()))
     .filter(Boolean);
-  assert.deepEqual(trayImports, ["getTrayOrderFull"]);
+  assert.deepEqual(trayImports.sort(), ["buildAdminTrayOrderView", "getTrayOrder"]);
 
   // E nenhuma escrita local no dominio financeiro/resgate.
   for (const pattern of [/insert\s+into/i, /update\s+public\./i, /delete\s+from/i]) {
     assert.ok(!pattern.test(source), `read model administrativo nao pode escrever: ${pattern}`);
   }
+});
+
+test("o acompanhamento logistico do cliente so importa LEITURA da Tray", () => {
+  const source = readFileSync(join(SRC, "services", "rewardRedemptionTracking.js"), "utf8");
+
+  const trayImports = [...source.matchAll(/import\s+\{([^}]+)\}\s+from\s+["'][^"']*[Tt]ray[^"']*["']/g)]
+    .flatMap((m) => m[1].split(",").map((s) => s.trim()))
+    .filter(Boolean);
+  assert.deepEqual(trayImports.sort(), ["buildCustomerTrayStatus", "getTrayOrder"]);
+
+  // Nenhuma escrita local: a consulta logistica e financeiramente inerte.
+  for (const pattern of [/insert\s+into/i, /update\s+public\./i, /delete\s+from/i]) {
+    assert.ok(!pattern.test(source), `acompanhamento nao pode escrever: ${pattern}`);
+  }
+  // E nunca toca no dominio financeiro/saga.
+  for (const forbidden of ["applyCouponLedgerEntry", "ensureTrayCouponForUser", "confirmRedemption", "createTrayOrder"]) {
+    assert.ok(!source.includes(forbidden), `acompanhamento nunca pode chamar ${forbidden}`);
+  }
+});
+
+test("o normalizador logistico nao inventa entrega nem monta URL de rastreio", () => {
+  const source = readFileSync(join(SRC, "services", "trayOrderLogistics.js"), "utf8");
+
+  // Nenhuma fase "delivered": os campos de entrega da Tray vem vazios ate em
+  // pedidos FINALIZADOS (auditoria real documentada no proprio arquivo).
+  assert.ok(!/DELIVERED:\s*"delivered"/.test(source));
+  assert.ok(!/phase\s*=\s*["']delivered["']/.test(source));
+
+  // A URL de rastreio so pode vir da Tray, nunca ser concatenada a partir do
+  // codigo de rastreamento.
+  assert.ok(!/rastreio\?|correios\.com|linkcorreios|\$\{.*sending_code.*\}/i.test(source.replace(/^\s*\/\/.*$/gm, "")));
 });

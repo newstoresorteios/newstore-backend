@@ -15,6 +15,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { prepareRedemption, confirmRedemption, getRedemption, listRedemptions } from "../services/rewardRedemption.js";
+import { getRedemptionTrayStatus } from "../services/rewardRedemptionTracking.js";
 
 const router = Router();
 
@@ -74,6 +75,25 @@ router.get("/", requireAuth, async (req, res) => {
     return res.json(await listRedemptions(req.user.id, { page: req.query.page, limit: req.query.limit }));
   } catch (e) {
     return sendError(res, e, "list");
+  }
+});
+
+/**
+ * GET /api/store/redemptions/:id/tray-status
+ *
+ * Acompanhamento logístico do pedido, SOMENTE LEITURA e sob demanda — a
+ * listagem de "Meus Pedidos" nunca chama a Tray (seria uma chamada externa
+ * por pedido). O cliente informa só o ID do RESGATE: o tray_order_id sai do
+ * banco depois da checagem de posse, então ninguém consulta pedido alheio.
+ *
+ * Nunca devolve a resposta crua da Tray, status comercial cru, store_note
+ * ou qualquer PII — ver trayOrderLogistics.js.
+ */
+router.get("/:id/tray-status", requireAuth, async (req, res) => {
+  try {
+    return res.json(await getRedemptionTrayStatus(req.user.id, req.params.id));
+  } catch (e) {
+    return sendError(res, e, "tray_status");
   }
 });
 

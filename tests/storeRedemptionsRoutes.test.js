@@ -48,6 +48,8 @@ const REDEMPTION_ROUTES = [
   ["POST", "/api/store/redemptions/confirm"],
   ["GET", "/api/store/redemptions"],
   ["GET", "/api/store/redemptions/abc"],
+  // Acompanhamento logistico do pedido (read-only, sob demanda).
+  ["GET", "/api/store/redemptions/abc/tray-status"],
 ];
 
 test("toda rota de resgate exige autenticacao", async () => {
@@ -79,4 +81,17 @@ test("todas as rotas tem requireAuth no stack", async () => {
     const names = layer.route.stack.map((s) => s.name);
     assert.ok(names.includes("requireAuth"), `${layer.route.path} sem requireAuth`);
   }
+});
+
+test("o acompanhamento logistico nunca aceita tray_order_id do navegador", async () => {
+  const { readFileSync } = await import("node:fs");
+  const routeSource = readFileSync(new URL("../src/routes/store_redemptions.js", import.meta.url), "utf8");
+  const serviceSource = readFileSync(new URL("../src/services/rewardRedemptionTracking.js", import.meta.url), "utf8");
+
+  // A rota so passa adiante o usuario do token e o ID do resgate da URL.
+  assert.ok(/getRedemptionTrayStatus\(req\.user\.id, req\.params\.id\)/.test(routeSource));
+  // E o servico nunca le tray_order_id de query/body: ele sai do banco.
+  assert.ok(!/req\.(query|body)/.test(serviceSource));
+  assert.ok(/select id, status, tray_order_id/.test(serviceSource));
+  assert.ok(/where id = \$1::uuid and user_id = \$2/.test(serviceSource));
 });

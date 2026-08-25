@@ -223,29 +223,50 @@ test("resgate sem snapshot de endereco devolve null, nunca campos vazios", () =>
 test("pedido Tray expoe somente campos uteis e nunca inventa rastreio", () => {
   const out = mapTrayOrderForAdmin({
     id: 25626,
-    status: "A enviar",
+    status: "AGUARDANDO PAGAMENTO",
+    OrderStatus: { type: "open" },
     payment_method: "NSCréditos",
     point_sale: "LOJA NS",
     shipment: "PENDENTE TRAY",
     shipment_value: "0.00",
     total: "299.90",
-    date: "2026-08-21 10:00:00",
+    date: "2026-08-21",
     modified: "2026-08-21 11:00:00",
+    store_note: "Resgate Loja NS / redemption_id=abc",
     Customer: { cpf: "12345678901", email: "cliente@exemplo.com" },
   });
 
   assert.equal(out.tray_order_id, "25626");
-  assert.equal(out.status, "A enviar");
+  // O admin PODE ver o status comercial cru; o cliente nunca (item 71).
+  assert.equal(out.status, "AGUARDANDO PAGAMENTO");
   assert.equal(out.point_sale, "LOJA NS");
   assert.equal(out.total, "299.90");
-  assert.equal(out.tracking, null);
+  assert.equal(out.logistics.phase, "received");
+  assert.equal(out.logistics.tracking_code, undefined);
+  assert.equal(out.logistics.tracking_url, undefined);
   assert.ok(!JSON.stringify(out).includes("12345678901"));
   assert.ok(!JSON.stringify(out).includes("cliente@exemplo.com"));
+  assert.ok(!JSON.stringify(out).includes("redemption_id=abc"));
 });
 
 test("rastreio aparece somente quando a Tray realmente devolve", () => {
-  const out = mapTrayOrderForAdmin({ id: 1, tracking_code: "BR123456789BR" });
-  assert.deepEqual(out.tracking, { code: "BR123456789BR", url: null, carrier: null });
+  const out = mapTrayOrderForAdmin({
+    id: 1,
+    status: "ENVIADO",
+    shipment: "Sedex",
+    shipment_integrator: "Correios",
+    shipment_date: "2026-05-28",
+    sending_code: "AD507735291BR",
+    tracking_url: "https://www.exemplo.com.br/rastreio?cod_acesso=A4400C4741",
+    has_shipment: "1",
+    is_traceable: "1",
+  });
+
+  assert.equal(out.logistics.phase, "shipped");
+  assert.equal(out.logistics.tracking_code, "AD507735291BR");
+  assert.equal(out.logistics.carrier, "Correios");
+  assert.equal(out.logistics.shipment_method, "Sedex");
+  assert.equal(out.logistics.shipped_at, "2026-05-28");
 });
 
 /* ─────────────────────────── Periodo ─────────────────────────── */
@@ -333,7 +354,7 @@ test("listagem nao faz N+1: 3 consultas fixas, nenhuma por linha", async () => {
 test("listagem nunca chama a Tray", async () => {
   let trayCalled = false;
   const { query } = recordingQuery(listResponder([LIST_ROW]));
-  await listAdminRedemptions({ page: 1, limit: 20 }, { query, getTrayOrderFull: async () => { trayCalled = true; return {}; } });
+  await listAdminRedemptions({ page: 1, limit: 20 }, { query, getTrayOrder: async () => { trayCalled = true; return {}; } });
   assert.equal(trayCalled, false);
 });
 
@@ -479,26 +500,27 @@ test("detalhe com id que nao e uuid nao chega a consultar o banco", async () => 
 test("detalhe nao consulta a Tray", async () => {
   let trayCalled = false;
   const { query } = recordingQuery(detailResponder());
-  await getAdminRedemptionDetail(REDEMPTION_ID, { query, getTrayOrderFull: async () => { trayCalled = true; return {}; } });
+  await getAdminRedemptionDetail(REDEMPTION_ID, { query, getTrayOrder: async () => { trayCalled = true; return {}; } });
   assert.equal(trayCalled, false);
 });
 
 /* ─────────────────────────── Tray read-only ─────────────────────────── */
 
-test("status Tray e uma leitura sob demanda de GET /orders/:id/full", async () => {
+test("status Tray e uma leitura sob demanda de GET /orders/:id", async () => {
   const { query } = recordingQuery(() => ({ rows: [{ tray_order_id: "25626" }] }));
   let asked = null;
   const out = await getAdminRedemptionTrayOrder(REDEMPTION_ID, {
     query,
-    getTrayOrderFull: async (id) => {
+    getTrayOrder: async (id) => {
       asked = id;
-      return { raw: { id: 25626, status: "A enviar", total: "299.90" } };
+      return { raw: { id: 25626, status: "AGUARDANDO PAGAMENTO", total: "299.90" } };
     },
   });
 
   assert.equal(asked, "25626");
   assert.equal(out.tray_order_id, "25626");
-  assert.equal(out.order.status, "A enviar");
+  assert.equal(out.order.status, "AGUARDANDO PAGAMENTO");
+  assert.equal(out.order.logistics.phase, "received");
   assert.ok(out.fetched_at);
 });
 
@@ -506,7 +528,7 @@ test("resgate sem pedido Tray nao chama a Tray", async () => {
   let trayCalled = false;
   const { query } = recordingQuery(() => ({ rows: [{ tray_order_id: null }] }));
   await assert.rejects(
-    () => getAdminRedemptionTrayOrder(REDEMPTION_ID, { query, getTrayOrderFull: async () => { trayCalled = true; return {}; } }),
+    () => getAdminRedemptionTrayOrder(REDEMPTION_ID, { query, getTrayOrder: async () => { trayCalled = true; return {}; } }),
     (e) => e.code === "tray_order_not_created" && e.status === 409
   );
   assert.equal(trayCalled, false);

@@ -274,6 +274,35 @@ export function parseMoneyStringToCents(raw) {
 }
 
 /**
+ * GET /orders/:id — leitura pura do pedido.
+ *
+ * ACHADO FACTUAL (auditoria read-only contra a loja real, 2026-08-25):
+ * `GET /orders/:id/full` responde **404** para TODOS os pedidos desta loja,
+ * enquanto `GET /orders/:id` devolve o objeto `Order` completo — incluindo os
+ * campos de logística (shipment_integrator, shipment_date, sending_code,
+ * tracking_url, has_shipment, is_traceable, estimated_delivery_date).
+ * Por isso a leitura de acompanhamento usa `/orders/:id`.
+ *
+ * `getTrayOrderFull` abaixo continua INTOCADO: ele pertence ao reconciliador
+ * do webhook (dinheiro), e mexer nele está fora do escopo desta tarefa. O
+ * 404 do `/full` está registrado no relatório para tratamento próprio.
+ *
+ * Reusa `trayCatalogGet` — mesmo cliente, mesma autenticação, mesmo timeout,
+ * mesma trava de somente-leitura. Nenhum client Tray novo.
+ */
+export async function getTrayOrder(orderId, options = {}) {
+  const id = String(orderId || "").trim();
+  if (!id) throw new TrayCatalogError("order_id_missing", { status: 400 });
+
+  const body = await trayCatalogGet(`/orders/${encodeURIComponent(id)}`, {}, options);
+  const order = body?.Order ?? body?.order ?? null;
+  if (!order || typeof order !== "object") {
+    throw new TrayCatalogError("tray_invalid_response", { status: 502 });
+  }
+  return { raw: order };
+}
+
+/**
  * GET /orders/:id/full — leitura pura, usada pelo reconciliador do webhook
  * de pedido (Fase G) para confirmar coupon_code/discount de um pedido antes
  * de agir sobre o saldo local. Nunca confia so no payload do webhook (que
