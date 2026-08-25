@@ -46,6 +46,12 @@ const ADMIN_ROUTES = [
   ["POST", "/api/admin/store/products/publish"],
   ["POST", "/api/admin/store/products/sync"],
   ["PATCH", "/api/admin/store/products/123"],
+  // Pedidos / Resgates (read model administrativo).
+  ["GET", "/api/admin/store/redemptions"],
+  ["GET", "/api/admin/store/redemptions/11111111-2222-3333-4444-555555555555"],
+  ["GET", "/api/admin/store/redemptions/11111111-2222-3333-4444-555555555555/tray"],
+  ["GET", "/api/admin/store/reports"],
+  ["GET", "/api/admin/store/redemption-statuses"],
 ];
 
 test("toda rota admin da loja exige autenticacao (401 sem token)", async () => {

@@ -20,6 +20,16 @@ import {
   getRewardCatalogStats,
 } from "../services/rewardStore.js";
 import { trayTokenHealth } from "../services/tray.js";
+import {
+  listAdminRedemptions,
+  getAdminRedemptionDetail,
+  getAdminRedemptionTrayOrder,
+  getRedemptionReport,
+  getTrayOrderWebhookEvidence,
+  getTrayOrdersModuleStatus,
+  REDEMPTION_STATUS_CATALOG,
+} from "../services/rewardRedemptionAdmin.js";
+import { isRewardRedemptionEnabled } from "../services/rewardRedemption.js";
 
 const router = Router();
 
@@ -157,9 +167,11 @@ router.get("/tray-brands", requireAuth, requireAdmin, async (_req, res) => {
  */
 router.get("/status", requireAuth, requireAdmin, async (_req, res) => {
   try {
-    const [health, catalog] = await Promise.all([
+    const [health, catalog, trayOrders, webhook] = await Promise.all([
       trayTokenHealth().catch((e) => ({ ok: false, lastError: e?.code || "tray_status_failed" })),
       getRewardCatalogStats(),
+      getTrayOrdersModuleStatus().catch(() => null),
+      getTrayOrderWebhookEvidence().catch(() => null),
     ]);
 
     let apiHost = null;
@@ -178,6 +190,15 @@ router.get("/status", requireAuth, requireAdmin, async (_req, res) => {
         last_error: health.lastError ?? null,
       },
       catalog,
+      // Estado operacional dos modulos do resgate. Nenhuma variavel de
+      // ambiente e devolvida — apenas o booleano que ela decide.
+      modules: {
+        redemption_backend: { enabled: isRewardRedemptionEnabled() },
+        tray_orders: trayOrders,
+        // A rota do webhook existir NAO prova ativacao externa: `delivery`
+        // so vira "verified" quando existe evidencia persistida de entrega.
+        webhook_order: webhook,
+      },
     });
   } catch (e) {
     return sendError(res, e, "store_status");
@@ -244,6 +265,92 @@ router.post("/products/sync", requireAuth, requireAdmin, async (req, res) => {
   } catch (e) {
     return sendError(res, e, "sync_reward_products");
   }
+});
+
+/* ─────────────────── Pedidos / Resgates (SOMENTE LEITURA) ─────────────────── */
+//
+// A NewStore administra o RESGATE; a Tray administra a LOGISTICA. Nenhuma
+// rota abaixo escreve em reward_redemptions, no ledger ou na Tray.
+
+/**
+ * GET /api/admin/store/redemptions
+ * Query: page, limit, q, status (csv), from, to
+ *
+ * Paginacao real no banco (LIMIT/OFFSET). Nunca chama a Tray para renderizar
+ * a listagem. Nunca expoe CPF, telefone ou endereco — endereco so no detalhe.
+ */
+router.get("/redemptions", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const page = toPositiveInt(req.query?.page, 1, 100000);
+    const limit = toPositiveInt(req.query?.limit, 20, 100);
+    return res.json(
+      await listAdminRedemptions({
+        page,
+        limit,
+        q: req.query?.q,
+        status: req.query?.status,
+        from: req.query?.from,
+        to: req.query?.to,
+      })
+    );
+  } catch (e) {
+    return sendError(res, e, "list_redemptions");
+  }
+});
+
+/**
+ * GET /api/admin/store/redemptions/:id
+ * Resgate + cliente + itens + endereco do snapshot + timeline + ledger.
+ * O meta dos eventos passa por whitelist: nunca token, senha ou PII.
+ */
+router.get("/redemptions/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    return res.json(await getAdminRedemptionDetail(req.params.id));
+  } catch (e) {
+    return sendError(res, e, "redemption_detail");
+  }
+});
+
+/**
+ * GET /api/admin/store/redemptions/:id/tray
+ * Estado atual do pedido na Tray — SOMENTE GET /orders/:id/full.
+ * O Admin NewStore nunca altera pedido, status, frete, estoque ou preco.
+ */
+router.get("/redemptions/:id/tray", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    return res.json(await getAdminRedemptionTrayOrder(req.params.id));
+  } catch (e) {
+    return sendError(res, e, "redemption_tray_order");
+  }
+});
+
+/**
+ * GET /api/admin/store/reports
+ * Query: from, to, recent_limit
+ *
+ * Metricas reais + ultimos resgates (mesma query da listagem).
+ * "NSCreditos resgatados" conta SOMENTE resgates confirmados: uma tentativa
+ * compensada tem efeito liquido zero no ledger e nunca entra nesse numero.
+ */
+router.get("/reports", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [redemptions, catalog] = await Promise.all([
+      getRedemptionReport({
+        from: req.query?.from,
+        to: req.query?.to,
+        recent_limit: req.query?.recent_limit,
+      }),
+      getRewardCatalogStats(),
+    ]);
+    return res.json({ ...redemptions, catalog });
+  } catch (e) {
+    return sendError(res, e, "store_reports");
+  }
+});
+
+/** GET /api/admin/store/redemption-statuses — status factuais (filtros/rotulos). */
+router.get("/redemption-statuses", requireAuth, requireAdmin, (_req, res) => {
+  return res.json({ items: REDEMPTION_STATUS_CATALOG });
 });
 
 export default router;

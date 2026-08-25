@@ -25,6 +25,8 @@ const LOJA_MODULE_FILES = [
   join(SRC, "services", "rewardStore.js"),
   join(SRC, "routes", "admin_store.js"),
   join(SRC, "routes", "store.js"),
+  // Read model administrativo do resgate: le o pedido na Tray, nunca escreve.
+  join(SRC, "services", "rewardRedemptionAdmin.js"),
 ];
 
 const RAW_PRODUCT = {
@@ -248,5 +250,20 @@ test("o modulo Loja de Premios nao importa o servico de escrita de cupons da Tra
       !/from\s+["'].*services\/trayCoupon/i.test(source),
       `${file} nao deve importar servicos de cupom (escrita na Tray)`
     );
+  }
+});
+
+test("o read model administrativo do resgate so usa leitura de pedido da Tray", () => {
+  const source = readFileSync(join(SRC, "services", "rewardRedemptionAdmin.js"), "utf8");
+
+  // Unica funcao da Tray importada: o GET /orders/:id/full ja existente.
+  const trayImports = [...source.matchAll(/import\s+\{([^}]+)\}\s+from\s+["'][^"']*tray[^"']*["']/gi)]
+    .flatMap((m) => m[1].split(",").map((s) => s.trim()))
+    .filter(Boolean);
+  assert.deepEqual(trayImports, ["getTrayOrderFull"]);
+
+  // E nenhuma escrita local no dominio financeiro/resgate.
+  for (const pattern of [/insert\s+into/i, /update\s+public\./i, /delete\s+from/i]) {
+    assert.ok(!pattern.test(source), `read model administrativo nao pode escrever: ${pattern}`);
   }
 });
