@@ -79,6 +79,14 @@ before(async () => {
     // criado. Testes especificos (cliente nao encontrado, timeout ambiguo)
     // substituem este mock explicitamente.
     createTrayRedemptionOrder: async () => ({ orderId: "TEST-TRAY-ORDER-1" }),
+    // Passo de status operacional (PUT /orders/:id + GET de confirmacao):
+    // tambem SEMPRE mockado aqui — o contrato real tem cobertura propria em
+    // trayOrderClient.test.js. Nenhum Payment Tray existe neste fluxo.
+    advanceTrayOrderToOperationalStatus: async () => ({
+      targetStatus: { id: "27", status: "A ENVIAR" },
+      order: { id: "TEST-TRAY-ORDER-1", OrderStatus: { id: "27", status: "A ENVIAR" }, has_payment: "0" },
+      hasPayment: "0",
+    }),
     // Fase F: sincronizacao do cupom Tray e SEMPRE mockada aqui — nunca
     // toca rede/DB real de producao a partir de um teste de saga.
     ensureTrayCouponForUser: async () => ({ ok: true, status: "SYNCED" }),
@@ -288,6 +296,138 @@ test("timeout/resultado ambiguo NAO compensa automaticamente (reconciliation_req
   const hist = await pool.query("select event_type from public.coupon_balance_history where user_id=$1 and event_type like 'REDEMPTION_%' order by created_at", [userId]);
   assert.equal(hist.rows.length, 1, "so o debito, nenhuma compensacao automatica");
   assert.equal(hist.rows[0].event_type, "REDEMPTION_DEBIT");
+});
+
+/* ───────────── Status operacional do pedido Tray (pos POST /orders) ───────────── */
+// O pedido nasce "AGUARDANDO PAGAMENTO" na Tray. A liquidacao e o debito de
+// NSCreditos na NewStore: nenhum Payment Tray e criado aqui, so o status
+// operacional avanca. Depois que o pedido EXISTE, nenhuma falha pode
+// compensar saldo nem criar um segundo pedido.
+
+test("pedido criado: tray_order_id e persistido ANTES do avanco de status e o resgate so fica confirmed depois dele", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  const advanceCalls = [];
+  let stateDuringAdvance = null;
+  const spyDeps = {
+    ...deps,
+    advanceTrayOrderToOperationalStatus: async ({ orderId }) => {
+      advanceCalls.push(orderId);
+      const { rows } = await pool.query(
+        "select status, tray_order_id from public.reward_redemptions where user_id=$1 order by created_at desc limit 1",
+        [userId]
+      );
+      stateDuringAdvance = rows[0];
+      return { targetStatus: { id: "27", status: "A ENVIAR" }, order: {}, hasPayment: "0" };
+    },
+  };
+
+  const out = await confirmRedemption(userId, { addressId, idempotencyKey: `redeem-status-ok-${Date.now()}` }, spyDeps);
+
+  assert.deepEqual(advanceCalls, ["TEST-TRAY-ORDER-1"], "um unico avanco de status, com o pedido real");
+  assert.equal(stateDuringAdvance.tray_order_id, "TEST-TRAY-ORDER-1", "o vinculo ja estava salvo antes do PUT");
+  assert.equal(stateDuringAdvance.status, "tray_order_pending");
+  assert.equal(out.redemption.status, "confirmed");
+  assert.equal(out.redemption.tray_order_id, "TEST-TRAY-ORDER-1");
+});
+
+test("falha no avanco de status DEPOIS do pedido criado: reconciliation_required, tray_order_id preservado e ZERO compensacao", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  let orderAttempts = 0;
+  const failingDeps = {
+    ...deps,
+    createTrayRedemptionOrder: async () => {
+      orderAttempts += 1;
+      return { orderId: "TEST-TRAY-ORDER-1" };
+    },
+    advanceTrayOrderToOperationalStatus: async () => {
+      throw Object.assign(new Error("tray_order_status_unconfirmed"), {
+        code: "tray_order_status_unconfirmed",
+        status: 502,
+        publicDetails: { operation: "TRAY_ORDER_STATUS_UPDATE", tray_order_id: "TEST-TRAY-ORDER-1" },
+      });
+    },
+  };
+
+  const out = await confirmRedemption(userId, { addressId, idempotencyKey: `redeem-status-fail-${Date.now()}` }, failingDeps);
+
+  assert.equal(orderAttempts, 1, "nunca um segundo POST /orders");
+  assert.equal(out.redemption.status, "reconciliation_required");
+  assert.equal(out.redemption.tray_order_id, "TEST-TRAY-ORDER-1", "o pedido real continua rastreavel");
+  assert.equal(out.redemption.failure_reason, "tray_order_status_unconfirmed");
+
+  const hist = await pool.query(
+    "select event_type from public.coupon_balance_history where user_id=$1 and event_type like 'REDEMPTION_%' order by created_at",
+    [userId]
+  );
+  assert.equal(hist.rows.length, 1, "so o debito — nenhuma compensacao automatica com pedido existente");
+  assert.equal(hist.rows[0].event_type, "REDEMPTION_DEBIT");
+  assert.equal((await getCouponBalance(userId, deps)).balance_cents, 50000);
+});
+
+test("status operacional nao identificado (fail-closed): reconciliation_required, sem segundo pedido e sem compensacao", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  let orderAttempts = 0;
+  const failClosedDeps = {
+    ...deps,
+    createTrayRedemptionOrder: async () => {
+      orderAttempts += 1;
+      return { orderId: "TEST-TRAY-ORDER-1" };
+    },
+    advanceTrayOrderToOperationalStatus: async () => {
+      throw Object.assign(new Error("tray_operational_status_not_found"), {
+        code: "tray_operational_status_not_found",
+        status: 502,
+      });
+    },
+  };
+
+  const out = await confirmRedemption(userId, { addressId, idempotencyKey: `redeem-status-notfound-${Date.now()}` }, failClosedDeps);
+
+  assert.equal(orderAttempts, 1);
+  assert.equal(out.redemption.status, "reconciliation_required");
+  assert.equal(out.redemption.failure_reason, "tray_operational_status_not_found");
+  assert.equal((await getCouponBalance(userId, deps)).balance_cents, 50000, "saldo intacto: nada de compensacao cega");
+});
+
+test("retry da mesma confirmacao: 1 pedido Tray, 1 debito, 1 avanco de status", skipOpts, async () => {
+  await creditUser(200000);
+  await addItem({ userId, rewardProductId: productId, quantity: 1 }, deps);
+
+  let orderAttempts = 0;
+  let advanceAttempts = 0;
+  const countingDeps = {
+    ...deps,
+    createTrayRedemptionOrder: async () => {
+      orderAttempts += 1;
+      return { orderId: "TEST-TRAY-ORDER-1" };
+    },
+    advanceTrayOrderToOperationalStatus: async () => {
+      advanceAttempts += 1;
+      return { targetStatus: { id: "27", status: "A ENVIAR" }, order: {}, hasPayment: "0" };
+    },
+  };
+
+  const key = `redeem-status-idem-${Date.now()}`;
+  const a = await confirmRedemption(userId, { addressId, idempotencyKey: key }, countingDeps);
+  const b = await confirmRedemption(userId, { addressId, idempotencyKey: key }, countingDeps);
+
+  assert.equal(orderAttempts, 1, "retry nunca cria um segundo pedido Tray");
+  assert.equal(advanceAttempts, 1, "retry nunca emite uma segunda mutation de status");
+  assert.equal(b.replayed, true);
+  assert.equal(b.redemption.tray_order_id, a.redemption.tray_order_id);
+  assert.equal(b.redemption.status, "confirmed");
+
+  const hist = await pool.query(
+    "select count(*)::int as n from public.coupon_balance_history where user_id=$1 and event_type like 'REDEMPTION_%'",
+    [userId]
+  );
+  assert.equal(hist.rows[0].n, 1, "um unico debito");
 });
 
 test("endereco de outro usuario nao e aceito no prepare nem no confirm", skipOpts, async () => {

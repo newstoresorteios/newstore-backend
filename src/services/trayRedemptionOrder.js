@@ -58,9 +58,53 @@ export class TrayOrderAmbiguousError extends Error {
   }
 }
 
-function buildNotes({ redemptionId, couponSnapshot }) {
-  const code = couponSnapshot?.coupon_code || "sem-cupom";
-  return `Resgate Loja NS / redemption_id=${redemptionId} / coupon_code=${code}`;
+function formatNsCredits(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "0";
+  return Number.isInteger(amount) ? String(amount) : amount.toFixed(2).replace(".", ",");
+}
+
+export function buildRedemptionStoreNote({ redemptionId, items } = {}) {
+  const lines = (Array.isArray(items) ? items : []).map((item) => {
+    const quantity = Number(item?.quantity);
+    const unitCredits = Number(
+      item?.current_nscredits_price ??
+      item?.nscredits_unit_price ??
+      item?.nscredits_unit_price_snapshot
+    );
+    const itemTotal = quantity * unitCredits;
+    const variant = item?.tray_variant_id != null && String(item.tray_variant_id).trim() !== ""
+      ? ` | variant_id=${item.tray_variant_id}`
+      : "";
+    return `- product_id=${item?.tray_product_id}${variant} | quantidade=${quantity} | NSCréditos unitários=${formatNsCredits(unitCredits)} | total=${formatNsCredits(itemTotal)} NSCréditos`;
+  });
+  const total = (Array.isArray(items) ? items : []).reduce((sum, item) => {
+    const quantity = Number(item?.quantity);
+    const unitCredits = Number(
+      item?.current_nscredits_price ??
+      item?.nscredits_unit_price ??
+      item?.nscredits_unit_price_snapshot
+    );
+    return sum + quantity * unitCredits;
+  }, 0);
+
+  return [
+    "RESGATE LOJA NS",
+    "",
+    "Forma de liquidação: NSCréditos",
+    "Pagamento monetário: NÃO APLICÁVEL",
+    "",
+    `NSCréditos utilizados: ${formatNsCredits(total)}`,
+    "",
+    "Itens:",
+    ...lines,
+    "",
+    `Total do resgate: ${formatNsCredits(total)} NSCréditos`,
+    `redemption_id=${redemptionId}`,
+    "",
+    "Pedido liquidado integralmente através de NSCréditos.",
+    "Não houve cobrança via PIX, cartão, boleto ou dinheiro.",
+  ].join("\n");
 }
 
 /**
@@ -77,7 +121,7 @@ function buildNotes({ redemptionId, couponSnapshot }) {
  * @throws {TrayCatalogError} demais falhas deterministicas (400/401/404/5xx) — seguro compensar
  */
 export async function createTrayRedemptionOrder(params, options = {}) {
-  const { userId, redemptionId, items, userProfile, couponSnapshot, address } = params || {};
+  const { userId, redemptionId, items, userProfile, address } = params || {};
 
   const email = String(userProfile?.email || "").trim();
   if (!email) throw new TrayCustomerProfileIncompleteError(["email"]);
@@ -128,7 +172,7 @@ export async function createTrayRedemptionOrder(params, options = {}) {
     });
   }
 
-  const notes = buildNotes({ redemptionId, couponSnapshot });
+  const notes = buildRedemptionStoreNote({ redemptionId, items });
 
   // IDENTIDADE CANONICA: quando ja existe um Customer Tray, a identidade do
   // Order.Customer vem da PROPRIA Tray, nunca remontada com os dados da

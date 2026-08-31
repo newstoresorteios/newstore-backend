@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createTrayRedemptionOrder } from "../src/services/trayRedemptionOrder.js";
+import { buildRedemptionStoreNote, createTrayRedemptionOrder } from "../src/services/trayRedemptionOrder.js";
 
 const ADDRESS = {
   street: "Rua Um",
@@ -21,10 +21,61 @@ const ADDRESS = {
 const BASE_PARAMS = {
   userId: 418,
   redemptionId: "2612b836-a0bd-4e74-b952-7620c8564e7c",
-  items: [{ tray_product_id: "14518", tray_variant_id: null, quantity: 1 }],
+  items: [{ tray_product_id: "14518", tray_variant_id: null, quantity: 1, current_nscredits_price: 300 }],
   address: ADDRESS,
   couponSnapshot: { coupon_code: "NSU-0418-Q4", tray_coupon_id: "2618" },
 };
+
+test("store_note de um item registra a liquidacao em NSCreditos sem PII", () => {
+  const note = buildRedemptionStoreNote({
+    redemptionId: "redemption-123",
+    items: [
+      {
+        tray_product_id: "14518",
+        tray_variant_id: null,
+        quantity: 1,
+        current_nscredits_price: 300,
+      },
+    ],
+  });
+
+  assert.match(note, /RESGATE LOJA NS/);
+  assert.match(note, /Forma de liquidação: NSCréditos/);
+  assert.match(note, /Pagamento monetário: NÃO APLICÁVEL/);
+  assert.match(note, /NSCréditos utilizados: 300/);
+  assert.match(note, /product_id=14518 \| quantidade=1 \| NSCréditos unitários=300 \| total=300 NSCréditos/);
+  assert.match(note, /redemption_id=redemption-123/);
+  assert.match(note, /Não houve cobrança via PIX, cartão, boleto ou dinheiro\./);
+  for (const forbidden of ["coupon_code", "10425415902", "token", "jp@example.com"]) {
+    assert.equal(note.toLowerCase().includes(forbidden.toLowerCase()), false);
+  }
+});
+
+test("store_note multi-item calcula totais por item e total do resgate", () => {
+  const note = buildRedemptionStoreNote({
+    redemptionId: "redemption-multi",
+    items: [
+      { tray_product_id: "14518", quantity: 1, current_nscredits_price: 300 },
+      { tray_product_id: "14722", tray_variant_id: "552", quantity: 2, current_nscredits_price: 225 },
+    ],
+  });
+
+  assert.match(note, /product_id=14518 \| quantidade=1 \| NSCréditos unitários=300 \| total=300 NSCréditos/);
+  assert.match(note, /product_id=14722 \| variant_id=552 \| quantidade=2 \| NSCréditos unitários=225 \| total=450 NSCréditos/);
+  assert.match(note, /NSCréditos utilizados: 750/);
+  assert.match(note, /Total do resgate: 750 NSCréditos/);
+  assert.equal(note.includes("variant_id=null"), false);
+});
+
+test("store_note preserva casas decimais na representacao humana", () => {
+  const note = buildRedemptionStoreNote({
+    redemptionId: "redemption-decimal",
+    items: [{ tray_product_id: "15000", quantity: 1, current_nscredits_price: 381.5 }],
+  });
+
+  assert.match(note, /NSCréditos unitários=381,50/);
+  assert.match(note, /Total do resgate: 381,50 NSCréditos/);
+});
 
 /** options com o cache de tray_customer_id ja resolvido (sem tocar DB real). */
 function makeOptions(trayCustomer, onPost) {
@@ -135,4 +186,8 @@ test("identidade do pedido vem da Tray; endereco vem da NewStore", async () => {
   // um unico modelo de identidade
   assert.equal("customer_id" in posted.Order, false);
   assert.ok(Array.isArray(posted.Order.ProductsSold));
+  assert.match(posted.Order.store_note, /RESGATE LOJA NS/);
+  assert.match(posted.Order.store_note, /NSCréditos utilizados: 300/);
+  assert.equal(posted.Order.store_note.includes("coupon_code"), false);
+  assert.equal(posted.Order.notes, posted.Order.store_note, "retry sempre envia o mesmo bloco determinístico");
 });

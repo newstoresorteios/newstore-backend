@@ -32,6 +32,7 @@ const ALLOWED_MUTATIONS = new Map([
   // Fase 5 (fechamento do resgate): mutacoes novas autorizadas, e so essas.
   // Nenhuma outra entra aqui sem decisao explicita — ver relatorio.
   ["TRAY_ORDER_CREATE", new Set(["POST"])],
+  ["TRAY_ORDER_STATUS_UPDATE", new Set(["PUT"])],
   // Reta final (perfil + Customer real): so cria Customer quando o
   // lookup por e-mail nao encontra nenhum e o perfil esta completo
   // (birth_date) — nunca um PUT/PATCH em Customer existente.

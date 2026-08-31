@@ -5,6 +5,9 @@ import assert from "node:assert/strict";
 import {
   createTrayOrder,
   getTrayOrderFull,
+  resolveTrayOperationalStatus,
+  updateTrayOrderStatus,
+  advanceTrayOrderToOperationalStatus,
   parseMoneyStringToCents,
   buildTraySessionId,
   normalizeTrayBirthDate,
@@ -50,6 +53,11 @@ function makeResponse({ status = 200, body = {} } = {}) {
   };
 }
 
+/** Qualquer um dos caminhos documentados de listagem de status. */
+function isStatusListing(url) {
+  return url.includes("/order_status") || url.includes("/orders/statuses");
+}
+
 function makeDeps(handler) {
   const calls = [];
   return {
@@ -64,6 +72,208 @@ function makeDeps(handler) {
     },
   };
 }
+
+test("lookup escolhe o ID factual do status A ENVIAR retornado pela Tray", async () => {
+  const { calls, deps } = makeDeps(() =>
+    makeResponse({
+      body: {
+        paging: { total: 3, page: 1, limit: 50, maxLimit: 50 },
+        OrderStatuses: [
+          { OrderStatus: { id: "16", status: "AGUARDANDO PAGAMENTO", show_backoffice: "1" } },
+          { OrderStatus: { id: "27", status: "  A ENVIAR  ", show_backoffice: "1" } },
+          { OrderStatus: { id: "99", status: "A ENVIAR VIP", show_backoffice: "1" } },
+        ],
+      },
+    })
+  );
+
+  const target = await resolveTrayOperationalStatus({ deps, cache: false });
+
+  assert.deepEqual(target, { id: "27", status: "A ENVIAR" });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/order_status\?/);
+  assert.equal(calls[0].method, "GET");
+});
+
+test("lookup aceita o rotulo em 'name' (formato documentado da listagem de status)", async () => {
+  const { calls, deps } = makeDeps(() =>
+    makeResponse({
+      body: {
+        OrderStatuses: [
+          { OrderStatus: { id: "16", name: "AGUARDANDO PAGAMENTO", type: "open" } },
+          { OrderStatus: { id: "27", name: "A ENVIAR", type: "open" } },
+        ],
+      },
+    })
+  );
+
+  const target = await resolveTrayOperationalStatus({ deps, cache: false });
+
+  assert.deepEqual(target, { id: "27", status: "A ENVIAR" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "GET");
+});
+
+test("lookup tenta o segundo caminho documentado quando o primeiro responde 404", async () => {
+  const { calls, deps } = makeDeps((url) => {
+    if (url.includes("/order_status")) return makeResponse({ status: 404, body: { message: "Not Found" } });
+    return makeResponse({ body: { OrderStatuses: [{ OrderStatus: { id: "27", status: "A ENVIAR" } }] } });
+  });
+
+  const target = await resolveTrayOperationalStatus({ deps, cache: false });
+
+  assert.equal(target.id, "27");
+  assert.equal(calls.length, 2);
+  for (const call of calls) assert.equal(call.method, "GET", "descoberta de status e sempre read-only");
+});
+
+test("PUT de status envia somente Order.status_id para o pedido especifico", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ body: { message: "Saved", id: "5555", code: 200 } }));
+
+  await updateTrayOrderStatus({ orderId: "5555", statusId: "27" }, { deps });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "PUT");
+  assert.match(calls[0].url, /\/orders\/5555\?access_token=/);
+  assert.deepEqual(calls[0].body, { Order: { status_id: "27" } });
+});
+
+test("avanço operacional faz lookup, PUT e confirma o OrderStatus via GET simples", async () => {
+  const { calls, deps } = makeDeps((url, options) => {
+    if (isStatusListing(url)) {
+      return makeResponse({
+        body: { OrderStatuses: [{ OrderStatus: { id: "27", status: "A ENVIAR", show_backoffice: "1" } }] },
+      });
+    }
+    if (options?.method === "PUT") {
+      return makeResponse({ body: { message: "Saved", id: "5555", code: 200 } });
+    }
+    return makeResponse({
+      body: {
+        Order: {
+          id: "5555",
+          status: "A ENVIAR",
+          has_payment: "0",
+          OrderStatus: { id: "27", status: "A ENVIAR", type: "open" },
+        },
+      },
+    });
+  });
+
+  const result = await advanceTrayOrderToOperationalStatus(
+    { orderId: "5555" },
+    { deps, cache: false }
+  );
+
+  assert.equal(result.targetStatus.id, "27");
+  assert.equal(result.order.OrderStatus.id, "27");
+  assert.equal(result.hasPayment, "0");
+  assert.deepEqual(calls.map((call) => call.method), ["GET", "PUT", "GET"]);
+  assert.equal(calls.some((call) => call.url.includes("/full")), false);
+});
+
+test("PUT com timeout: reconcilia por GET e trata status ja aplicado como sucesso", async () => {
+  const { calls, deps } = makeDeps((url, options) => {
+    if (isStatusListing(url)) {
+      return makeResponse({ body: { OrderStatuses: [{ OrderStatus: { id: "27", status: "A ENVIAR" } }] } });
+    }
+    if (options?.method === "PUT") {
+      const abort = new Error("aborted");
+      abort.name = "AbortError";
+      throw abort;
+    }
+    return makeResponse({
+      body: { Order: { id: "5555", has_payment: "0", OrderStatus: { id: "27", status: "A ENVIAR" } } },
+    });
+  });
+
+  const result = await advanceTrayOrderToOperationalStatus({ orderId: "5555" }, { deps, cache: false });
+
+  assert.equal(result.targetStatus.id, "27");
+  assert.equal(calls.filter((call) => call.method === "PUT").length, 1, "nunca repete a mutation as cegas");
+  assert.deepEqual(calls.map((call) => call.method), ["GET", "PUT", "GET"]);
+});
+
+test("PUT com timeout e status ainda antigo: nao repete o PUT e exige reconciliacao", async () => {
+  const { calls, deps } = makeDeps((url, options) => {
+    if (isStatusListing(url)) {
+      return makeResponse({ body: { OrderStatuses: [{ OrderStatus: { id: "27", status: "A ENVIAR" } }] } });
+    }
+    if (options?.method === "PUT") {
+      const abort = new Error("aborted");
+      abort.name = "AbortError";
+      throw abort;
+    }
+    return makeResponse({
+      body: { Order: { id: "5555", has_payment: "0", OrderStatus: { id: "16", status: "AGUARDANDO PAGAMENTO" } } },
+    });
+  });
+
+  await assert.rejects(
+    () => advanceTrayOrderToOperationalStatus({ orderId: "5555" }, { deps, cache: false }),
+    (e) => e instanceof TrayCatalogError && e.code === "tray_order_status_unconfirmed"
+  );
+
+  assert.equal(calls.filter((call) => call.method === "PUT").length, 1);
+});
+
+test("PUT com timeout e GET indisponivel: falha para reconciliacao sem novo PUT", async () => {
+  const { calls, deps } = makeDeps((url, options) => {
+    if (isStatusListing(url)) {
+      return makeResponse({ body: { OrderStatuses: [{ OrderStatus: { id: "27", status: "A ENVIAR" } }] } });
+    }
+    if (options?.method === "PUT") {
+      const abort = new Error("aborted");
+      abort.name = "AbortError";
+      throw abort;
+    }
+    return makeResponse({ status: 503, body: { message: "unavailable" } });
+  });
+
+  await assert.rejects(
+    () => advanceTrayOrderToOperationalStatus({ orderId: "5555" }, { deps, cache: false }),
+    (e) => e instanceof TrayCatalogError && e.code === "tray_order_status_unconfirmed"
+  );
+
+  assert.equal(calls.filter((call) => call.method === "PUT").length, 1);
+});
+
+test("status operacional inexistente falha fechado ANTES de qualquer mutation", async () => {
+  const { calls, deps } = makeDeps(() =>
+    makeResponse({
+      body: {
+        OrderStatuses: [
+          { OrderStatus: { id: "16", status: "AGUARDANDO PAGAMENTO" } },
+          { OrderStatus: { id: "21", status: "CANCELADO" } },
+        ],
+      },
+    })
+  );
+
+  await assert.rejects(
+    () => advanceTrayOrderToOperationalStatus({ orderId: "5555" }, { deps, cache: false }),
+    (e) => e instanceof TrayCatalogError && e.code === "tray_operational_status_not_found"
+  );
+
+  assert.deepEqual(calls.map((call) => call.method), ["GET"], "nenhum PUT com status arbitrario");
+});
+
+test("o avanco de status nunca chama a API de pagamentos da Tray", async () => {
+  const { calls, deps } = makeDeps((url, options) => {
+    if (isStatusListing(url)) {
+      return makeResponse({ body: { OrderStatuses: [{ OrderStatus: { id: "27", status: "A ENVIAR" } }] } });
+    }
+    if (options?.method === "PUT") return makeResponse({ body: { message: "Saved", id: "5555", code: 200 } });
+    return makeResponse({
+      body: { Order: { id: "5555", has_payment: "0", OrderStatus: { id: "27", status: "A ENVIAR" } } },
+    });
+  });
+
+  await advanceTrayOrderToOperationalStatus({ orderId: "5555" }, { deps, cache: false });
+
+  assert.equal(calls.some((call) => call.url.includes("/payments")), false, "zero chamadas a /payments");
+  assert.equal(calls.some((call) => call.body && "Payment" in call.body), false);
+});
 
 /* ─────────────────────────── validacoes pre-rede ─────────────────────────── */
 

@@ -27,6 +27,8 @@
 import { trayMutationRequest } from "./trayMutationClient.js";
 import { trayCatalogGet, TrayCatalogError } from "./trayCatalogClient.js";
 
+let cachedOperationalStatus = null;
+
 // Campos obrigatorios do Order descobertos empiricamente (400 real:
 // "Este campo nao pode ser deixado em branco" para shipment e point_sale).
 // Os valores abaixo sao DECISAO DE PRODUTO da Loja NS, nao invencao:
@@ -300,6 +302,176 @@ export async function getTrayOrder(orderId, options = {}) {
     throw new TrayCatalogError("tray_invalid_response", { status: 502 });
   }
   return { raw: order };
+}
+
+function normalizeTrayStatusName(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toUpperCase();
+}
+
+/**
+ * Caminhos documentados pela Tray para a listagem de status de pedido. A
+ * conta desta loja e a autoridade: tentamos na ordem, SEMPRE em GET, e
+ * paramos no primeiro que devolver status de verdade. Nenhum ID e assumido
+ * aqui — quem escolhe e resolveTrayOperationalStatus, pelo nome real.
+ */
+const TRAY_ORDER_STATUS_PATHS = ["/order_status", "/orders/statuses"];
+
+/** A listagem aparece como { OrderStatuses: [{ OrderStatus: {...} }] } ou array cru. */
+function extractTrayStatuses(body) {
+  const rows = Array.isArray(body)
+    ? body
+    : Array.isArray(body?.OrderStatuses)
+      ? body.OrderStatuses
+      : Array.isArray(body?.OrderStatus)
+        ? body.OrderStatus
+        : [];
+  return rows
+    .map((entry) => entry?.OrderStatus ?? entry)
+    .filter((entry) => entry && typeof entry === "object")
+    // O rotulo aparece como `status` no pedido e como `name` na listagem de
+    // status — aceitamos os dois formatos factuais, sem inventar um terceiro.
+    .map((entry) => ({
+      id: String(entry.id ?? "").trim(),
+      status: String(entry.status ?? entry.name ?? "").trim(),
+    }))
+    .filter((entry) => entry.id && entry.status);
+}
+
+export async function listTrayOrderStatuses(options = {}) {
+  for (const statusPath of TRAY_ORDER_STATUS_PATHS) {
+    let body;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      body = await trayCatalogGet(statusPath, { limit: 50, page: 1 }, options);
+    } catch (e) {
+      // 404 = esta conta nao expoe a listagem neste caminho; qualquer outro
+      // erro (auth, rate limit, 5xx, timeout) sobe e vira reconciliacao.
+      if (e instanceof TrayCatalogError && Number(e.status) === 404) continue;
+      throw e;
+    }
+    const statuses = extractTrayStatuses(body);
+    if (statuses.length) return statuses;
+  }
+  return [];
+}
+
+export async function resolveTrayOperationalStatus(options = {}) {
+  if (options.cache !== false && cachedOperationalStatus) return cachedOperationalStatus;
+
+  const statuses = await listTrayOrderStatuses(options);
+  const matches = statuses.filter((entry) => normalizeTrayStatusName(entry.status) === "A ENVIAR");
+  if (matches.length !== 1) {
+    throw new TrayCatalogError(matches.length ? "tray_operational_status_ambiguous" : "tray_operational_status_not_found", {
+      status: 502,
+      publicDetails: {
+        expected_status: "A ENVIAR",
+        available_statuses: statuses.map(({ id, status }) => ({ id, status })),
+      },
+    });
+  }
+
+  const target = { id: matches[0].id, status: matches[0].status };
+  if (options.cache !== false) cachedOperationalStatus = target;
+  return target;
+}
+
+/** Timeout/rede: a Tray pode ou nao ter aplicado a mutation. Nunca repetir as cegas. */
+const AMBIGUOUS_TRAY_CODES = new Set(["tray_timeout", "tray_unreachable"]);
+
+function unconfirmedStatusError(orderId, targetStatus, cause) {
+  return new TrayCatalogError("tray_order_status_unconfirmed", {
+    status: 502,
+    publicDetails: {
+      operation: "TRAY_ORDER_STATUS_UPDATE",
+      tray_order_id: orderId,
+      target_status_id: targetStatus.id,
+      cause,
+    },
+  });
+}
+
+export async function updateTrayOrderStatus({ orderId, statusId } = {}, options = {}) {
+  const id = String(orderId || "").trim();
+  const targetId = String(statusId || "").trim();
+  if (!id) throw new TrayCatalogError("order_id_missing", { status: 400 });
+  if (!targetId) throw new TrayCatalogError("order_status_id_missing", { status: 400 });
+
+  return trayMutationRequest(
+    "TRAY_ORDER_STATUS_UPDATE",
+    "PUT",
+    `/orders/${encodeURIComponent(id)}`,
+    { Order: { status_id: targetId } },
+    options
+  );
+}
+
+function trayOrderHasOperationalStatus(order, orderId, targetStatus) {
+  if (String(order?.id || "") !== String(orderId)) return false;
+  const statusIdMatches = String(order?.OrderStatus?.id || "") === String(targetStatus.id);
+  const statusNameMatches =
+    normalizeTrayStatusName(order?.OrderStatus?.status || order?.status) === normalizeTrayStatusName(targetStatus.status);
+  return statusIdMatches || statusNameMatches;
+}
+
+/**
+ * Avanca UM pedido ja criado para o status operacional real da loja.
+ *
+ * O pedido ja existe na Tray quando esta funcao roda: qualquer falha aqui e
+ * um caso de reconciliacao, NUNCA de recriar pedido ou devolver credito.
+ * Por isso o timeout do PUT nao vira retry cego -- a unica pergunta legitima
+ * e "a Tray aplicou?", e quem responde e o GET /orders/:id (nunca /full,
+ * que responde 404 nesta loja).
+ *
+ * Este fluxo NAO cria Payment na Tray: NSCreditos sao liquidados dentro da
+ * NewStore (ledger de cupom) e o status serve so para liberar a operacao/
+ * separacao. `has_payment` pode continuar 0 -- decisao de negocio, nao bug.
+ */
+export async function advanceTrayOrderToOperationalStatus({ orderId } = {}, options = {}) {
+  const id = String(orderId || "").trim();
+  if (!id) throw new TrayCatalogError("order_id_missing", { status: 400 });
+
+  // Fail-closed: sem status operacional identificado com seguranca, nenhuma
+  // mutation sai daqui (nada de status arbitrario num pedido real).
+  const targetStatus = await resolveTrayOperationalStatus(options);
+
+  let ambiguous = false;
+  try {
+    await updateTrayOrderStatus({ orderId: id, statusId: targetStatus.id }, options);
+  } catch (e) {
+    if (!(e instanceof TrayCatalogError && AMBIGUOUS_TRAY_CODES.has(e.code))) throw e;
+    ambiguous = true;
+  }
+
+  let order = null;
+  try {
+    ({ raw: order } = await getTrayOrder(id, options));
+  } catch (e) {
+    if (!ambiguous) throw e;
+    throw unconfirmedStatusError(id, targetStatus, e.code);
+  }
+
+  if (!trayOrderHasOperationalStatus(order, id, targetStatus)) {
+    if (ambiguous) throw unconfirmedStatusError(id, targetStatus, "tray_timeout");
+    throw new TrayCatalogError("tray_order_status_verification_failed", {
+      status: 502,
+      publicDetails: {
+        operation: "TRAY_ORDER_STATUS_UPDATE",
+        tray_order_id: id,
+        target_status_id: targetStatus.id,
+      },
+    });
+  }
+
+  return {
+    targetStatus,
+    order,
+    hasPayment: order?.has_payment ?? null,
+  };
 }
 
 /**

@@ -40,6 +40,7 @@ import {
   TrayCustomerIdentityConflictError,
   TrayOrderAmbiguousError,
 } from "./trayRedemptionOrder.js";
+import { advanceTrayOrderToOperationalStatus } from "./trayOrderClient.js";
 import { ensureTrayCouponForUser } from "./trayCouponEnsure.js";
 
 export class RedemptionError extends Error {
@@ -127,6 +128,8 @@ function resolveDeps(deps = {}) {
   return {
     ...resolveCartDeps(deps),
     createTrayRedemptionOrder: deps.createTrayRedemptionOrder || createTrayRedemptionOrder,
+    advanceTrayOrderToOperationalStatus:
+      deps.advanceTrayOrderToOperationalStatus || advanceTrayOrderToOperationalStatus,
     ensureTrayCouponForUser: deps.ensureTrayCouponForUser || ensureTrayCouponForUser,
   };
 }
@@ -362,6 +365,10 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
   await setStatus(query, redemption.id, "tray_order_pending", { shipping_snapshot: shippingOption });
   await recordEvent(query, redemption.id, { from: "credits_reserved", to: "tray_order_pending" });
 
+  // Fica FORA do try: assim que o POST /orders responde, o vinculo com o
+  // pedido real e a unica coisa que impede uma compensacao/recriacao cega.
+  let trayOrderId = null;
+
   try {
     const orderResult = await d.createTrayRedemptionOrder({
       userId,
@@ -377,10 +384,43 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
       couponSnapshot: { coupon_code: balance.coupon_code, tray_coupon_id: balance.tray_coupon_id },
     });
 
-    await setStatus(query, redemption.id, "confirmed", { tray_order_id: orderResult?.orderId || null });
+    // O pedido EXISTE na Tray a partir daqui. O tray_order_id e gravado
+    // ANTES de qualquer outra chamada: se o processo morrer no meio, o
+    // resgate ainda aponta para o pedido real (reconciliacao humana), nunca
+    // para um segundo POST /orders.
+    trayOrderId = orderResult?.orderId || null;
+    await setStatus(query, redemption.id, "tray_order_pending", { tray_order_id: trayOrderId });
+
+    // Liberacao operacional (PUT /orders/:id + GET de confirmacao): o pedido
+    // nasce "AGUARDANDO PAGAMENTO" na Tray e este passo o move para o status
+    // real da loja. NENHUM Payment Tray e criado neste fluxo -- a liquidacao
+    // do resgate e o debito de NSCreditos no ledger da NewStore, e por isso
+    // has_payment pode continuar 0 na Tray (decisao de negocio, nao bug).
+    await d.advanceTrayOrderToOperationalStatus({ orderId: trayOrderId });
+
+    await setStatus(query, redemption.id, "confirmed", { tray_order_id: trayOrderId });
     await recordEvent(query, redemption.id, { from: "tray_order_pending", to: "confirmed" });
-    return { replayed: false, redemption: mapRedemption({ ...redemption, status: "confirmed", coupon_value_after_cents: debit.balance_cents, tray_order_id: orderResult?.orderId || null }) };
+    return { replayed: false, redemption: mapRedemption({ ...redemption, status: "confirmed", coupon_value_after_cents: debit.balance_cents, tray_order_id: trayOrderId }) };
   } catch (e) {
+    // Pedido ja criado na Tray: NUNCA compensar, NUNCA recriar, NUNCA repetir
+    // a mutation as cegas. Qualquer falha do passo de status (lookup
+    // fail-closed, PUT recusado, timeout nao confirmado pelo GET) vira
+    // reconciliacao manual com o tray_order_id preservado.
+    if (trayOrderId) {
+      const reason = e?.code || "tray_order_status_update_failed";
+      await setStatus(query, redemption.id, "reconciliation_required", { failure_reason: reason, tray_order_id: trayOrderId });
+      await recordEvent(query, redemption.id, {
+        from: "tray_order_pending",
+        to: "reconciliation_required",
+        reason,
+        meta: buildTrayFailureMeta(e),
+      });
+      return {
+        replayed: false,
+        redemption: mapRedemption({ ...redemption, status: "reconciliation_required", coupon_value_after_cents: debit.balance_cents, tray_order_id: trayOrderId, failure_reason: reason }),
+      };
+    }
+
     if (e instanceof TrayOrderAmbiguousError) {
       // Item 34: timeout/resultado ambiguo NUNCA compensa automaticamente.
       await setStatus(query, redemption.id, "reconciliation_required", { failure_reason: e.code });

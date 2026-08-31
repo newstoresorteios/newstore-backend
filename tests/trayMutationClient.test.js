@@ -51,6 +51,34 @@ test("metodo errado para uma operacao autorizada tambem e recusado", async () =>
   assert.equal(calls.length, 0);
 });
 
+test("TRAY_ORDER_STATUS_UPDATE autoriza PUT — e SO esse par operacao/metodo", async () => {
+  const { calls, deps } = makeDeps(() => makeResponse({ body: { message: "Saved", id: "5555", code: 200 } }));
+
+  await trayMutationRequest("TRAY_ORDER_STATUS_UPDATE", "PUT", "/orders/5555", { Order: { status_id: "27" } }, { deps });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "PUT");
+
+  // Nenhum PUT generico foi liberado junto: qualquer outra operacao Tray
+  // continua bloqueada antes da rede, inclusive pagamento.
+  for (const operation of ["TRAY_ORDER_UPDATE", "TRAY_ORDER_PAYMENT_CREATE", "TRAY_PAYMENT_UPDATE"]) {
+    // eslint-disable-next-line no-await-in-loop
+    await assert.rejects(
+      () => trayMutationRequest(operation, "PUT", "/orders/5555", {}, { deps }),
+      (e) => e instanceof TrayCatalogError && e.code === "tray_mutation_not_allowed",
+      `${operation} PUT deveria ser recusado`
+    );
+  }
+  for (const method of ["POST", "PATCH", "DELETE"]) {
+    // eslint-disable-next-line no-await-in-loop
+    await assert.rejects(
+      () => trayMutationRequest("TRAY_ORDER_STATUS_UPDATE", method, "/orders/5555", {}, { deps }),
+      (e) => e.code === "tray_mutation_not_allowed",
+      `TRAY_ORDER_STATUS_UPDATE ${method} deveria ser recusado`
+    );
+  }
+  assert.equal(calls.length, 1, "nenhuma das recusas chegou a rede");
+});
+
 test("operacao autorizada emite POST com body e token corretos", async () => {
   const { calls, deps } = makeDeps(() => makeResponse({ status: 201, body: { id: 999 } }));
   const out = await trayMutationRequest("TRAY_ORDER_CREATE", "POST", "/orders", { Order: { customer_id: 1 } }, { deps });
