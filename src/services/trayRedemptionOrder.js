@@ -14,9 +14,22 @@
 //      bloqueio geral do resgate, nunca uma mutacao Tray sem necessidade.
 //   2. Criar o pedido real (trayOrderClient.js), identificando o resgate
 //      via o campo oficial `notes` — nunca via payment_method inventado.
+//   3. Liquidar o pedido (settleTrayRedemptionOrder, no fim deste arquivo):
+//      Payment REAL na Tray pelo valor factual de Order.total + avanco para
+//      o status operacional. Desde 2026-09-09 um resgate so pode virar
+//      `confirmed` com `has_payment === "1"` confirmado pela propria Tray —
+//      isso SUPERA a decisao de 31/08, que aceitava `has_payment` em "0".
 
 import { resolveTrayCustomerId, TrayCustomerProfileIncompleteError, TrayCustomerIdentityConflictError } from "./trayCustomerResolver.js";
-import { createTrayOrder, buildTraySessionId } from "./trayOrderClient.js";
+import {
+  createTrayOrder,
+  buildTraySessionId,
+  getTrayOrder,
+  readTrayOrderTotal,
+  trayOrderHasPayment,
+  advanceTrayOrderToOperationalStatus,
+} from "./trayOrderClient.js";
+import { ensureTrayRedemptionPayment, resolveTrayPaymentDate } from "./trayPaymentClient.js";
 import { getTrayCustomerById } from "./trayCustomerClient.js";
 import { TrayCatalogError } from "./trayCatalogClient.js";
 import { fetchTrayProduct, fetchTrayVariants } from "./trayCatalogClient.js";
@@ -210,4 +223,90 @@ export async function createTrayRedemptionOrder(params, options = {}) {
     }
     throw e;
   }
+}
+
+/**
+ * LIQUIDACAO DO RESGATE NA TRAY — roda depois que o pedido ja existe e o
+ * `tray_order_id` ja foi persistido.
+ *
+ * Regra de negocio de 2026-09-09, que SUPERA a decisao de 31/08 ("nenhum
+ * Payment e criado; has_payment pode continuar 0"): um resgate so pode virar
+ * `confirmed` quando existe Payment REAL no pedido Tray e a propria Tray
+ * confirma `has_payment === "1"`.
+ *
+ * Fluxo (cada passo e verificado contra a Tray, nunca assumido):
+ *
+ *   GET /orders/:id            -> Order.total FACTUAL (nunca NSCreditos)
+ *   ensureTrayRedemptionPayment -> reutiliza ou cria UM Payment (marker
+ *                                  deterministico por redemption_id)
+ *   GET /orders/:id            -> EXIGE has_payment === "1"
+ *   status operacional         -> PUT so se ainda NAO estiver "A ENVIAR",
+ *                                 reutilizando a resolucao dinamica existente
+ *   confirmacao final          -> has_payment === "1" + status esperado
+ *
+ * Toda falha aqui acontece com o pedido JA CRIADO: e caso de reconciliacao
+ * (creditos e tray_order_id preservados), NUNCA de recriar pedido, repetir
+ * pagamento ou compensar creditos automaticamente.
+ *
+ * @param {object} params
+ * @param {string} params.orderId tray_order_id ja persistido
+ * @param {string} params.redemptionId identidade do resgate (vira o marker)
+ * @returns {Promise<{payment: object, paymentCreated: boolean, targetStatus: object, order: object, hasPayment: string, statusUpdated: boolean}>}
+ */
+export async function settleTrayRedemptionOrder({ orderId, redemptionId } = {}, options = {}) {
+  const id = String(orderId || "").trim();
+  if (!id) throw new TrayCatalogError("order_id_missing", { status: 400 });
+
+  // 1. Valor monetario factual do pedido. Fail-closed: sem total utilizavel
+  //    nenhum Payment e criado (nunca inventamos valor, nunca convertemos
+  //    NSCreditos em reais).
+  const { raw: orderBeforePayment } = await getTrayOrder(id, options);
+  const total = readTrayOrderTotal(orderBeforePayment);
+
+  // 2. Exatamente um Payment do resgate — reutiliza o existente quando ha.
+  const { payment, created } = await ensureTrayRedemptionPayment(
+    { orderId: id, redemptionId, value: total, date: resolveTrayPaymentDate() },
+    options
+  );
+
+  // 3. Gate duro: quem diz que o pedido esta pago e a Tray, nao nos.
+  //    `Order.payment_form = "NSCréditos"` nao conta como pagamento.
+  const { raw: orderAfterPayment } = await getTrayOrder(id, options);
+  if (!trayOrderHasPayment(orderAfterPayment)) {
+    throw new TrayCatalogError("tray_payment_not_reflected", {
+      status: 502,
+      publicDetails: {
+        tray_order_id: id,
+        tray_payment_id: payment?.id ?? null,
+        has_payment: orderAfterPayment?.has_payment ?? null,
+      },
+    });
+  }
+
+  // 4. Estado operacional. Reutiliza o mecanismo existente (resolucao
+  //    dinamica do ID de "A ENVIAR" + PUT + GET de confirmacao) e nao emite
+  //    PUT redundante quando a propria Tray ja moveu o pedido.
+  const advanced = await advanceTrayOrderToOperationalStatus({ orderId: id, order: orderAfterPayment }, options);
+
+  // 5. Confirmacao final na leitura que fechou o passo de status.
+  if (!trayOrderHasPayment(advanced.order)) {
+    throw new TrayCatalogError("tray_payment_not_reflected", {
+      status: 502,
+      publicDetails: {
+        tray_order_id: id,
+        tray_payment_id: payment?.id ?? null,
+        has_payment: advanced.order?.has_payment ?? null,
+        stage: "post_status_update",
+      },
+    });
+  }
+
+  return {
+    payment,
+    paymentCreated: created,
+    targetStatus: advanced.targetStatus,
+    order: advanced.order,
+    hasPayment: String(advanced.order?.has_payment ?? ""),
+    statusUpdated: advanced.statusUpdated,
+  };
 }

@@ -59,7 +59,7 @@ function errorForStatus(response, body) {
  * @param {object} body corpo JSON — enviado como está, sem transformação
  */
 export async function trayMutationRequest(operation, method, path, body, options = {}) {
-  const m = assertAllowedTrayMutation(operation, method);
+  const m = assertAllowedTrayMutation(operation, method, path);
   const deps = options.deps || (await defaultDeps());
   const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : DEFAULT_TIMEOUT_MS;
 

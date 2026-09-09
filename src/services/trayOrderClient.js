@@ -41,6 +41,11 @@ let cachedOperationalStatus = null;
 //   shipment_value a NewStore nao cobra nem calcula frete nesta integracao.
 //   payment_form   o beneficio foi quitado pelo saldo interno NSCreditos --
 //                  nunca um meio de pagamento ficticio (PIX/cartao/boleto).
+//                  ATENCAO: payment_form NAO representa pagamento
+//                  confirmado. Quem representa e o Payment real criado por
+//                  trayPaymentClient.js (POST /payments), e a confirmacao
+//                  factual e `Order.has_payment === "1"` devolvido pela
+//                  propria Tray. Nunca definir has_payment neste payload.
 //
 // Limites da doc: point_sale 45, shipment 100, payment_form 50.
 // Auditoria read-only de 50 pedidos reais desta loja (total 707):
@@ -304,6 +309,35 @@ export async function getTrayOrder(orderId, options = {}) {
   return { raw: order };
 }
 
+/**
+ * Valor monetario FACTUAL do pedido Tray (`Order.total`) — a unica origem
+ * legitima do `payment.value` do resgate.
+ *
+ * NSCreditos NUNCA entram aqui: eles sao ledger interno da NewStore e nao
+ * tem taxa de conversao para reais. Se a Tray nao devolver um total
+ * reconhecivel, falhamos fechado — um Payment com valor inventado corromperia
+ * um pedido real.
+ */
+export function readTrayOrderTotal(order) {
+  const total = normalizeTrayMoney(order?.total);
+  if (!total) {
+    throw new TrayCatalogError("tray_order_total_invalid", {
+      status: 502,
+      publicDetails: { tray_order_id: order?.id != null ? String(order.id) : null, tray_total: order?.total ?? null },
+    });
+  }
+  return total;
+}
+
+/**
+ * A Tray marca `has_payment` como "1" quando o pedido tem Payment de verdade.
+ * Este e o unico sinal aceito para considerar o resgate liquidado do lado
+ * Tray — `Order.payment_form = "NSCréditos"` NAO e pagamento confirmado.
+ */
+export function trayOrderHasPayment(order) {
+  return String(order?.has_payment ?? "") === "1";
+}
+
 function normalizeTrayStatusName(value) {
   return String(value || "")
     .normalize("NFD")
@@ -427,13 +461,32 @@ function trayOrderHasOperationalStatus(order, orderId, targetStatus) {
  * e "a Tray aplicou?", e quem responde e o GET /orders/:id (nunca /full,
  * que responde 404 nesta loja).
  *
- * Este fluxo NAO cria Payment na Tray: NSCreditos sao liquidados dentro da
- * NewStore (ledger de cupom) e o status serve so para liberar a operacao/
- * separacao. `has_payment` pode continuar 0 -- decisao de negocio, nao bug.
+ * Pagamento: quem cria o Payment do resgate e trayPaymentClient.js, ANTES
+ * desta chamada (ver settleTrayRedemptionOrder). Esta funcao continua sem
+ * tocar em /payments — ela so mexe em status.
+ *
+ * `order` (opcional) e uma leitura JA FEITA do pedido. Quando informada e o
+ * pedido ja esta no status operacional, nenhum PUT redundante e emitido — e
+ * nem o lookup de status e necessario, porque o proprio pedido carrega o
+ * `OrderStatus` factual (nenhum ID e assumido em lugar nenhum).
  */
-export async function advanceTrayOrderToOperationalStatus({ orderId } = {}, options = {}) {
+export async function advanceTrayOrderToOperationalStatus({ orderId, order: knownOrder = null } = {}, options = {}) {
   const id = String(orderId || "").trim();
   if (!id) throw new TrayCatalogError("order_id_missing", { status: 400 });
+
+  // Ja esta onde queremos: nao existe mutation a fazer num pedido real.
+  if (knownOrder && normalizeTrayStatusName(knownOrder?.OrderStatus?.status || knownOrder?.status) === "A ENVIAR") {
+    const currentStatus = {
+      id: String(knownOrder?.OrderStatus?.id ?? "").trim(),
+      status: String(knownOrder?.OrderStatus?.status || knownOrder?.status || "").trim(),
+    };
+    return {
+      targetStatus: currentStatus,
+      order: knownOrder,
+      hasPayment: knownOrder?.has_payment ?? null,
+      statusUpdated: false,
+    };
+  }
 
   // Fail-closed: sem status operacional identificado com seguranca, nenhuma
   // mutation sai daqui (nada de status arbitrario num pedido real).
@@ -471,6 +524,7 @@ export async function advanceTrayOrderToOperationalStatus({ orderId } = {}, opti
     targetStatus,
     order,
     hasPayment: order?.has_payment ?? null,
+    statusUpdated: true,
   };
 }
 

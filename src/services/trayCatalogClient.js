@@ -21,22 +21,27 @@ const READ_ONLY_METHODS = new Set(["GET"]);
 
 /**
  * Allow-list explicita de mutacoes Tray autorizadas, por operacao de
- * dominio. NENHUMA operacao esta autorizada hoje — ver relatorio da Fase E
- * (resgate real): a criacao de pedido depende de uma decisao de produto
- * sobre payment_type/payment_method que ainda nao existe, e nao adivinhamos
- * aqui. Quando uma mutacao for autorizada, ela entra nomeada nesta lista
- * (ex.: { operation: "tray_order_create", methods: ["POST"] }) — nunca como
- * uma liberacao geral de metodo.
+ * dominio. Cada entrada amarra TRES coisas ao mesmo tempo: o nome estavel da
+ * operacao, o metodo HTTP exato e o RECURSO (path) em que ela pode tocar.
+ * Nunca ha liberacao geral de metodo nem de recurso — autorizar
+ * "POST" para uma operacao jamais autoriza aquela operacao a postar em
+ * outro endpoint da Tray.
  */
 const ALLOWED_MUTATIONS = new Map([
   // Fase 5 (fechamento do resgate): mutacoes novas autorizadas, e so essas.
   // Nenhuma outra entra aqui sem decisao explicita — ver relatorio.
-  ["TRAY_ORDER_CREATE", new Set(["POST"])],
-  ["TRAY_ORDER_STATUS_UPDATE", new Set(["PUT"])],
+  ["TRAY_ORDER_CREATE", { methods: new Set(["POST"]), path: /^\/orders$/ }],
+  ["TRAY_ORDER_STATUS_UPDATE", { methods: new Set(["PUT"]), path: /^\/orders\/[^/?]+$/ }],
   // Reta final (perfil + Customer real): so cria Customer quando o
   // lookup por e-mail nao encontra nenhum e o perfil esta completo
   // (birth_date) — nunca um PUT/PATCH em Customer existente.
-  ["TRAY_CUSTOMER_CREATE", new Set(["POST"])],
+  ["TRAY_CUSTOMER_CREATE", { methods: new Set(["POST"]), path: /^\/customers$/ }],
+  // 2026-09-09 (supera a decisao de 31/08 "has_payment pode continuar 0"):
+  // todo resgate NOVO liquidado em NSCreditos precisa de um Payment REAL no
+  // pedido Tray. Autorizado SOMENTE o cadastro (POST /payments) — alterar
+  // (PUT/PATCH) ou apagar (DELETE) um pagamento continua proibido, e a
+  // amarracao de path impede que qualquer outra operacao poste em /payments.
+  ["TRAY_REDEMPTION_PAYMENT_CREATE", { methods: new Set(["POST"]), path: /^\/payments$/ }],
 ]);
 
 export class TrayCatalogError extends Error {
@@ -64,17 +69,24 @@ export function assertReadOnlyMethod(method) {
 
 /**
  * Guarda para qualquer mutacao FORA do catalogo (carrinho, frete, pedido,
- * sincronizacao de cupom). So passa se `operation` estiver explicitamente
- * na allow-list PARA aquele metodo. Hoje a lista esta vazia: toda chamada
- * aqui falha, de proposito, ate a Fase E decidir o contrato de pagamento.
+ * pagamento do resgate, sincronizacao de cupom). So passa se `operation`
+ * estiver explicitamente na allow-list PARA aquele metodo E — quando o
+ * chamador informa o `path` — para aquele recurso.
+ *
+ * `path` e opcional para permitir checar o par (operacao, metodo) de forma
+ * isolada; o cliente HTTP (trayMutationClient.js) SEMPRE o informa, entao
+ * nenhuma requisicao real escapa da amarracao de recurso.
  */
-export function assertAllowedTrayMutation(operation, method) {
+export function assertAllowedTrayMutation(operation, method, path = null) {
   const m = String(method || "").toUpperCase();
-  const allowedMethods = ALLOWED_MUTATIONS.get(String(operation || ""));
-  if (!allowedMethods || !allowedMethods.has(m)) {
+  const rule = ALLOWED_MUTATIONS.get(String(operation || ""));
+  const methodOk = Boolean(rule && rule.methods.has(m));
+  // Compara so o caminho: querystring nunca faz parte da autorizacao.
+  const pathOk = path == null || (methodOk && rule.path.test(String(path).replace(/\?.*$/, "")));
+  if (!methodOk || !pathOk) {
     throw new TrayCatalogError("tray_mutation_not_allowed", {
       status: 500,
-      publicDetails: { operation: String(operation || ""), method: m },
+      publicDetails: { operation: String(operation || ""), method: m, ...(path == null ? {} : { path: String(path) }) },
     });
   }
   return m;

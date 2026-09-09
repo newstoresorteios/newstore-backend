@@ -1,5 +1,16 @@
 # Loja NS — status operacional do pedido Tray após resgate em NSCréditos
 
+> **SUPERSEDED (parcialmente) em 2026-09-09.**
+> A decisão registrada abaixo em *"Risco aceito, deliberado"* — **"o fluxo não
+> cria Payment na Tray"** e **"`has_payment` pode continuar `0`"** — **não vale
+> mais** para resgates NOVOS. A regra de negócio atual exige um Payment REAL no
+> pedido Tray e `has_payment === "1"` antes de o resgate virar `confirmed`.
+> Ver: `docs/superpowers/specs/2026-09-09-loja-ns-tray-payment-nscredits.md`.
+>
+> O resto deste documento (resolução dinâmica do status "A ENVIAR", fail-closed,
+> tratamento de timeout do `PUT`) continua **válido e em vigor**. Este texto é
+> mantido como registro histórico e **não** foi reescrito.
+
 Data: 2026-08-31
 Escopo: **backend, somente os PRÓXIMOS resgates**. Zero migration, zero
 alteração retroativa, zero pagamento Tray, zero mudança de frontend.
@@ -31,6 +42,9 @@ resgate confirmed
 ```
 
 ### Risco aceito, deliberado
+
+> **Esta subseção foi SUPERADA em 2026-09-09.** Ela descreve o que era verdade
+> entre 31/08 e 09/09. Não use como referência para o comportamento atual.
 
 - Este fluxo **não cria Payment na Tray**: nenhum `POST/PUT/DELETE /payments`,
   nenhum pagamento de R$ 0,00, nenhum PIX/cartão/boleto fictício.

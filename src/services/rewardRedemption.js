@@ -39,8 +39,8 @@ import {
   TrayCustomerAmbiguousError,
   TrayCustomerIdentityConflictError,
   TrayOrderAmbiguousError,
+  settleTrayRedemptionOrder,
 } from "./trayRedemptionOrder.js";
-import { advanceTrayOrderToOperationalStatus } from "./trayOrderClient.js";
 import { ensureTrayCouponForUser } from "./trayCouponEnsure.js";
 
 export class RedemptionError extends Error {
@@ -128,8 +128,7 @@ function resolveDeps(deps = {}) {
   return {
     ...resolveCartDeps(deps),
     createTrayRedemptionOrder: deps.createTrayRedemptionOrder || createTrayRedemptionOrder,
-    advanceTrayOrderToOperationalStatus:
-      deps.advanceTrayOrderToOperationalStatus || advanceTrayOrderToOperationalStatus,
+    settleTrayRedemptionOrder: deps.settleTrayRedemptionOrder || settleTrayRedemptionOrder,
     ensureTrayCouponForUser: deps.ensureTrayCouponForUser || ensureTrayCouponForUser,
   };
 }
@@ -391,12 +390,19 @@ export async function confirmRedemption(userId, { addressId, shippingOption = nu
     trayOrderId = orderResult?.orderId || null;
     await setStatus(query, redemption.id, "tray_order_pending", { tray_order_id: trayOrderId });
 
-    // Liberacao operacional (PUT /orders/:id + GET de confirmacao): o pedido
-    // nasce "AGUARDANDO PAGAMENTO" na Tray e este passo o move para o status
-    // real da loja. NENHUM Payment Tray e criado neste fluxo -- a liquidacao
-    // do resgate e o debito de NSCreditos no ledger da NewStore, e por isso
-    // has_payment pode continuar 0 na Tray (decisao de negocio, nao bug).
-    await d.advanceTrayOrderToOperationalStatus({ orderId: trayOrderId });
+    // LIQUIDACAO NA TRAY (regra de 2026-09-09, que SUPERA a decisao de
+    // 31/08 "nenhum Payment e criado; has_payment pode continuar 0"):
+    //
+    //   GET /orders/:id -> Order.total factual (NUNCA os NSCreditos)
+    //   Payment real do resgate (reutiliza o existente pelo marker
+    //     deterministico; cria no maximo UM)
+    //   GET /orders/:id -> EXIGE has_payment === "1"
+    //   status operacional "A ENVIAR" (sem PUT redundante)
+    //
+    // Fail-closed: qualquer passo que nao possa ser CONFIRMADO contra a Tray
+    // lanca, e o catch abaixo manda o resgate para reconciliacao com o
+    // tray_order_id preservado. `confirmed` so acontece com pagamento real.
+    await d.settleTrayRedemptionOrder({ orderId: trayOrderId, redemptionId: redemption.id });
 
     await setStatus(query, redemption.id, "confirmed", { tray_order_id: trayOrderId });
     await recordEvent(query, redemption.id, { from: "tray_order_pending", to: "confirmed" });
