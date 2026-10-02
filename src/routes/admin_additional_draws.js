@@ -275,7 +275,14 @@ router.get("/", async (_req, res) => {
       });
     }
 
-    return res.json({ draws: items });
+    const hidden = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.draws
+        WHERE draw_type IN ('adicional', 'secundario')
+          AND lower(coalesce(status, '')) = 'archived'`
+    );
+
+    return res.json({ draws: items, hidden_count: Number(hidden.rows?.[0]?.n || 0) });
   } catch (e) {
     console.error("[admin_additional_draws/list] error:", e?.code || e?.message || e);
     return res.status(500).json({ error: "additional_draws_list_failed" });
@@ -539,6 +546,25 @@ router.patch("/history/hide", async (_req, res) => {
   } catch (e) {
     console.error("[admin_additional_draws/hide-history] error:", e?.code || e?.message || e);
     return res.status(500).json({ error: "additional_draw_hide_history_failed" });
+  }
+});
+
+// Desfaz o "Ocultar historico": archived volta a ser 'sorteado'. Somente o
+// endpoint acima gera 'archived', entao o status original e sempre 'sorteado'.
+router.patch("/history/show", async (_req, res) => {
+  try {
+    const result = await query(
+      `UPDATE public.draws
+          SET status = 'sorteado'
+        WHERE draw_type IN ('adicional', 'secundario')
+          AND lower(coalesce(status, '')) = 'archived'
+        RETURNING id`
+    );
+    const ids = (result.rows || []).map((row) => Number(row.id));
+    return res.json({ ok: true, restored: true, count: ids.length, ids });
+  } catch (e) {
+    console.error("[admin_additional_draws/show-history] error:", e?.code || e?.message || e);
+    return res.status(500).json({ error: "additional_draw_show_history_failed" });
   }
 });
 
