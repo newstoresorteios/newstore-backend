@@ -259,6 +259,7 @@ router.get("/", async (_req, res) => {
       `SELECT *
          FROM public.draws
         WHERE draw_type IN ('adicional', 'secundario')
+          AND lower(coalesce(status, '')) NOT IN ('archived', 'deleted')
         ORDER BY id DESC`
     );
 
@@ -516,6 +517,61 @@ router.patch("/:id", async (req, res) => {
     }
     if (e?.status === 400) return res.status(400).json({ error: e.message });
     return res.status(500).json({ error: "additional_draw_update_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+// Soft delete: apenas oculta do historico admin (status = 'archived').
+// Nao remove payments, reservations, numbers, users nem coupon_balance_history.
+router.patch("/:id/archive", async (req, res) => {
+  const drawId = Number(req.params.id);
+  if (!Number.isInteger(drawId) || drawId <= 0) {
+    return res.status(400).json({ error: "invalid_draw_id" });
+  }
+
+  const pool = await getPool();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const current = await client.query(
+      `SELECT id, status, draw_type
+         FROM public.draws
+        WHERE id = $1
+        FOR UPDATE`,
+      [drawId]
+    );
+    if (!current.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "draw_not_found" });
+    }
+
+    const { status, draw_type: drawType } = current.rows[0];
+    if (!["adicional", "secundario"].includes(String(drawType || "").toLowerCase())) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "principal_draw_cannot_be_archived_here" });
+    }
+    if (String(status || "").toLowerCase() !== "sorteado") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "only_drawn_additional_can_be_archived" });
+    }
+
+    await client.query(
+      `UPDATE public.draws
+          SET status = 'archived'
+        WHERE id = $1
+          AND draw_type IN ('adicional', 'secundario')
+          AND status = 'sorteado'`,
+      [drawId]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, archived: true, id: drawId });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("[admin_additional_draws/archive] error:", e?.code || e?.message || e);
+    return res.status(500).json({ error: "additional_draw_archive_failed" });
   } finally {
     client.release();
   }
