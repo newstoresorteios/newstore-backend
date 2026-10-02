@@ -522,58 +522,23 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-// Soft delete: apenas oculta do historico admin (status = 'archived').
-// Nao remove payments, reservations, numbers, users nem coupon_balance_history.
-router.patch("/:id/archive", async (req, res) => {
-  const drawId = Number(req.params.id);
-  if (!Number.isInteger(drawId) || drawId <= 0) {
-    return res.status(400).json({ error: "invalid_draw_id" });
-  }
-
-  const pool = await getPool();
-  const client = await pool.connect();
+// Soft delete global: oculta do historico admin todos os adicionais ja sorteados
+// (status 'sorteado' -> 'archived'). Abertos/encerrados nao sao tocados e nada
+// e removido de payments, reservations, numbers, users nem coupon_balance_history.
+router.patch("/history/hide", async (_req, res) => {
   try {
-    await client.query("BEGIN");
-
-    const current = await client.query(
-      `SELECT id, status, draw_type
-         FROM public.draws
-        WHERE id = $1
-        FOR UPDATE`,
-      [drawId]
-    );
-    if (!current.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "draw_not_found" });
-    }
-
-    const { status, draw_type: drawType } = current.rows[0];
-    if (!["adicional", "secundario"].includes(String(drawType || "").toLowerCase())) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "principal_draw_cannot_be_archived_here" });
-    }
-    if (String(status || "").toLowerCase() !== "sorteado") {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "only_drawn_additional_can_be_archived" });
-    }
-
-    await client.query(
+    const result = await query(
       `UPDATE public.draws
           SET status = 'archived'
-        WHERE id = $1
-          AND draw_type IN ('adicional', 'secundario')
-          AND status = 'sorteado'`,
-      [drawId]
+        WHERE draw_type IN ('adicional', 'secundario')
+          AND lower(coalesce(status, '')) = 'sorteado'
+        RETURNING id`
     );
-
-    await client.query("COMMIT");
-    return res.json({ ok: true, archived: true, id: drawId });
+    const ids = (result.rows || []).map((row) => Number(row.id));
+    return res.json({ ok: true, archived: true, count: ids.length, ids });
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    console.error("[admin_additional_draws/archive] error:", e?.code || e?.message || e);
-    return res.status(500).json({ error: "additional_draw_archive_failed" });
-  } finally {
-    client.release();
+    console.error("[admin_additional_draws/hide-history] error:", e?.code || e?.message || e);
+    return res.status(500).json({ error: "additional_draw_hide_history_failed" });
   }
 });
 
