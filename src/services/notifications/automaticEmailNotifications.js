@@ -12,6 +12,10 @@ import {
   BALANCE_EMAIL_EVENT_KEYS,
   handleAutomaticBalanceEmailEvent,
 } from "./automaticBalanceEmailNotifications.js";
+import {
+  RESULT_EMAIL_EVENT_KEYS,
+  handleAutomaticResultEmailEvent,
+} from "./automaticResultEmailNotifications.js";
 
 export const AUTOMATIC_EMAIL_EVENT_KEYS = Object.freeze([
   "NEW_DRAW_PUBLISHED",
@@ -20,6 +24,7 @@ export const AUTOMATIC_EMAIL_EVENT_KEYS = Object.freeze([
   "EMAIL_DRAW_REMAINING_30",
   "EMAIL_DRAW_REMAINING_15",
   "DRAW_CLOSED",
+  ...RESULT_EMAIL_EVENT_KEYS,
   ...BALANCE_EMAIL_EVENT_KEYS,
 ]);
 
@@ -351,6 +356,15 @@ export async function handleAutomaticEmailEvent({
       throw eventError("email_reference_type_invalid");
     }
     return handleAutomaticBalanceEmailEvent({
+      eventKey: key,
+      referenceType,
+      referenceKey,
+      metadata,
+      occurredAt,
+    }, dependencies);
+  }
+  if (RESULT_EMAIL_EVENT_KEYS.includes(key)) {
+    return handleAutomaticResultEmailEvent({
       eventKey: key,
       referenceType,
       referenceKey,
