@@ -9,6 +9,7 @@ import {
   markDispatchFailed,
 } from "./notificationLog.js";
 import { BACKEND_BREVO_WHATSAPP_TEMPLATES } from "./manualWhatsAppTemplates.js";
+import { resolvePublicSiteUrl } from "../../config/publicSiteUrl.js";
 
 const DRAW_50_TEMPLATE = BACKEND_BREVO_WHATSAPP_TEMPLATES.DRAW_REMAINING_NUMBERS_50;
 const DRAW_10_TEMPLATE = BACKEND_BREVO_WHATSAPP_TEMPLATES.DRAW_REMAINING_NUMBERS_10;
@@ -61,13 +62,7 @@ function firstText(...values) {
 }
 
 function publicBaseUrl() {
-  return firstText(
-    process.env.PUBLIC_APP_URL,
-    process.env.APP_PUBLIC_URL,
-    process.env.FRONTEND_URL,
-    process.env.SITE_URL,
-    "https://sorteiosxnamai.com.br"
-  ).replace(/\/+$/, "");
+  return resolvePublicSiteUrl();
 }
 
 function absoluteUrl(pathOrUrl, fallbackPath = "/") {

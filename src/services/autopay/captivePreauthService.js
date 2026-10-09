@@ -10,9 +10,9 @@ import {
 } from "../notifications/brevoWhatsApp.js";
 import { assertWhatsAppConsent, WHATSAPP_CONSENT_CATEGORY_DEFAULT } from "../notifications/communicationConsent.js";
 import { createDispatch, markDispatchAccepted, markDispatchFailed } from "../notifications/notificationLog.js";
+import { resolvePublicSiteUrl } from "../../config/publicSiteUrl.js";
 
 const LOG_PREFIX = "[captive-preauth]";
-const PUBLIC_URL_FALLBACK = "https://sorteiosxnamai.com.br";
 const AUTHORIZATION_STATUSES = new Set(["pending", "authorized", "declined", "expired", "charged", "failed"]);
 const PREAUTH_TEMPLATE_KEY = "CAPTIVE_PREAUTH_REQUEST";
 const CONFIRMATION_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -41,13 +41,7 @@ function error(event, extra = {}) {
 }
 
 function normalizeBaseUrl() {
-  const raw =
-    process.env.PUBLIC_APP_URL ||
-    process.env.APP_PUBLIC_URL ||
-    process.env.FRONTEND_URL ||
-    process.env.SITE_URL ||
-    PUBLIC_URL_FALLBACK;
-  return String(raw || PUBLIC_URL_FALLBACK).trim().replace(/\/+$/, "");
+  return resolvePublicSiteUrl();
 }
 
 function normalizeUrl(value) {
