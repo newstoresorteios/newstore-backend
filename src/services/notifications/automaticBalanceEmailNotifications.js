@@ -7,6 +7,7 @@ import {
   updateCampaignAudienceCounts,
 } from "./notificationLog.js";
 import { createSmtpTransporter, getSmtpConfig } from "./manualEmailNotifications.js";
+import { resolvePublicSiteUrl } from "../../config/publicSiteUrl.js";
 
 export const BALANCE_EMAIL_EVENT_KEYS = Object.freeze([
   "EMAIL_BALANCE_EXPIRING_30_DAYS",
@@ -27,7 +28,6 @@ const BALANCE_EVENT_STAGES = new Map([
 ]);
 
 const SAO_PAULO_TIME_ZONE = "America/Sao_Paulo";
-const FALLBACK_SITE_URL = "https://sorteiosxnamai.com.br";
 
 function cleanText(value) {
   return String(value ?? "").trim();
@@ -42,12 +42,7 @@ function automationEnabled() {
 }
 
 function siteUrl() {
-  return cleanText(
-    process.env.PUBLIC_APP_URL ||
-      process.env.FRONTEND_URL ||
-      process.env.SITE_URL ||
-      FALLBACK_SITE_URL
-  ).replace(/\/+$/, "");
+  return resolvePublicSiteUrl();
 }
 
 function escapeHtml(value) {

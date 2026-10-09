@@ -8,6 +8,7 @@ import {
   updateCampaignAudienceCounts,
 } from "./notificationLog.js";
 import { createSmtpTransporter, getSmtpConfig } from "./manualEmailNotifications.js";
+import { resolvePublicSiteUrl } from "../../config/publicSiteUrl.js";
 
 // E-mails de RESULTADO (sorteio realizado). Reutilizam notification_dispatches / notification_campaigns:
 // um registro por evento + destinatario, dedupe por payload.reference_key e reenvio de falhas.
@@ -31,7 +32,6 @@ const DEFAULT_MAX_AGE_HOURS = 192;
 const CRITICAL_EVENT_KEYS = new Set(["EMAIL_RESULT_WINNER", "EMAIL_RESULT_ADMIN"]);
 const DEFAULT_PENDING_STALE_MINUTES = 20;
 const DEFAULT_MAX_ATTEMPTS = 5;
-const FALLBACK_SITE_URL = "https://sorteiosxnamai.com.br";
 
 function cleanText(value) {
   return String(value ?? "").trim();
@@ -89,9 +89,7 @@ export function resultConfig() {
 }
 
 function siteUrl() {
-  return cleanText(
-    process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || process.env.SITE_URL || FALLBACK_SITE_URL
-  ).replace(/\/+$/, "");
+  return resolvePublicSiteUrl();
 }
 
 function drawTypeInfo(drawType) {

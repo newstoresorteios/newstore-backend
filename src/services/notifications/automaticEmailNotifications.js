@@ -7,6 +7,7 @@ import {
   updateCampaignAudienceCounts,
 } from "./notificationLog.js";
 import { createSmtpTransporter, getSmtpConfig } from "./manualEmailNotifications.js";
+import { resolvePublicSiteUrl } from "../../config/publicSiteUrl.js";
 import { renderTemplate } from "./manualNotificationPreview.js";
 import {
   BALANCE_EMAIL_EVENT_KEYS,
@@ -35,7 +36,6 @@ const REMAINING_THRESHOLDS = new Map([
   ["EMAIL_DRAW_REMAINING_15", 15],
 ]);
 const CAIXA_URL = "https://www.youtube.com/@caixa";
-const FALLBACK_SITE_URL = "https://sorteiosxnamai.com.br";
 
 function cleanText(value) {
   return String(value ?? "").trim();
@@ -119,12 +119,7 @@ function validEmail(value) {
 }
 
 function baseUrl() {
-  return cleanText(
-    process.env.PUBLIC_APP_URL ||
-      process.env.FRONTEND_URL ||
-      process.env.SITE_URL ||
-      FALLBACK_SITE_URL
-  ).replace(/\/+$/, "");
+  return resolvePublicSiteUrl();
 }
 
 function absoluteDrawUrl(drawId) {
