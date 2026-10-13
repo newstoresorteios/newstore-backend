@@ -184,6 +184,7 @@ async function alreadyDispatched({ eventKey, referenceKey, userId }) {
         AND provider = 'brevo'
         AND user_id = $2
         AND payload->>'reference_key' = $3
+        AND status NOT IN ('failed', 'skipped')
       LIMIT 1`,
     [eventKey, userId, referenceKey]
   );
