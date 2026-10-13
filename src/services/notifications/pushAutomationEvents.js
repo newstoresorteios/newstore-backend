@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { query } from "../../db.js";
 import {
   getActivePushRuleByEventKey,
@@ -250,12 +251,17 @@ async function countReferencesForScan({ eventKey, scanId, referenceKey }) {
   return Number(result.rows?.[0]?.count || 0);
 }
 
-function buildAutomationDedupeKey({ eventKey, referenceKey }) {
-  return `push:${eventKey}:${referenceKey}`;
+function buildAutomationDedupeKey({ eventKey, referenceKey, dryRun = false }) {
+  return `${dryRun ? "push:test" : "push"}:${eventKey}:${referenceKey}`;
 }
 
-function isRetryableLedgerStatus(status) {
-  return String(status || "").toLowerCase() === "failed";
+function isRetryableLedgerStatus(ledger) {
+  const status = String(ledger?.status || "").toLowerCase();
+  if (status === "sent" && Number(ledger.meta?.failed || 0) > 0) return true;
+  if (["failed", "partial_failure", "skipped", "dry_run"].includes(status)) return true;
+  if (status !== "processing") return false;
+  const startedAt = new Date(ledger.meta?.processing_started_at || ledger.created_at).getTime();
+  return Number.isFinite(startedAt) && Date.now() - startedAt >= envPositiveInt("PUSH_ENGINE_PROCESSING_LEASE_MINUTES", 20) * 60000;
 }
 
 async function claimAutomationEventLedger({
@@ -271,7 +277,7 @@ async function claimAutomationEventLedger({
 }) {
   if (!referenceKey) return { claimed: false, deduped: false, ledger: null };
 
-  const dedupeKey = buildAutomationDedupeKey({ eventKey, referenceKey });
+  const dedupeKey = buildAutomationDedupeKey({ eventKey, referenceKey, dryRun });
   const mode = dryRun ? "test" : "production";
   const meta = {
     source,
@@ -282,6 +288,8 @@ async function claimAutomationEventLedger({
     metadata,
     recipient_user_ids: recipientUserIds,
     automation: true,
+    processing_started_at: new Date().toISOString(),
+    claim_id: randomUUID(),
   };
 
   const inserted = await query(
@@ -293,29 +301,30 @@ async function claimAutomationEventLedger({
     [eventKey, dedupeKey, referenceType || null, referenceKey, mode, JSON.stringify(meta)]
   );
   if (inserted.rowCount) {
-    return { claimed: true, deduped: false, ledger: inserted.rows[0] };
+    return { claimed: true, deduped: false, ledger: inserted.rows[0], claimId: meta.claim_id };
   }
 
   const existing = await query(
-    `SELECT id, event_key, dedupe_key, status
+    `SELECT id, event_key, dedupe_key, status, mode, meta, created_at
        FROM public.notification_event_ledger
       WHERE dedupe_key = $1
       LIMIT 1`,
     [dedupeKey]
   );
   const ledger = existing.rows?.[0] || null;
-  if (ledger && isRetryableLedgerStatus(ledger.status)) {
+  if (ledger && isRetryableLedgerStatus(ledger)) {
     const retry = await query(
       `UPDATE public.notification_event_ledger
           SET status = 'processing',
               mode = $2,
               meta = $3::jsonb
         WHERE id = $1
-          AND status = 'failed'
+          AND status = $4
+          AND meta = $5::jsonb
         RETURNING id, event_key, dedupe_key, status`,
-      [ledger.id, mode, JSON.stringify(meta)]
+      [ledger.id, mode, JSON.stringify(meta), ledger.status, JSON.stringify(ledger.meta || {})]
     );
-    if (retry.rowCount) return { claimed: true, deduped: false, ledger: retry.rows[0] };
+    if (retry.rowCount) return { claimed: true, deduped: false, ledger: retry.rows[0], claimId: meta.claim_id };
   }
 
   return { claimed: false, deduped: true, ledger };
@@ -339,8 +348,9 @@ async function finishAutomationEventLedger(ledgerClaim, result, { category = "op
               category = $3,
               mode = $4,
               meta = COALESCE(meta, '{}'::jsonb) || $5::jsonb
-        WHERE id = $1`,
-      [ledgerClaim.ledger.id, status, category || "operational", dryRun ? "test" : "production", JSON.stringify(meta)]
+        WHERE id = $1
+          AND meta->>'claim_id' = $6`,
+      [ledgerClaim.ledger.id, status, category || "operational", dryRun ? "test" : "production", JSON.stringify(meta), ledgerClaim.claimId]
     );
   } catch (error) {
     console.warn("[push-internal] ledger:finish_failed", {
@@ -350,6 +360,17 @@ async function finishAutomationEventLedger(ledgerClaim, result, { category = "op
       error: error?.code || error?.message || "ledger_finish_failed",
     });
   }
+}
+
+async function renewAutomationEventLease(claim) {
+  if (!claim?.claimed) return;
+  const result = await query(
+    `UPDATE public.notification_event_ledger
+        SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('processing_started_at', now())
+      WHERE id = $1 AND meta->>'claim_id' = $2 AND status = 'processing'`,
+    [claim.ledger.id, claim.claimId]
+  );
+  if (!result.rowCount) throw coded("push_event_lease_lost");
 }
 
 function buildDedupedAutomationResult({ eventKey, referenceKey, ledger }) {
@@ -402,26 +423,37 @@ async function insertSafetySkipped({
   return { ok: true, event_key: eventKey, status: "skipped", reason, dispatch };
 }
 
-async function getRecipients({ eventKey, recipientUserIds }) {
+async function getRecipients({ eventKey, recipientUserIds, referenceKey }) {
+  // Successful device deliveries are retained even when the event is retried.
+  const pendingOnly = `AND NOT EXISTS (
+    SELECT 1 FROM public.notification_push_dispatches d
+     WHERE d.subscription_id = s.id
+       AND d.event_key = $1
+       AND d.payload->>'reference_key' = $2
+       AND d.status = 'sent'
+  )`;
   if (PUBLIC_EVENT_KEYS.has(eventKey)) {
     return query(
-      `SELECT *
-         FROM public.push_subscriptions
-        WHERE is_active = true
-          AND operational_opt_in = true
-        ORDER BY updated_at DESC, created_at DESC`
+      `SELECT s.*
+         FROM public.push_subscriptions s
+        WHERE s.is_active = true
+          AND s.operational_opt_in = true
+          ${pendingOnly}
+        ORDER BY s.updated_at DESC, s.created_at DESC`,
+      [eventKey, referenceKey]
     );
   }
 
   if (USER_EVENT_KEYS.has(eventKey) && recipientUserIds.length) {
     return query(
-      `SELECT *
-         FROM public.push_subscriptions
-        WHERE is_active = true
-          AND operational_opt_in = true
-          AND user_id = ANY($1::bigint[])
-        ORDER BY updated_at DESC, created_at DESC`,
-      [recipientUserIds]
+      `SELECT s.*
+         FROM public.push_subscriptions s
+        WHERE s.is_active = true
+          AND s.operational_opt_in = true
+          AND s.user_id = ANY($3::bigint[])
+          ${pendingOnly}
+        ORDER BY s.updated_at DESC, s.created_at DESC`,
+      [eventKey, referenceKey, recipientUserIds]
     );
   }
 
@@ -455,6 +487,7 @@ export async function handlePushAutomationEvent({
   const engineSource = isEngineSource(safeSource);
   let ledgerClaim = null;
   let whatsappResult = null;
+  let heartbeatError = null;
 
   async function ensureLedgerClaim() {
     if (ledgerClaim) return ledgerClaim;
@@ -483,7 +516,13 @@ export async function handlePushAutomationEvent({
   }
 
   async function finishWithLedger(result, category = "operational") {
+    if (heartbeatError) throw heartbeatError;
+    const whatsappFailed = whatsappResult?.ok === false ? Math.max(1, Number(whatsappResult.failed || 0)) : Number(whatsappResult?.failed || 0);
     const finalResult = whatsappResult ? { ...result, whatsapp: whatsappResult } : result;
+    if (whatsappFailed) {
+      finalResult.failed = Number(result.failed || 0) + whatsappFailed;
+      finalResult.status = Number(result.sent || 0) > 0 ? "partial_failure" : "failed";
+    }
     await finishAutomationEventLedger(ledgerClaim, finalResult, { category, dryRun });
     return finalResult;
   }
@@ -502,24 +541,18 @@ export async function handlePushAutomationEvent({
     };
 
     if (envBool("PUSH_ENGINE_REQUIRE_OCCURRED_AT", true) && !occurred.valid) {
-      const deduped = await getDedupedResultIfNeeded();
-      if (deduped) return deduped;
-      return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_occurred_at" }));
+      return insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_occurred_at" });
     }
 
     if (occurred.valid && envBool("PUSH_ENGINE_SAFETY_NO_BACKFILL", true)) {
       const maxAgeHours = envPositiveInt("PUSH_ENGINE_MAX_EVENT_AGE_HOURS", 24);
       if (Date.now() - occurred.date.getTime() > maxAgeHours * 60 * 60 * 1000) {
-        const deduped = await getDedupedResultIfNeeded();
-        if (deduped) return deduped;
-        return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_event_too_old" }));
+        return insertSafetySkipped({ ...skippedArgs, reason: "safety_event_too_old" });
       }
     }
 
     if (envBool("PUSH_ENGINE_REQUIRE_SCAN_ID", true) && !safeScanId) {
-      const deduped = await getDedupedResultIfNeeded();
-      if (deduped) return deduped;
-      return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_scan_id" }));
+      return insertSafetySkipped({ ...skippedArgs, reason: "safety_missing_scan_id" });
     }
 
     if (!dryRun && safeScanId && !envBool("PUSH_ENGINE_ALLOW_LARGE_BATCH", false)) {
@@ -533,9 +566,7 @@ export async function handlePushAutomationEvent({
         referenceKey: safeReferenceKey,
       });
       if (!existingSent && acceptedReferences >= maxReferences) {
-        const deduped = await getDedupedResultIfNeeded();
-        if (deduped) return deduped;
-        return finishWithLedger(await insertSafetySkipped({ ...skippedArgs, reason: "safety_scan_event_limit_exceeded" }));
+        return insertSafetySkipped({ ...skippedArgs, reason: "safety_scan_event_limit_exceeded" });
       }
     }
   }
@@ -547,110 +578,93 @@ export async function handlePushAutomationEvent({
   const deduped = await getDedupedResultIfNeeded();
   if (deduped) return deduped;
 
+  let renewing = false;
+  const leaseMs = envPositiveInt("PUSH_ENGINE_PROCESSING_LEASE_MINUTES", 20) * 60000;
+  const heartbeat = setInterval(async () => {
+    if (renewing || heartbeatError) return;
+    renewing = true;
+    try { await renewAutomationEventLease(ledgerClaim); }
+    catch (error) { heartbeatError = error; }
+    finally { renewing = false; }
+  }, Math.min(30000, Math.floor(leaseMs / 3)));
+  heartbeat.unref?.();
   try {
-    whatsappResult = await handleWhatsAppAutomationEvent({
-      eventKey: key,
-      source: safeSource,
-      referenceType: safeReferenceType,
-      referenceKey: safeReferenceKey,
-      metadata: safeMetadata,
-      recipientUserIds: safeRecipientUserIds,
-      dryRun,
-    });
-  } catch (error) {
-    console.warn("[push-internal] whatsapp automation failed", {
-      event_key: key,
-      reference_key: safeReferenceKey,
-      code: error?.code || null,
-      message: error?.message || null,
-    });
-    whatsappResult = {
-      ok: false,
-      event_key: key,
-      status: "failed",
-      reason: error?.code || error?.message || "whatsapp_automation_failed",
-    };
-  }
-
-  const rule = await getActivePushRuleByEventKey(key);
-
-  if (!rule) {
-    const dispatch = await insertAutomationDispatch({
-      eventKey: key,
-      status: "skipped",
-      category: "operational",
-      title: "Push automatico ignorado",
-      body: "Regra inativa ou nao encontrada.",
-      url: null,
-      payload: {
-        dry_run: dryRun,
+    try {
+      whatsappResult = await handleWhatsAppAutomationEvent({
+        eventKey: key,
         source: safeSource,
-        scan_id: safeScanId,
-        occurred_at: occurred.value,
-        reference_type: safeReferenceType,
-        reference_key: safeReferenceKey,
-        reason: "rule_inactive_or_not_found",
+        referenceType: safeReferenceType,
+        referenceKey: safeReferenceKey,
         metadata: safeMetadata,
-        recipient_user_ids: safeRecipientUserIds,
-        actor: safeActor,
-      },
-    });
-    return finishWithLedger({ ok: true, event_key: key, status: "skipped", dispatch });
-  }
+        recipientUserIds: safeRecipientUserIds,
+        dryRun,
+      });
+    } catch (error) {
+      console.warn("[push-internal] whatsapp automation failed", {
+        event_key: key,
+        reference_key: safeReferenceKey,
+        code: error?.code || null,
+        message: error?.message || null,
+      });
+      whatsappResult = {
+        ok: false,
+        event_key: key,
+        status: "failed",
+        reason: error?.code || error?.message || "whatsapp_automation_failed",
+      };
+    }
 
-  const renderedTitle = renderTemplate(rule.title_template, safeMetadata);
-  const renderedBody = renderTemplate(rule.body_template, safeMetadata);
-  const renderedUrl = renderTemplate(rule.url_template || "", safeMetadata) || "/";
+    const rule = await getActivePushRuleByEventKey(key);
 
-  if (!dryRun) {
-    const recipients = await getRecipients({
-      eventKey: key,
-      recipientUserIds: safeRecipientUserIds,
-    });
-
-    if (!recipients.rows?.length) {
+    if (!rule) {
       const dispatch = await insertAutomationDispatch({
         eventKey: key,
         status: "skipped",
-        category: rule.category || "operational",
-        title: renderedTitle || rule.title_template,
-        body: renderedBody || "Nenhuma subscription ativa com opt-in operacional.",
-        url: renderedUrl,
-        errorMessage: "no_active_push_recipients",
+        category: "operational",
+        title: "Push automatico ignorado",
+        body: "Regra inativa ou nao encontrada.",
+        url: null,
         payload: {
+          dry_run: dryRun,
           source: safeSource,
           scan_id: safeScanId,
           occurred_at: occurred.value,
           reference_type: safeReferenceType,
           reference_key: safeReferenceKey,
+          reason: "rule_inactive_or_not_found",
           metadata: safeMetadata,
           recipient_user_ids: safeRecipientUserIds,
-          automation: true,
-          real_send: true,
-          no_recipients: true,
+          actor: safeActor,
         },
       });
-      return finishWithLedger({
-        ok: true,
-        event_key: key,
-        status: "skipped",
-        attempted: 0,
-        sent: 0,
-        failed: 0,
-        reference_key: safeReferenceKey,
-        dispatch,
-      }, rule.category || "operational");
+      return await finishWithLedger({ ok: true, event_key: key, status: "skipped", dispatch });
     }
 
-    let sent = 0;
-    let failed = 0;
-    for (const row of recipients.rows || []) {
-      try {
-        await sendPushToSubscriptionRow({
-          subscriptionRow: row,
-          title: renderedTitle,
-          body: renderedBody,
+    const renderedTitle = renderTemplate(rule.title_template, safeMetadata);
+    const renderedBody = renderTemplate(rule.body_template, safeMetadata);
+    const renderedUrl = renderTemplate(rule.url_template || "", safeMetadata) || "/";
+
+    if (!dryRun) {
+      const recipients = await getRecipients({
+        eventKey: key,
+        recipientUserIds: safeRecipientUserIds,
+        referenceKey: safeReferenceKey,
+      });
+
+      if (!recipients.rows?.length) {
+        const alreadySent = safeReferenceKey && await findSentDispatch({ eventKey: key, referenceKey: safeReferenceKey });
+        if (alreadySent) {
+          return await finishWithLedger({ ok: true, event_key: key, status: "sent", attempted: 0, sent: 0, failed: 0,
+            reason: "all_active_devices_already_sent", reference_key: safeReferenceKey }, rule.category || "operational");
+        }
+        const dispatch = await insertAutomationDispatch({
+          eventKey: key,
+          status: "skipped",
+          category: rule.category || "operational",
+          title: renderedTitle || rule.title_template,
+          body: renderedBody || "Nenhuma subscription ativa com opt-in operacional.",
           url: renderedUrl,
+          errorMessage: "no_active_push_recipients",
           payload: {
             source: safeSource,
             scan_id: safeScanId,
@@ -661,49 +675,88 @@ export async function handlePushAutomationEvent({
             recipient_user_ids: safeRecipientUserIds,
             automation: true,
             real_send: true,
+            no_recipients: true,
           },
-          source: "push_automation",
-          eventKey: key,
-          category: rule.category || "operational",
-          requireConfiguredSubscription: false,
-          skipModeAssert: true,
         });
-        sent += 1;
-      } catch {
-        failed += 1;
+        return await finishWithLedger({
+          ok: true,
+          event_key: key,
+          status: "skipped",
+          attempted: 0,
+          sent: 0,
+          failed: 0,
+          reference_key: safeReferenceKey,
+          dispatch,
+        }, rule.category || "operational");
       }
+
+      let sent = 0;
+      let failed = 0;
+      for (const row of recipients.rows || []) {
+        if (heartbeatError) throw heartbeatError;
+        await renewAutomationEventLease(ledgerClaim);
+        try {
+          await sendPushToSubscriptionRow({
+            subscriptionRow: row,
+            title: renderedTitle,
+            body: renderedBody,
+            url: renderedUrl,
+            payload: {
+              source: safeSource,
+              scan_id: safeScanId,
+              occurred_at: occurred.value,
+              reference_type: safeReferenceType,
+              reference_key: safeReferenceKey,
+              metadata: safeMetadata,
+              recipient_user_ids: safeRecipientUserIds,
+              automation: true,
+              real_send: true,
+            },
+            source: "push_automation",
+            eventKey: key,
+            category: rule.category || "operational",
+            requireConfiguredSubscription: false,
+            skipModeAssert: true,
+          });
+          sent += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+      return await finishWithLedger({
+        ok: true,
+        event_key: key,
+        status: failed > 0 ? (sent > 0 ? "partial_failure" : "failed") : "sent",
+        attempted: sent + failed,
+        sent,
+        failed,
+        reference_key: safeReferenceKey,
+      }, rule.category || "operational");
     }
-    return finishWithLedger({
-      ok: true,
-      event_key: key,
-      status: sent > 0 ? "sent" : "failed",
-      attempted: sent + failed,
-      sent,
-      failed,
-      reference_key: safeReferenceKey,
-    }, rule.category || "operational");
+
+    const dispatch = await insertAutomationDispatch({
+      eventKey: key,
+      status: "dry_run",
+      category: rule.category || "operational",
+      title: renderedTitle,
+      body: renderedBody,
+      url: renderedUrl || null,
+      payload: {
+        dry_run: true,
+        source: safeSource,
+        scan_id: safeScanId,
+        occurred_at: occurred.value,
+        reference_type: safeReferenceType,
+        reference_key: safeReferenceKey,
+        rule_id: rule.id,
+        metadata: safeMetadata,
+        recipient_user_ids: safeRecipientUserIds,
+        actor: safeActor,
+      },
+    });
+
+    return await finishWithLedger({ ok: true, event_key: key, status: "dry_run", dispatch }, rule.category || "operational");
+  } finally {
+    clearInterval(heartbeat);
   }
-
-  const dispatch = await insertAutomationDispatch({
-    eventKey: key,
-    status: "dry_run",
-    category: rule.category || "operational",
-    title: renderedTitle,
-    body: renderedBody,
-    url: renderedUrl || null,
-    payload: {
-      dry_run: true,
-      source: safeSource,
-      scan_id: safeScanId,
-      occurred_at: occurred.value,
-      reference_type: safeReferenceType,
-      reference_key: safeReferenceKey,
-      rule_id: rule.id,
-      metadata: safeMetadata,
-      recipient_user_ids: safeRecipientUserIds,
-      actor: safeActor,
-    },
-  });
-
-  return finishWithLedger({ ok: true, event_key: key, status: "dry_run", dispatch }, rule.category || "operational");
 }
