@@ -1,4 +1,5 @@
 import { query } from "../../db.js";
+import { resolvePublicSiteUrl } from "../../config/publicSiteUrl.js";
 import { normalizePhoneBR } from "./brevoWhatsApp.js";
 import { getWhatsappConsentStatusForUser } from "./communicationConsent.js";
 import { getBuiltinEmailTemplates } from "./manualNotificationCatalog.js";
@@ -61,6 +62,15 @@ function normalizeUrl(url) {
   return clean.slice(0, 500);
 }
 
+// Link relativo nao funciona em e-mail (nao ha site base): vira URL completa do site publico.
+export function absolutizeEmailUrl(url) {
+  const clean = String(url ?? "").trim();
+  if (clean.startsWith("/") && !clean.startsWith("//")) {
+    return `${resolvePublicSiteUrl()}${clean}`;
+  }
+  return clean;
+}
+
 function normalizeEmailDrawUrl(url) {
   const clean = String(url || "/").trim() || "/";
   const relative = clean.startsWith("/") && !clean.startsWith("//");
@@ -70,7 +80,7 @@ function normalizeEmailDrawUrl(url) {
     error.code = "manual_email_url_invalid";
     throw error;
   }
-  return clean.slice(0, 1000);
+  return absolutizeEmailUrl(clean).slice(0, 1000);
 }
 
 function normalizeParams(channel, templateKey, value) {
@@ -303,6 +313,7 @@ export function renderManualEmailContent(normalized, template, extraParams = {})
     ...(normalized.params || {}),
     ...extraParams,
   };
+  if (params.draw_url != null) params.draw_url = absolutizeEmailUrl(params.draw_url);
   return {
     subject: renderTemplate(
       normalized.subject || template?.subject_template || template?.name || "Mensagem da New Store",

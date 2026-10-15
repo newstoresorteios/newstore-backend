@@ -599,6 +599,75 @@ test("remaining-number email templates enforce their own number and render allow
   }
 });
 
+const SITE = "https://www.sorteionewstore.com.br";
+
+function hrefs(html) {
+  return [...String(html).matchAll(/href="([^"]*)"/g)].map((match) => match[1]);
+}
+
+test("manual draw emails never render a relative draw_url in preview", async () => {
+  const keys = ["NEW_DRAW_EMAIL", ...[75, 50, 30, 15].map((n) => `EMAIL_DRAW_REMAINING_${n}`)];
+  for (const templateKey of keys) {
+    for (const params of [undefined, { draw_url: "/" }, { draw_url: "/sorteio" }]) {
+      const preview = await buildManualNotificationPreview({
+        pgClient: emailPg([{ id: 1, name: "Ana", email: "ana@example.com" }]),
+        payload: { channel: "email", template_key: templateKey, audience: "selected", user_ids: [1], params },
+      });
+      const links = hrefs(preview.html_preview);
+      assert.ok(links.length > 0, templateKey);
+      for (const link of links) assert.match(link, /^https:\/\//, `${templateKey} ${JSON.stringify(params)}`);
+      assert.ok(links.every((link) => link.startsWith(SITE)), templateKey);
+      assert.doesNotMatch(preview.text_preview, /(^|\s)\/(\s|$)/, templateKey);
+    }
+  }
+});
+
+test("manual draw email keeps absolute draw_url and resolves relative paths against the site", async () => {
+  const preview = await buildManualNotificationPreview({
+    pgClient: emailPg([{ id: 1, name: "Ana", email: "ana@example.com" }]),
+    payload: {
+      channel: "email",
+      template_key: "EMAIL_DRAW_REMAINING_75",
+      audience: "selected",
+      user_ids: [1],
+      params: { draw_url: "/?draw_id=7" },
+    },
+  });
+  assert.equal(preview.normalized.params.draw_url, `${SITE}/?draw_id=7`);
+  assert.deepEqual(hrefs(preview.html_preview), [`${SITE}/?draw_id=7`]);
+
+  const custom = await buildManualNotificationPreview({
+    pgClient: emailPg([{ id: 1, name: "Ana", email: "ana@example.com" }]),
+    payload: {
+      channel: "email",
+      template_key: "EMAIL_DRAW_REMAINING_75",
+      audience: "selected",
+      user_ids: [1],
+      params: { draw_url: "https://newstorerj.com.br/sorteio" },
+    },
+  });
+  assert.deepEqual(hrefs(custom.html_preview), ["https://newstorerj.com.br/sorteio"]);
+});
+
+test("manual draw email send uses the same absolute URL as the preview", async () => {
+  const sentMessages = [];
+  const result = await sendManualEmailNotification({
+    pgClient: emailPg([{ id: 1, name: "Ana", email: "ana@example.com" }]),
+    adminUserId: 99,
+    payload: { channel: "email", template_key: "NEW_DRAW_EMAIL", audience: "selected", user_ids: [1] },
+    transporter: {
+      async sendMail(message) {
+        sentMessages.push(message);
+        return { messageId: "smtp-1", accepted: [message.to] };
+      },
+    },
+  });
+  assert.equal(result.sent, 1);
+  assert.equal(sentMessages.length, 1);
+  assert.deepEqual(hrefs(sentMessages[0].html), [`${SITE}/`, ]);
+  assert.match(sentMessages[0].text, new RegExp(`${SITE}/`));
+});
+
 test("remaining-number email rejects unsafe draw URLs", async () => {
   for (const drawUrl of ["javascript:alert(1)", "data:text/html,oi", "http://example.com"] ) {
     await assert.rejects(
