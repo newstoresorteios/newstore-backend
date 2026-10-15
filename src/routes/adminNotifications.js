@@ -33,6 +33,7 @@ import {
 } from "../services/notifications/manualNotificationPreview.js";
 import { sendManualPushNotification } from "../services/notifications/manualPushNotifications.js";
 import { sendManualEmailNotification } from "../services/notifications/manualEmailNotifications.js";
+import { createDispatchesCsvHandler } from "../services/notifications/dispatchCsvExport.js";
 
 const router = express.Router();
 
@@ -404,6 +405,9 @@ router.get("/dispatches", async (req, res) => {
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
+
+// Exportacao CSV do historico (filtros: status, channel, provider, from, to). Sem limite de 50 linhas.
+router.get("/dispatches/export.csv", createDispatchesCsvHandler());
 
 router.get("/inbound", async (req, res) => {
   try {
